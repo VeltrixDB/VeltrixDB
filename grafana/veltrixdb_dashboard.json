@@ -1,0 +1,1945 @@
+{
+  "__inputs": [
+    {
+      "name": "DS_PROMETHEUS",
+      "label": "Prometheus",
+      "description": "",
+      "type": "datasource",
+      "pluginId": "prometheus",
+      "pluginName": "Prometheus"
+    }
+  ],
+  "__elements": {},
+  "__requires": [
+    { "type": "grafana",    "id": "grafana",    "name": "Grafana",    "version": "9.0.0" },
+    { "type": "datasource", "id": "prometheus", "name": "Prometheus", "version": "1.0.0" },
+    { "type": "panel", "id": "stat",       "name": "Stat",       "version": "" },
+    { "type": "panel", "id": "timeseries", "name": "Time series","version": "" },
+    { "type": "panel", "id": "gauge",      "name": "Gauge",      "version": "" },
+    { "type": "panel", "id": "bargauge",   "name": "Bar gauge",  "version": "" },
+    { "type": "panel", "id": "row",        "name": "Row",        "version": "" }
+  ],
+  "annotations": { "list": [] },
+  "description": "VeltrixDB full-stack monitoring: latency, throughput, LIRS cache, VLog, NVMe fill, tombstones, deletes, SSTables, cluster, replication, write/read flow pipelines.",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "liveNow": false,
+  "refresh": "10s",
+  "schemaVersion": 37,
+  "style": "dark",
+  "tags": ["veltrixdb", "storage", "kv"],
+  "time": { "from": "now-1h", "to": "now" },
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "VeltrixDB — Full Stack Dashboard",
+  "uid": "veltrixdb-full-v2",
+  "version": 2,
+  "weekStart": "",
+
+  "templating": {
+    "list": [
+      {
+        "current": {},
+        "hide": 0,
+        "includeAll": false,
+        "label": "Data Source",
+        "multi": false,
+        "name": "datasource",
+        "options": [],
+        "query": "prometheus",
+        "refresh": 1,
+        "regex": "",
+        "type": "datasource"
+      },
+      {
+        "current": { "selected": true, "text": "All", "value": "$__all" },
+        "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+        "definition": "label_values(veltrixdb_storage_writes_total, node)",
+        "hide": 0,
+        "includeAll": true,
+        "label": "Node",
+        "multi": true,
+        "name": "node",
+        "options": [],
+        "query": {
+          "query": "label_values(veltrixdb_storage_writes_total, node)",
+          "refId": "StandardVariableQuery"
+        },
+        "refresh": 2,
+        "regex": "",
+        "sort": 1,
+        "type": "query"
+      }
+    ]
+  },
+
+  "panels": [
+
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
+      "id": 1,
+      "title": "📊 Overview — At-a-Glance Health",
+      "type": "row"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "How many keys are being stored per second right now. Each PUT command = one write. Normal range on NVMe: 50K–500K/s. At 5ms WAL window + high concurrency expect 50–100 entries per flush. Yellow at 50K = low-throughput territory; red at 200K = check WAL batch size panel.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 50000 }, { "color": "red", "value": 200000 }] },
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 4, "w": 3, "x": 0, "y": 1 },
+      "id": 2,
+      "options": { "colorMode": "background", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
+      "targets": [{ "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "sum(rate(veltrixdb_storage_writes_total{node=~\"$node\"}[5m]))", "legendFormat": "Writes/s", "refId": "A" }],
+      "title": "Writes / s",
+      "type": "stat"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "How many keys are being fetched per second. Reads served from LIRS cache (RAM) are sub-millisecond. Reads that miss the cache go to NVMe VLog (1–5ms). High read rate + low cache hit rate = disk bottleneck. See Read Path Deep Dive section for breakdown.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 100000 }, { "color": "red", "value": 500000 }] },
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 4, "w": 3, "x": 3, "y": 1 },
+      "id": 3,
+      "options": { "colorMode": "background", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
+      "targets": [{ "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "sum(rate(veltrixdb_storage_reads_total{node=~\"$node\"}[5m]))", "legendFormat": "Reads/s", "refId": "A" }],
+      "title": "Reads / s",
+      "type": "stat"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Time for the most recent write to complete, from PUT received to WAL fdatasync confirmed. This is a last-observed snapshot. With 5ms WAL group-commit window: floor is ~5ms + fdatasync (~0.2ms NVMe, ~7ms macOS). Green <5ms, yellow <20ms, red >20ms = investigate disk pressure.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 5 }, { "color": "red", "value": 20 }] },
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 4, "w": 3, "x": 6, "y": 1 },
+      "id": 4,
+      "options": { "colorMode": "background", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
+      "targets": [{ "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "histogram_quantile(0.99, sum(rate(veltrixdb_storage_write_latency_seconds_bucket{node=~\"$node\"}[5m])) by (le)) * 1000", "legendFormat": "Write P99 ms", "refId": "A" }],
+      "title": "Write P99 (ms)",
+      "type": "stat"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "P99 read latency. Cache hit = <0.2 ms (pure LIRS RAM). Cache miss → NVMe VLog pread = 0.1–1 ms on local NVMe. Target: P99 < 5 ms at 1 billion keys with 512 GB cache. Green <2 ms, yellow <5 ms, red >5 ms.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 2 }, { "color": "red", "value": 5 }] },
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 4, "w": 3, "x": 9, "y": 1 },
+      "id": 5,
+      "options": { "colorMode": "background", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
+      "targets": [{ "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "histogram_quantile(0.99, sum(rate(veltrixdb_storage_read_latency_seconds_bucket{node=~\"$node\"}[5m])) by (le)) * 1000", "legendFormat": "Read P99 ms", "refId": "A" }],
+      "title": "Read P99 (ms)",
+      "type": "stat"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Fraction of GET requests answered from the LIRS in-memory cache with no disk I/O. Below 80% = working set is larger than cache — consider increasing --cache. Below 60% = severe cache pressure. Above 90% = healthy. Note: cache misses for non-existent keys also count as misses.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "red", "value": null }, { "color": "yellow", "value": 0.6 }, { "color": "green", "value": 0.8 }] },
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 4, "w": 3, "x": 12, "y": 1 },
+      "id": 6,
+      "options": { "colorMode": "background", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
+      "targets": [{ "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "avg(veltrixdb_cache_hit_rate{node=~\"$node\"})", "legendFormat": "Hit Rate", "refId": "A" }],
+      "title": "Cache Hit Rate",
+      "type": "stat"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Number of live (non-deleted) keys currently tracked in the in-memory Index Vault. Every key occupies ~100–200 bytes of RAM as an IndexEntry (disk offset, version, TTL, size). At 1 billion keys = ~100–200 GB RAM just for index. This is the primary RAM driver at scale.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 500000000 }, { "color": "red", "value": 1000000000 }] },
+          "unit": "short",
+          "decimals": 2
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 4, "w": 3, "x": 15, "y": 1 },
+      "id": 7,
+      "options": { "colorMode": "background", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
+      "targets": [{ "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "sum(veltrixdb_storage_index_size_keys{node=~\"$node\"})", "legendFormat": "Index Keys", "refId": "A" }],
+      "title": "Index Keys (RAM)",
+      "type": "stat"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Total bytes in all NVMe VLog files across all disks. VLog grows with every PUT and only shrinks when VLog GC runs (garbage ratio > 30%). If this grows without bound during steady-state traffic with no new writes, check the GC Diagnostics section — GCPaused or zero-candidates are the most common culprits.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 20 }, { "color": "red", "value": 30 }] },
+          "unit": "decgbytes",
+          "decimals": 2
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 4, "w": 3, "x": 18, "y": 1 },
+      "id": 8,
+      "options": { "colorMode": "background", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
+      "targets": [{ "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "sum(veltrixdb_vlog_file_bytes{node=~\"$node\"}) / 1e9", "legendFormat": "VLog GB", "refId": "A" }],
+      "title": "VLog Total Size",
+      "type": "stat"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "How many nodes are active in the VeltrixDB cluster consistent-hash ring. Keys are distributed across nodes by FNV-1a hash. Should match your deployment size. Dropping below expected = a node left or crashed.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "red", "value": null }, { "color": "green", "value": 1 }] },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 4, "w": 3, "x": 21, "y": 1 },
+      "id": 9,
+      "options": { "colorMode": "background", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
+      "targets": [{ "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "sum(veltrixdb_cluster_nodes_total{node=~\"$node\"})", "legendFormat": "Nodes", "refId": "A" }],
+      "title": "Cluster Nodes",
+      "type": "stat"
+    },
+
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 5 },
+      "id": 10,
+      "title": "⚡ Throughput & WAL",
+      "type": "row"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Writes, reads, deletes, and VLog appends per second over time, split by node. Use this to spot load imbalance (one node much busier than others = hot shard), traffic spikes, or regressions after deployments. VLog writes should track storage writes closely — divergence suggests a KV-separation path issue.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "ops / s", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 10, "gradientMode": "none", "hideFrom": { "legend": false, "tooltip": false, "viz": false }, "lineInterpolation": "linear", "lineWidth": 2, "pointSize": 5, "scaleDistribution": { "type": "linear" }, "showPoints": "never", "spanNulls": false, "stacking": { "group": "A", "mode": "none" }, "thresholdsStyle": { "mode": "off" } },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 16, "x": 0, "y": 6 },
+      "id": 11,
+      "options": { "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "sum by (node) (rate(veltrixdb_storage_writes_total{node=~\"$node\"}[5m]))", "legendFormat": "Writes/s — {{node}}", "refId": "A" },
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "sum by (node) (rate(veltrixdb_storage_reads_total{node=~\"$node\"}[5m]))", "legendFormat": "Reads/s — {{node}}", "refId": "B" },
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "sum by (node) (rate(veltrixdb_storage_deletes_total{node=~\"$node\"}[5m]))", "legendFormat": "Deletes/s — {{node}}", "refId": "C" },
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "sum by (node) (rate(veltrixdb_vlog_writes_total{node=~\"$node\"}[5m]))", "legendFormat": "VLog Writes/s — {{node}}", "refId": "D" }
+      ],
+      "title": "Operation Throughput — Writes / Reads / Deletes / VLog",
+      "type": "timeseries"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "How many fdatasync calls per second the WAL is making. Each bar = one group-commit that flushed multiple writes in a single disk sync. With a 5ms window the timer fires ~200 times/s. Lower flush rate with same write rate = better batching (more writes per sync). See WAL Avg Batch Size panel in the Write Path section for the efficiency metric.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "flushes / s", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "bars", "fillOpacity": 60, "gradientMode": "none", "hideFrom": { "legend": false, "tooltip": false, "viz": false }, "lineInterpolation": "linear", "lineWidth": 1, "pointSize": 5, "scaleDistribution": { "type": "linear" }, "showPoints": "never", "spanNulls": false, "stacking": { "group": "A", "mode": "none" }, "thresholdsStyle": { "mode": "off" } },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 6 },
+      "id": 12,
+      "options": { "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [{ "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "sum by (node) (rate(veltrixdb_storage_wal_flushes_total{node=~\"$node\"}[5m]))", "legendFormat": "WAL Flushes/s — {{node}}", "refId": "A" }],
+      "title": "WAL fdatasync Flush Rate",
+      "type": "timeseries"
+    },
+
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 14 },
+      "id": 13,
+      "title": "🎯 Latency Percentiles — P50 / P95 / P99",
+      "type": "row"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Write (PUT) latency distribution — P50 is the median, P95 catches most outliers, P99 is the tail you care about in SLA terms. WAL group-commit floor: ~5ms window + ~0.2ms NVMe fdatasync. P99 target: <20ms. Spikes = NVMe back-pressure, CPU saturation, or GC pausing the WAL flusher goroutine.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "ms", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 10, "gradientMode": "none", "hideFrom": { "legend": false, "tooltip": false, "viz": false }, "lineInterpolation": "linear", "lineWidth": 2, "pointSize": 5, "scaleDistribution": { "type": "linear" }, "showPoints": "never", "spanNulls": false, "stacking": { "group": "A", "mode": "none" }, "thresholdsStyle": { "mode": "line+area" } },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "transparent", "value": null }, { "color": "yellow", "value": 10 }, { "color": "red", "value": 20 }] },
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 15 },
+      "id": 14,
+      "options": { "legend": { "calcs": ["mean", "max", "lastNotNull"], "displayMode": "table", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "histogram_quantile(0.50, sum(rate(veltrixdb_storage_write_latency_seconds_bucket{node=~\"$node\"}[5m])) by (le)) * 1000", "legendFormat": "Write P50 ms", "refId": "A" },
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "histogram_quantile(0.95, sum(rate(veltrixdb_storage_write_latency_seconds_bucket{node=~\"$node\"}[5m])) by (le)) * 1000", "legendFormat": "Write P95 ms", "refId": "B" },
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "histogram_quantile(0.99, sum(rate(veltrixdb_storage_write_latency_seconds_bucket{node=~\"$node\"}[5m])) by (le)) * 1000", "legendFormat": "Write P99 ms", "refId": "C" }
+      ],
+      "title": "Write Latency — P50 / P95 / P99 (ms)",
+      "type": "timeseries"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Read (GET) latency distribution — P50 is the median, P99 is the SLA tail. LIRS cache hit: <0.2ms. NVMe VLog miss: 1–5ms. SLA target: P99 <5ms on n2-highmem-64 with -cache 409600 (entire 1B-key dataset in RAM). Persistent P99 >5ms = working set exceeds cache size or VLog reads queuing behind write bursts.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "ms", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 10, "gradientMode": "none", "hideFrom": { "legend": false, "tooltip": false, "viz": false }, "lineInterpolation": "linear", "lineWidth": 2, "pointSize": 5, "scaleDistribution": { "type": "linear" }, "showPoints": "never", "spanNulls": false, "stacking": { "group": "A", "mode": "none" }, "thresholdsStyle": { "mode": "line+area" } },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "transparent", "value": null }, { "color": "yellow", "value": 2 }, { "color": "red", "value": 5 }] },
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 15 },
+      "id": 15,
+      "options": { "legend": { "calcs": ["mean", "max", "lastNotNull"], "displayMode": "table", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "histogram_quantile(0.50, sum(rate(veltrixdb_storage_read_latency_seconds_bucket{node=~\"$node\"}[5m])) by (le)) * 1000", "legendFormat": "Read P50 ms", "refId": "A" },
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "histogram_quantile(0.95, sum(rate(veltrixdb_storage_read_latency_seconds_bucket{node=~\"$node\"}[5m])) by (le)) * 1000", "legendFormat": "Read P95 ms", "refId": "B" },
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "histogram_quantile(0.99, sum(rate(veltrixdb_storage_read_latency_seconds_bucket{node=~\"$node\"}[5m])) by (le)) * 1000", "legendFormat": "Read P99 ms", "refId": "C" }
+      ],
+      "title": "Read Latency — P50 / P95 / P99 (ms)",
+      "type": "timeseries"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Delete (DEL) latency distribution. A DEL writes a tombstone to WAL — same path as PUT — so the floor matches write latency (~5ms WAL window + fdatasync). Physical removal is deferred to the Defragmenter (zero cost at delete time). P99 spikes here track write P99 spikes exactly.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "ms", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 10, "gradientMode": "none", "hideFrom": { "legend": false, "tooltip": false, "viz": false }, "lineInterpolation": "linear", "lineWidth": 2, "pointSize": 5, "scaleDistribution": { "type": "linear" }, "showPoints": "never", "spanNulls": false, "stacking": { "group": "A", "mode": "none" }, "thresholdsStyle": { "mode": "line+area" } },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "transparent", "value": null }, { "color": "yellow", "value": 10 }, { "color": "red", "value": 20 }] },
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 15 },
+      "id": 16,
+      "options": { "legend": { "calcs": ["mean", "max", "lastNotNull"], "displayMode": "table", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "histogram_quantile(0.50, sum(rate(veltrixdb_storage_delete_latency_seconds_bucket{node=~\"$node\"}[5m])) by (le)) * 1000", "legendFormat": "Delete P50 ms", "refId": "A" },
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "histogram_quantile(0.95, sum(rate(veltrixdb_storage_delete_latency_seconds_bucket{node=~\"$node\"}[5m])) by (le)) * 1000", "legendFormat": "Delete P95 ms", "refId": "B" },
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "histogram_quantile(0.99, sum(rate(veltrixdb_storage_delete_latency_seconds_bucket{node=~\"$node\"}[5m])) by (le)) * 1000", "legendFormat": "Delete P99 ms", "refId": "C" }
+      ],
+      "title": "Delete Latency — P50 / P95 / P99 (ms)",
+      "type": "timeseries"
+    },
+
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 23 },
+      "id": 17,
+      "title": "💾 LIRS Cache",
+      "type": "row"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "LIRS is a scan-resistant cache: it keeps 95% of RAM for the hot key set (LIR) and 5% for cold candidates (HIR). Unlike LRU, a scan through 10 million cold keys won't evict your hot working set. Hit rate above 90% = healthy. Below 70% = cache is too small, or access pattern is nearly random across a very large key space.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "hit rate", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 20, "gradientMode": "scheme", "hideFrom": { "legend": false, "tooltip": false, "viz": false }, "lineInterpolation": "linear", "lineWidth": 2, "pointSize": 5, "scaleDistribution": { "type": "linear" }, "showPoints": "never", "spanNulls": false, "stacking": { "group": "A", "mode": "none" }, "thresholdsStyle": { "mode": "line" } },
+          "mappings": [],
+          "max": 1,
+          "min": 0,
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "red", "value": null }, { "color": "yellow", "value": 0.7 }, { "color": "green", "value": 0.9 }] },
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 24 },
+      "id": 18,
+      "options": { "legend": { "calcs": ["mean", "lastNotNull"], "displayMode": "table", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "veltrixdb_cache_hit_rate{node=~\"$node\"}", "legendFormat": "Hit Rate (engine) — {{node}}", "refId": "A" },
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "sum by (node) (rate(veltrixdb_cache_hits_total{node=~\"$node\"}[5m])) / (sum by (node) (rate(veltrixdb_cache_hits_total{node=~\"$node\"}[5m])) + sum by (node) (rate(veltrixdb_cache_misses_total{node=~\"$node\"}[5m])))", "legendFormat": "Hit Rate (computed) — {{node}}", "refId": "B" }
+      ],
+      "title": "LIRS Cache Hit Rate",
+      "type": "timeseries"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "RAM bytes currently used by cached values vs the configured maximum (your --cache flag). The dashed red line is your cap. When 'Used' approaches the cap, LIRS evicts cold keys. Small values (≤256 bytes) are eviction-resistant (priority=2) so they stay longer. If you see unwanted evictions, increase --cache.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "bytes", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 15, "gradientMode": "none", "hideFrom": { "legend": false, "tooltip": false, "viz": false }, "lineInterpolation": "linear", "lineWidth": 2, "pointSize": 5, "scaleDistribution": { "type": "linear" }, "showPoints": "never", "spanNulls": false, "stacking": { "group": "A", "mode": "none" }, "thresholdsStyle": { "mode": "off" } },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
+          "unit": "bytes"
+        },
+        "overrides": [{ "matcher": { "id": "byName", "options": "Capacity" }, "properties": [{ "id": "custom.lineStyle", "value": { "dash": [10, 10], "fill": "dash" } }, { "id": "color", "value": { "fixedColor": "red", "mode": "fixed" } }] }]
+      },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 24 },
+      "id": 19,
+      "options": { "legend": { "calcs": ["lastNotNull"], "displayMode": "table", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "sum by (node) (veltrixdb_cache_size_bytes{node=~\"$node\"})", "legendFormat": "Used — {{node}}", "refId": "A" },
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "sum by (node) (veltrixdb_cache_max_size_bytes{node=~\"$node\"})", "legendFormat": "Capacity", "refId": "B" }
+      ],
+      "title": "LIRS Cache RAM: Used vs Capacity",
+      "type": "timeseries"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Keys evicted per second split by reason. LIRS pressure = cache is full and a cold key was sacrificed (normal). TTL expired = key's time-to-live ran out (expected if you use TTLs). Defrag GC = defragmenter removed a key from cache during cleanup. Stacked bars let you see the total eviction rate and its composition. High LIRS pressure sustained = cache too small.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "evictions/s", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "bars", "fillOpacity": 70, "gradientMode": "none", "hideFrom": { "legend": false, "tooltip": false, "viz": false }, "lineInterpolation": "linear", "lineWidth": 1, "pointSize": 5, "scaleDistribution": { "type": "linear" }, "showPoints": "never", "spanNulls": false, "stacking": { "group": "A", "mode": "normal" }, "thresholdsStyle": { "mode": "off" } },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 24 },
+      "id": 20,
+      "options": { "legend": { "calcs": ["sum"], "displayMode": "table", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "sum by (node) (rate(veltrixdb_cache_evictions_total{node=~\"$node\", type=\"lirs\"}[5m]))", "legendFormat": "LIRS pressure — {{node}}", "refId": "A" },
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "sum by (node) (rate(veltrixdb_cache_evictions_total{node=~\"$node\", type=\"ttl\"}[5m]))", "legendFormat": "TTL expired — {{node}}", "refId": "B" },
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "sum by (node) (rate(veltrixdb_cache_evictions_total{node=~\"$node\", type=\"defrag\"}[5m]))", "legendFormat": "Defrag GC — {{node}}", "refId": "C" }
+      ],
+      "title": "Cache Evictions / s (by type, stacked)",
+      "type": "timeseries"
+    },
+
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 32 },
+      "id": 21,
+      "title": "🗂️ VLog / NVMe per Disk",
+      "type": "row"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "How many gigabytes each NVMe disk's VLog file has grown to. VeltrixDB uses WiscKey KV-separation: all values go to VLog, keys stay in RAM. All 8 disks should grow at roughly the same rate — a disk 2× larger than others means that disk's shards are hotter. The TOTAL line is the sum. VLog only shrinks during GC.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "GB", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 10, "gradientMode": "none", "hideFrom": { "legend": false, "tooltip": false, "viz": false }, "lineInterpolation": "linear", "lineWidth": 2, "pointSize": 5, "scaleDistribution": { "type": "linear" }, "showPoints": "never", "spanNulls": false, "stacking": { "group": "A", "mode": "none" }, "thresholdsStyle": { "mode": "off" } },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
+          "unit": "decgbytes"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 33 },
+      "id": 22,
+      "options": { "legend": { "calcs": ["lastNotNull"], "displayMode": "table", "placement": "right", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "veltrixdb_vlog_file_bytes{node=~\"$node\"} / 1e9", "legendFormat": "disk-{{disk}} ({{node}})", "refId": "A" },
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "sum by (node) (veltrixdb_vlog_file_bytes{node=~\"$node\"}) / 1e9", "legendFormat": "TOTAL ({{node}})", "refId": "B" }
+      ],
+      "title": "VLog File Size per NVMe Disk",
+      "type": "timeseries"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "What fraction of each disk's VLog is dead/wasted space from overwritten or deleted keys. Think of it like disk fragmentation. Yellow at 25% = approaching the GC trigger. Red at 30% = GC threshold (DefragThreshold=0.30) — VLog GC kicks in, rewriting live data to reclaim space. GC is I/O-intensive but necessary. All disks should stay similar — a disk much higher than others had more overwrites/deletes on its shards.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "garbage %", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 15, "gradientMode": "none", "hideFrom": { "legend": false, "tooltip": false, "viz": false }, "lineInterpolation": "linear", "lineWidth": 2, "pointSize": 5, "scaleDistribution": { "type": "linear" }, "showPoints": "never", "spanNulls": false, "stacking": { "group": "A", "mode": "none" }, "thresholdsStyle": { "mode": "line+area" } },
+          "mappings": [],
+          "max": 1,
+          "min": 0,
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "transparent", "value": null }, { "color": "yellow", "value": 0.25 }, { "color": "red", "value": 0.30 }] },
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 33 },
+      "id": 23,
+      "options": { "legend": { "calcs": ["lastNotNull"], "displayMode": "table", "placement": "right", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "veltrixdb_vlog_garbage_ratio{node=~\"$node\"}", "legendFormat": "disk-{{disk}} ({{node}})", "refId": "A" },
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "avg by (node) (veltrixdb_vlog_garbage_ratio{node=~\"$node\"})", "legendFormat": "AVG ({{node}})", "refId": "B" }
+      ],
+      "title": "VLog Garbage Ratio per Disk  (red = GC threshold 0.30)",
+      "type": "timeseries"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "How often VLog GC runs per second (counter increments only when ≥1 byte was reclaimed). GC is triggered when a disk's garbage ratio exceeds the DefragThreshold (default 0.30). Each run reads live values from the pre-horizon region and rewrites them to the tail — like defragmenting a hard drive. Spikes after bulk deletes or overwrites are expected and healthy. Zero for long periods with garbage_ratio > 0.30 = check the GC Diagnostics section below.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "runs/s", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "bars", "fillOpacity": 70, "gradientMode": "none", "hideFrom": { "legend": false, "tooltip": false, "viz": false }, "lineInterpolation": "linear", "lineWidth": 1, "pointSize": 5, "scaleDistribution": { "type": "linear" }, "showPoints": "never", "spanNulls": false, "stacking": { "group": "A", "mode": "none" }, "thresholdsStyle": { "mode": "off" } },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 41 },
+      "id": 24,
+      "options": { "legend": { "calcs": ["sum"], "displayMode": "table", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [{ "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "rate(veltrixdb_vlog_gc_runs_total{node=~\"$node\"}[5m])", "legendFormat": "GC Runs/s — {{node}}", "refId": "A" }],
+      "title": "VLog GC Runs / s",
+      "type": "timeseries"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Bytes of NVMe disk space freed per second by VLog GC. High reclaim rates after a bulk delete wave are expected and healthy. If reclaim rate > VLog write rate, the VLog is shrinking. If reclaim rate stays near 0 with garbage ratio >50%, GC may be failing — check logs for VLog GC errors.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "bytes/s", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 15, "gradientMode": "none", "hideFrom": { "legend": false, "tooltip": false, "viz": false }, "lineInterpolation": "linear", "lineWidth": 2, "pointSize": 5, "scaleDistribution": { "type": "linear" }, "showPoints": "never", "spanNulls": false, "stacking": { "group": "A", "mode": "none" }, "thresholdsStyle": { "mode": "off" } },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
+          "unit": "Bps"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 41 },
+      "id": 25,
+      "options": { "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [{ "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "rate(veltrixdb_vlog_gc_bytes_total{node=~\"$node\"}[5m])", "legendFormat": "GC Bytes/s — {{node}}", "refId": "A" }],
+      "title": "VLog GC Bytes Reclaimed / s",
+      "type": "timeseries"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "VLog reads (cache miss → NVMe fetch) and VLog writes (every PUT stores value here) per second. VLog reads should be much lower than total reads if cache hit rate is high. VLog writes should approximately equal storage writes when KV-separation is on. A large gap between storage writes and VLog writes = KV separation path issue.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "ops/s", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 10, "gradientMode": "none", "hideFrom": { "legend": false, "tooltip": false, "viz": false }, "lineInterpolation": "linear", "lineWidth": 2, "pointSize": 5, "scaleDistribution": { "type": "linear" }, "showPoints": "never", "spanNulls": false, "stacking": { "group": "A", "mode": "none" }, "thresholdsStyle": { "mode": "off" } },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 41 },
+      "id": 26,
+      "options": { "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "rate(veltrixdb_vlog_reads_total{node=~\"$node\"}[5m])", "legendFormat": "VLog Reads/s — {{node}}", "refId": "A" },
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "rate(veltrixdb_vlog_writes_total{node=~\"$node\"}[5m])", "legendFormat": "VLog Writes/s — {{node}}", "refId": "B" }
+      ],
+      "title": "VLog Read / Write Ops / s",
+      "type": "timeseries"
+    },
+
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 49 },
+      "id": 27,
+      "title": "🧠 Index Vault & RAM Utilization",
+      "type": "row"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Live key count over time. Steady upward slope = data ingestion. Plateau = balanced writes and deletes. Sharp drop = bulk delete or mass TTL expiry. At 1 billion keys, each IndexEntry is ~100–200 bytes = 100–200 GB RAM used for the index alone. This metric directly tells you how much RAM the index is consuming.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "keys", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 10, "gradientMode": "none", "hideFrom": { "legend": false, "tooltip": false, "viz": false }, "lineInterpolation": "linear", "lineWidth": 2, "pointSize": 5, "scaleDistribution": { "type": "linear" }, "showPoints": "never", "spanNulls": false, "stacking": { "group": "A", "mode": "none" }, "thresholdsStyle": { "mode": "off" } },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 50 },
+      "id": 28,
+      "options": { "legend": { "calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [{ "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "veltrixdb_storage_index_size_keys{node=~\"$node\"}", "legendFormat": "Live Keys — {{node}}", "refId": "A" }],
+      "title": "Index Vault — Live Key Count (RAM)",
+      "type": "timeseries"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Visual fill meter: how full the LIRS cache is as a percentage of its configured max. Green = room to grow. Yellow (>70%) = evictions are increasing, consider bumping --cache. Red (>90%) = heavy eviction pressure, hot keys may be displaced before they can be used again. Keep below 80% for comfortable headroom.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "mappings": [],
+          "max": 1,
+          "min": 0,
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 0.7 }, { "color": "red", "value": 0.9 }] },
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 50 },
+      "id": 29,
+      "options": { "displayMode": "lcd", "minVizHeight": 10, "minVizWidth": 0, "orientation": "horizontal", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "showUnfilled": true, "text": {} },
+      "targets": [{ "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "veltrixdb_cache_size_bytes{node=~\"$node\"} / veltrixdb_cache_max_size_bytes{node=~\"$node\"}", "legendFormat": "Cache Fill — {{node}}", "refId": "A" }],
+      "title": "Cache RAM Fill Ratio (Used / Max)",
+      "type": "bargauge"
+    },
+
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 58 },
+      "id": 30,
+      "title": "🔧 Compaction, SSTable & Defrag — Is Anything Running?",
+      "type": "row"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "How active compaction is. Compaction flushes dirty in-memory index entries to on-disk SSTable segment files. It runs every 120 seconds by default (DefragInterval). Each bar = one compaction cycle. If this stays at 0 for >2 minutes during active writes, the compaction goroutine may be stuck — check logs for [engine:compaction] lines.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "runs/s", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "bars", "fillOpacity": 70, "gradientMode": "none", "hideFrom": { "legend": false, "tooltip": false, "viz": false }, "lineInterpolation": "linear", "lineWidth": 1, "pointSize": 5, "scaleDistribution": { "type": "linear" }, "showPoints": "never", "spanNulls": false, "stacking": { "group": "A", "mode": "none" }, "thresholdsStyle": { "mode": "off" } },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 59 },
+      "id": 31,
+      "options": { "legend": { "calcs": ["sum"], "displayMode": "table", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [{ "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "rate(veltrixdb_storage_compaction_runs_total{node=~\"$node\"}[5m])", "legendFormat": "Compaction Runs/s — {{node}}", "refId": "A" }],
+      "title": "Compaction Runs / s (memtable → SSTable) — Is it running?",
+      "type": "timeseries"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "SSTable segment files created per second. Each compaction cycle writes one SSTable per disk (up to 8 SSTable files per run). This counter growing steadily = compaction is healthy. Flat for >2 minutes with active writes = stuck compaction. SSTables are immutable once written — they accumulate until older ones are superseded by new compaction output.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "files/s", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "bars", "fillOpacity": 70, "gradientMode": "none", "hideFrom": { "legend": false, "tooltip": false, "viz": false }, "lineInterpolation": "linear", "lineWidth": 1, "pointSize": 5, "scaleDistribution": { "type": "linear" }, "showPoints": "never", "spanNulls": false, "stacking": { "group": "A", "mode": "none" }, "thresholdsStyle": { "mode": "off" } },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 59 },
+      "id": 32,
+      "options": { "legend": { "calcs": ["sum"], "displayMode": "table", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "rate(veltrixdb_storage_sstable_creations_total{node=~\"$node\"}[5m])", "legendFormat": "SSTable Files/s — {{node}}", "refId": "A" },
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "veltrixdb_storage_sstable_creations_total{node=~\"$node\"}", "legendFormat": "Total SSTables (cumulative) — {{node}}", "refId": "B" }
+      ],
+      "title": "SSTable Creations / s + Cumulative Total",
+      "type": "timeseries"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "The Defragmenter scans all shards looking for tombstones (deleted keys) past their grace period and physically removes them. It also checks each disk's VLog garbage ratio and triggers VLog GC when >50%. Runs every 120 seconds. Each bar = one full defrag pass. This is the process that keeps the index clean and VLog from growing forever.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "passes/s", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "bars", "fillOpacity": 70, "gradientMode": "none", "hideFrom": { "legend": false, "tooltip": false, "viz": false }, "lineInterpolation": "linear", "lineWidth": 1, "pointSize": 5, "scaleDistribution": { "type": "linear" }, "showPoints": "never", "spanNulls": false, "stacking": { "group": "A", "mode": "none" }, "thresholdsStyle": { "mode": "off" } },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 59 },
+      "id": 33,
+      "options": { "legend": { "calcs": ["sum"], "displayMode": "table", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [{ "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "rate(veltrixdb_storage_defrag_runs_total{node=~\"$node\"}[5m])", "legendFormat": "Defrag Passes/s — {{node}}", "refId": "A" }],
+      "title": "Defragmenter (Tombstone GC) Passes / s",
+      "type": "timeseries"
+    },
+
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 67 },
+      "id": 34,
+      "title": "🗑️ Delete Operations & Tombstones",
+      "type": "row"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "DEL operations per second — Phase 1 of deletion. A delete immediately writes a tombstone record to WAL and marks the key as logically deleted in the in-memory index. The client gets an OK response. Phase 2 (physical cleanup) happens later. Cost = same as a write: ~5ms at 5ms WAL window.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "ops/s", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 20, "gradientMode": "none", "hideFrom": { "legend": false, "tooltip": false, "viz": false }, "lineInterpolation": "linear", "lineWidth": 2, "pointSize": 5, "scaleDistribution": { "type": "linear" }, "showPoints": "never", "spanNulls": false, "stacking": { "group": "A", "mode": "none" }, "thresholdsStyle": { "mode": "off" } },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 68 },
+      "id": 35,
+      "options": { "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [{ "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "rate(veltrixdb_storage_deletes_total{node=~\"$node\"}[5m])", "legendFormat": "DEL/s — {{node}}", "refId": "A" }],
+      "title": "Delete Ops / s (Phase 1: tombstone written)",
+      "type": "timeseries"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Tombstones physically removed per second — Phase 2 of deletion. After the grace period, the Defragmenter finds expired tombstones and removes them from the index + frees VLog space via MarkDead(). Spikes here after bulk deletes are healthy. If deletes/s >> tombstones collected/s for extended periods, tombstone backlog is growing and index RAM is being wasted.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "tombstones/s", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "bars", "fillOpacity": 70, "gradientMode": "none", "hideFrom": { "legend": false, "tooltip": false, "viz": false }, "lineInterpolation": "linear", "lineWidth": 1, "pointSize": 5, "scaleDistribution": { "type": "linear" }, "showPoints": "never", "spanNulls": false, "stacking": { "group": "A", "mode": "none" }, "thresholdsStyle": { "mode": "off" } },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 68 },
+      "id": 36,
+      "options": { "legend": { "calcs": ["sum"], "displayMode": "table", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [{ "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "rate(veltrixdb_storage_tombstones_collected_total{node=~\"$node\"}[5m])", "legendFormat": "Tombstones GC'd/s — {{node}}", "refId": "A" }],
+      "title": "Tombstones Physically Collected / s (Phase 2: after grace period)",
+      "type": "timeseries"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Bloom filter false positives per second. Before an SSTable disk read, VeltrixDB checks a bloom filter — a probabilistic structure that says 'this key might be here'. A false positive = filter said maybe but key wasn't there = wasted NVMe read. High FP rate means either the filter is too small or many reads are for keys that don't exist.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "fps/s", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "bars", "fillOpacity": 70, "gradientMode": "none", "hideFrom": { "legend": false, "tooltip": false, "viz": false }, "lineInterpolation": "linear", "lineWidth": 1, "pointSize": 5, "scaleDistribution": { "type": "linear" }, "showPoints": "never", "spanNulls": false, "stacking": { "group": "A", "mode": "none" }, "thresholdsStyle": { "mode": "off" } },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 68 },
+      "id": 37,
+      "options": { "legend": { "calcs": ["sum"], "displayMode": "table", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [{ "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "rate(veltrixdb_storage_bloom_false_positives_total{node=~\"$node\"}[5m])", "legendFormat": "Bloom FP/s — {{node}}", "refId": "A" }],
+      "title": "Bloom Filter False Positives / s (wasted NVMe reads)",
+      "type": "timeseries"
+    },
+
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 76 },
+      "id": 38,
+      "title": "🌐 Cluster & Failure Detector",
+      "type": "row"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Total nodes in the cluster consistent-hash ring. Keys are distributed by FNV-1a hash. Should match your target deployment size. If this drops, a node left the ring — either planned scale-down or a crash.",
+      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "mappings": [], "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "red", "value": 0 }] }, "unit": "short" }, "overrides": [] },
+      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 77 },
+      "id": 39,
+      "options": { "colorMode": "background", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
+      "targets": [{ "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "sum(veltrixdb_cluster_nodes_total{node=~\"$node\"})", "legendFormat": "Nodes", "refId": "A" }],
+      "title": "Total Cluster Nodes",
+      "type": "stat"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Monotonically increasing version of the partition map (the routing table). Increments on every node add, remove, or rebalance. Rapidly increasing version number = cluster topology churn. Stable = cluster is settled and not resharding.",
+      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "mappings": [], "thresholds": { "mode": "absolute", "steps": [{ "color": "blue", "value": null }] }, "unit": "short" }, "overrides": [] },
+      "gridPos": { "h": 4, "w": 4, "x": 4, "y": 77 },
+      "id": 40,
+      "options": { "colorMode": "value", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
+      "targets": [{ "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "max(veltrixdb_cluster_partition_map_version{node=~\"$node\"})", "legendFormat": "Version", "refId": "A" }],
+      "title": "Partition Map Version",
+      "type": "stat"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Nodes currently detected as failed by the gossip failure detector (missed heartbeat for >10 seconds). Any nonzero value = a node is down or partitioned. Red background = immediate action needed. Also check FD False Positives to distinguish real failures from GC-pause false alarms.",
+      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "mappings": [], "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "red", "value": 1 }] }, "unit": "short" }, "overrides": [] },
+      "gridPos": { "h": 4, "w": 4, "x": 8, "y": 77 },
+      "id": 41,
+      "options": { "colorMode": "background", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
+      "targets": [{ "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "sum(veltrixdb_failure_detector_nodes_failed_total{node=~\"$node\"})", "legendFormat": "Failed", "refId": "A" }],
+      "title": "Nodes Detected Failed",
+      "type": "stat"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Times the failure detector incorrectly flagged a healthy node as dead. Caused by GC pauses or network hiccups. In single-node mode, if this ticks up continuously, SetLocalNode() was not called before fd.Start() — see Invariant #11 in CLAUDE.md.",
+      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "mappings": [], "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 1 }] }, "unit": "short" }, "overrides": [] },
+      "gridPos": { "h": 4, "w": 4, "x": 12, "y": 77 },
+      "id": 42,
+      "options": { "colorMode": "background", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
+      "targets": [{ "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "sum(veltrixdb_failure_detector_false_positives_total{node=~\"$node\"})", "legendFormat": "FP", "refId": "A" }],
+      "title": "FD False Positives",
+      "type": "stat"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Total nodes ever joined the cluster (cumulative). Combined with Node Removals: current size ≈ Additions - Removals. Useful for scale-out history and auditing.",
+      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "mappings": [], "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }, "unit": "short" }, "overrides": [] },
+      "gridPos": { "h": 4, "w": 4, "x": 16, "y": 77 },
+      "id": 43,
+      "options": { "colorMode": "background", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
+      "targets": [{ "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "sum(veltrixdb_cluster_node_additions_total{node=~\"$node\"})", "legendFormat": "Additions", "refId": "A" }],
+      "title": "Node Additions (total)",
+      "type": "stat"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Total nodes ever removed from the cluster (cumulative). Compare with Nodes Detected Failed to distinguish planned scale-down (removals without failures) from crashes (removals matching failures).",
+      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "mappings": [], "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 1 }] }, "unit": "short" }, "overrides": [] },
+      "gridPos": { "h": 4, "w": 4, "x": 20, "y": 77 },
+      "id": 44,
+      "options": { "colorMode": "background", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
+      "targets": [{ "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "sum(veltrixdb_cluster_node_removals_total{node=~\"$node\"})", "legendFormat": "Removals", "refId": "A" }],
+      "title": "Node Removals (total)",
+      "type": "stat"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Cluster membership change events per second over time. Node additions/removals, partition rebalances (key-range redistribution across ring), and partition migrations (individual shard moves between nodes). In a settled cluster, all lines are flat at 0. Spikes = planned maintenance or unplanned failures.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "events/s", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 15, "gradientMode": "none", "hideFrom": { "legend": false, "tooltip": false, "viz": false }, "lineInterpolation": "linear", "lineWidth": 2, "pointSize": 5, "scaleDistribution": { "type": "linear" }, "showPoints": "never", "spanNulls": false, "stacking": { "group": "A", "mode": "none" }, "thresholdsStyle": { "mode": "off" } },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 81 },
+      "id": 45,
+      "options": { "legend": { "calcs": ["sum"], "displayMode": "table", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "rate(veltrixdb_cluster_node_additions_total{node=~\"$node\"}[5m])", "legendFormat": "Additions/s — {{node}}", "refId": "A" },
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "rate(veltrixdb_cluster_node_removals_total{node=~\"$node\"}[5m])", "legendFormat": "Removals/s — {{node}}", "refId": "B" },
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "rate(veltrixdb_cluster_rebalances_total{node=~\"$node\"}[5m])", "legendFormat": "Rebalances/s — {{node}}", "refId": "C" },
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "rate(veltrixdb_cluster_partition_migrations_total{node=~\"$node\"}[5m])", "legendFormat": "Migrations/s — {{node}}", "refId": "D" }
+      ],
+      "title": "Cluster Events / s",
+      "type": "timeseries"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Failure detector health events per second. In a healthy cluster with no incidents, all lines sit at 0. 'Nodes Failed/s' = new failure detections. 'Recovered/s' = nodes that came back. 'False Positives/s' = incorrect detections (GC pauses, network jitter). 'Recovery Attempts' = ping probes to failed nodes.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "events/s", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 15, "gradientMode": "none", "hideFrom": { "legend": false, "tooltip": false, "viz": false }, "lineInterpolation": "linear", "lineWidth": 2, "pointSize": 5, "scaleDistribution": { "type": "linear" }, "showPoints": "never", "spanNulls": false, "stacking": { "group": "A", "mode": "none" }, "thresholdsStyle": { "mode": "off" } },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 81 },
+      "id": 46,
+      "options": { "legend": { "calcs": ["sum"], "displayMode": "table", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "rate(veltrixdb_failure_detector_nodes_failed_total{node=~\"$node\"}[5m])", "legendFormat": "Nodes Failed/s — {{node}}", "refId": "A" },
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "rate(veltrixdb_failure_detector_nodes_recovered_total{node=~\"$node\"}[5m])", "legendFormat": "Recovered/s — {{node}}", "refId": "B" },
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "rate(veltrixdb_failure_detector_false_positives_total{node=~\"$node\"}[5m])", "legendFormat": "False Positives/s — {{node}}", "refId": "C" },
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "rate(veltrixdb_failure_detector_recovery_attempts_total{node=~\"$node\"}[5m])", "legendFormat": "Recovery Attempts/s — {{node}}", "refId": "D" },
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "rate(veltrixdb_failure_detector_recovery_success_total{node=~\"$node\"}[5m])", "legendFormat": "Recovery Success/s — {{node}}", "refId": "E" }
+      ],
+      "title": "Failure Detector Events / s",
+      "type": "timeseries"
+    },
+
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 89 },
+      "id": 100,
+      "title": "🔬 Write Path Deep Dive — Batcher → WAL → VLog Pipeline",
+      "type": "row"
+    },
+
+    
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Average number of writes batched into a single WAL fdatasync. This is THE key throughput efficiency metric. At 2ms window + 1K writes/s ≈ 2 entries/flush (1 fdatasync per 2 writes = wasteful). At 5ms window + 10K writes/s ≈ 50 entries/flush. At 5ms + 50K writes/s ≈ 250 entries/flush. Formula: writes/s ÷ wal_flushes/s. Red below 5, yellow 5–20, green above 20. If stuck at 1–3 at low write rates, that is normal — the timer flush fires before writes accumulate.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "entries / flush", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 20, "gradientMode": "none", "hideFrom": { "legend": false, "tooltip": false, "viz": false }, "lineInterpolation": "linear", "lineWidth": 2, "pointSize": 5, "scaleDistribution": { "type": "linear" }, "showPoints": "never", "spanNulls": false, "stacking": { "group": "A", "mode": "none" }, "thresholdsStyle": { "mode": "line" } },
+          "mappings": [],
+          "min": 0,
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "red", "value": null }, { "color": "yellow", "value": 5 }, { "color": "green", "value": 20 }] },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 90 },
+      "id": 47,
+      "options": { "legend": { "calcs": ["mean", "max", "lastNotNull"], "displayMode": "table", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [{ "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "rate(veltrixdb_storage_writes_total{node=~\"$node\"}[5m]) / rate(veltrixdb_storage_wal_flushes_total{node=~\"$node\"}[5m])", "legendFormat": "Entries/Flush — {{node}}", "refId": "A" }],
+      "title": "WAL Avg Batch Size — entries per fdatasync (key efficiency metric)",
+      "type": "timeseries"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "How many PUT operations were throttled (stalled for 1ms) because the dirty memtable grew too large. When un-flushed keys exceed BackPressureThreshold (30M), VeltrixDB sleeps 1ms before accepting more — like a traffic light to prevent RAM overflow. Any nonzero value = writes are faster than compaction drains the memtable. Fix: reduce write rate, lower DefragInterval, or raise BackPressureThreshold.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "stalls/s", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "bars", "fillOpacity": 70, "gradientMode": "none", "hideFrom": { "legend": false, "tooltip": false, "viz": false }, "lineInterpolation": "linear", "lineWidth": 1, "pointSize": 5, "scaleDistribution": { "type": "linear" }, "showPoints": "never", "spanNulls": false, "stacking": { "group": "A", "mode": "none" }, "thresholdsStyle": { "mode": "line" } },
+          "mappings": [],
+          "min": 0,
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 1 }, { "color": "red", "value": 100 }] },
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 90 },
+      "id": 48,
+      "options": { "legend": { "calcs": ["sum", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [{ "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "rate(veltrixdb_storage_write_backpressure_events_total{node=~\"$node\"}[5m])", "legendFormat": "Stalls/s — {{node}}", "refId": "A" }],
+      "title": "Write Backpressure Stalls / s (memtable full → 1ms sleep per stall)",
+      "type": "timeseries"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "All three write pipeline stages shown together so you can compare rates and spot bottlenecks. ① WAL Flushes/s = how often WAL commits to disk (~200/s at 5ms window regardless of load). ② VLog Writes/s = values landing on NVMe — should track writes/s. ③ Compaction Runs/s = dirty index flushed to SSTable every 120s. If WAL >> VLog writes, KV-separation is misconfigured. If compaction is 0, memtable is piling up.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "ops/s", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 10, "gradientMode": "none", "hideFrom": { "legend": false, "tooltip": false, "viz": false }, "lineInterpolation": "linear", "lineWidth": 2, "pointSize": 5, "scaleDistribution": { "type": "linear" }, "showPoints": "never", "spanNulls": false, "stacking": { "group": "A", "mode": "none" }, "thresholdsStyle": { "mode": "off" } },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 90 },
+      "id": 49,
+      "options": { "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "rate(veltrixdb_storage_wal_flushes_total{node=~\"$node\"}[5m])", "legendFormat": "① WAL Flushes/s — {{node}}", "refId": "A" },
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "rate(veltrixdb_vlog_writes_total{node=~\"$node\"}[5m])", "legendFormat": "② VLog Writes/s — {{node}}", "refId": "B" },
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "rate(veltrixdb_storage_compaction_runs_total{node=~\"$node\"}[5m])", "legendFormat": "③ Compaction Runs/s — {{node}}", "refId": "C" }
+      ],
+      "title": "Write Pipeline: ① WAL Flush  ② VLog Append  ③ Compaction",
+      "type": "timeseries"
+    },
+
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 98 },
+      "id": 101,
+      "title": "📖 Read Path Deep Dive — Cache → Index → VLog",
+      "type": "row"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Every GET either hits the LIRS cache (answered from RAM, green) or misses and falls through to the index+disk (red). In a well-tuned system the green area dominates. If red is significant: (1) cache is too small — bump --cache, (2) access pattern is random across a very large key space, or (3) cache just restarted and is warming up (normal for 5–10 minutes after restart).",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "ops/s", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 30, "gradientMode": "none", "hideFrom": { "legend": false, "tooltip": false, "viz": false }, "lineInterpolation": "linear", "lineWidth": 2, "pointSize": 5, "scaleDistribution": { "type": "linear" }, "showPoints": "never", "spanNulls": false, "stacking": { "group": "A", "mode": "normal" }, "thresholdsStyle": { "mode": "off" } },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
+          "unit": "reqps"
+        },
+        "overrides": [
+          { "matcher": { "id": "byRegexp", "options": "Cache Hits.*" }, "properties": [{ "id": "color", "value": { "fixedColor": "green", "mode": "fixed" } }] },
+          { "matcher": { "id": "byRegexp", "options": "Cache Misses.*" }, "properties": [{ "id": "color", "value": { "fixedColor": "red", "mode": "fixed" } }] }
+        ]
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 99 },
+      "id": 50,
+      "options": { "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "rate(veltrixdb_cache_hits_total{node=~\"$node\"}[5m])", "legendFormat": "Cache Hits/s (RAM) — {{node}}", "refId": "A" },
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "rate(veltrixdb_cache_misses_total{node=~\"$node\"}[5m])", "legendFormat": "Cache Misses/s (disk or not-found) — {{node}}", "refId": "B" }
+      ],
+      "title": "Read Sources: Cache Hits (RAM, green) vs Misses (disk or not-found, red)",
+      "type": "timeseries"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "A cache miss leads to one of two outcomes: (1) key exists on disk → VLog read from NVMe (1–5ms), shown in blue, or (2) key doesn't exist → index lookup returns empty immediately (cheap, no disk I/O). If total misses >> VLog reads, most misses are for non-existent keys — common when reads precede writes or for TTL-expired keys. VLog reads == misses means every miss triggers a disk read.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "ops/s", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 15, "gradientMode": "none", "hideFrom": { "legend": false, "tooltip": false, "viz": false }, "lineInterpolation": "linear", "lineWidth": 2, "pointSize": 5, "scaleDistribution": { "type": "linear" }, "showPoints": "never", "spanNulls": false, "stacking": { "group": "A", "mode": "none" }, "thresholdsStyle": { "mode": "off" } },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 99 },
+      "id": 51,
+      "options": { "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "rate(veltrixdb_cache_misses_total{node=~\"$node\"}[5m])", "legendFormat": "Total Cache Misses/s — {{node}}", "refId": "A" },
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "rate(veltrixdb_vlog_reads_total{node=~\"$node\"}[5m])", "legendFormat": "VLog Reads/s (key found on NVMe) — {{node}}", "refId": "B" }
+      ],
+      "title": "Cache Miss Breakdown: actual NVMe reads vs key-not-found (no disk)",
+      "type": "timeseries"
+    },
+
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 107 },
+      "id": 102,
+      "title": "🔄 Replication",
+      "type": "row"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Writes dispatched to replica nodes per second vs failures. VeltrixDB supports async, quorum, and strong replication modes. Failures should be 0 under normal operation. Spike in failures = replica is down, slow, or network partition. In strong-consistency mode, write failures here block the primary write and return error to client.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "ops/s", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 15, "gradientMode": "none", "hideFrom": { "legend": false, "tooltip": false, "viz": false }, "lineInterpolation": "linear", "lineWidth": 2, "pointSize": 5, "scaleDistribution": { "type": "linear" }, "showPoints": "never", "spanNulls": false, "stacking": { "group": "A", "mode": "none" }, "thresholdsStyle": { "mode": "off" } },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
+          "unit": "reqps"
+        },
+        "overrides": [{ "matcher": { "id": "byRegexp", "options": "Failures.*" }, "properties": [{ "id": "color", "value": { "fixedColor": "red", "mode": "fixed" } }] }]
+      },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 108 },
+      "id": 52,
+      "options": { "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "rate(veltrixdb_replication_writes_total{node=~\"$node\"}[5m])", "legendFormat": "Repl Writes/s — {{node}}", "refId": "A" },
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "rate(veltrixdb_replication_failures_total{node=~\"$node\"}[5m])", "legendFormat": "Failures/s — {{node}}", "refId": "B" }
+      ],
+      "title": "Replication: Writes/s vs Failures/s",
+      "type": "timeseries"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "How far behind replicas are: bytes = unsynced data volume, nanoseconds = age of oldest un-replicated write. Both should be near 0 in a healthy cluster. High lag bytes = replica falling behind on ingestion. High lag nanoseconds = stale reads possible (in eventual-consistency mode). In strong-consistency mode writes block until quorum acknowledges, so lag is bounded.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 15, "gradientMode": "none", "hideFrom": { "legend": false, "tooltip": false, "viz": false }, "lineInterpolation": "linear", "lineWidth": 2, "pointSize": 5, "scaleDistribution": { "type": "linear" }, "showPoints": "never", "spanNulls": false, "stacking": { "group": "A", "mode": "none" }, "thresholdsStyle": { "mode": "off" } },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
+          "unit": "bytes"
+        },
+        "overrides": [{ "matcher": { "id": "byRegexp", "options": "Lag ns.*" }, "properties": [{ "id": "unit", "value": "ns" }] }]
+      },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 108 },
+      "id": 53,
+      "options": { "legend": { "calcs": ["mean", "lastNotNull"], "displayMode": "table", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "veltrixdb_replication_lag_bytes{node=~\"$node\"}", "legendFormat": "Lag bytes — {{node}}", "refId": "A" },
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "veltrixdb_replication_lag_nanoseconds{node=~\"$node\"}", "legendFormat": "Lag ns — {{node}}", "refId": "B" }
+      ],
+      "title": "Replication Lag (bytes + nanoseconds)",
+      "type": "timeseries"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Three advanced replication health signals. Anti-entropy (blue): periodic full-sync passes to heal divergence after partitions — occasional runs are normal after a network event. Conflict resolutions (orange): write conflicts resolved via vector clock comparison — nonzero means concurrent writes to the same key happened (expected in async mode). Vector clock updates (green): causal ordering events, scales linearly with write rate.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "events/s", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 10, "gradientMode": "none", "hideFrom": { "legend": false, "tooltip": false, "viz": false }, "lineInterpolation": "linear", "lineWidth": 2, "pointSize": 5, "scaleDistribution": { "type": "linear" }, "showPoints": "never", "spanNulls": false, "stacking": { "group": "A", "mode": "none" }, "thresholdsStyle": { "mode": "off" } },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 108 },
+      "id": 54,
+      "options": { "legend": { "calcs": ["mean", "sum"], "displayMode": "table", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "rate(veltrixdb_replication_anti_entropy_runs_total{node=~\"$node\"}[5m])", "legendFormat": "Anti-Entropy Runs/s — {{node}}", "refId": "A" },
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "rate(veltrixdb_replication_conflict_resolutions_total{node=~\"$node\"}[5m])", "legendFormat": "Conflict Resolutions/s — {{node}}", "refId": "B" },
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "rate(veltrixdb_replication_vector_clock_updates_total{node=~\"$node\"}[5m])", "legendFormat": "Vector Clock Updates/s — {{node}}", "refId": "C" }
+      ],
+      "title": "Anti-Entropy, Conflict Resolution & Vector Clock Updates / s",
+      "type": "timeseries"
+    },
+
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 116 },
+      "id": 103,
+      "title": "🔍 VLog GC Diagnostics — Why Is GC Skipping?",
+      "type": "row"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Rate of compactVLog early exits, broken down by reason. Use this when vlog_gc_runs_total is stuck at 0.\n\n• skipped_ratio: GCRatio was below DefragThreshold (0.30) at the time of the defrag tick — GC correctly did nothing. Expected when garbage is low.\n• skipped_paused: GCPaused flag was true (read EWMA > 4 ms) and the EWMA was NOT yet stale. If this rises during a write-only workload after any earlier slow reads, GCPaused will auto-clear after 4 minutes of no reads (staleness guard).\n• skipped_empty: GCRatio > threshold but no live candidates found below the GC horizon. Rare — indicates all index entries for this disk have DiskOffset = 0 (KV-sep off path) or the index is unexpectedly empty.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "skips/s", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 20, "gradientMode": "none", "hideFrom": { "legend": false, "tooltip": false, "viz": false }, "lineInterpolation": "linear", "lineWidth": 2, "pointSize": 5, "scaleDistribution": { "type": "linear" }, "showPoints": "never", "spanNulls": false, "stacking": { "group": "A", "mode": "none" }, "thresholdsStyle": { "mode": "off" } },
+          "mappings": [],
+          "min": 0,
+          "unit": "ops"
+        },
+        "overrides": [
+          { "matcher": { "id": "byRegexp", "options": ".*paused.*" }, "properties": [{ "id": "color", "value": { "fixedColor": "red", "mode": "fixed" } }] },
+          { "matcher": { "id": "byRegexp", "options": ".*ratio.*" }, "properties": [{ "id": "color", "value": { "fixedColor": "blue", "mode": "fixed" } }] },
+          { "matcher": { "id": "byRegexp", "options": ".*empty.*" }, "properties": [{ "id": "color", "value": { "fixedColor": "orange", "mode": "fixed" } }] }
+        ]
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 117 },
+      "id": 55,
+      "options": { "legend": { "calcs": ["lastNotNull", "sum"], "displayMode": "table", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "rate(veltrixdb_vlog_gc_skipped_ratio_total{node=~\"$node\"}[5m])", "legendFormat": "skipped_ratio (GCRatio < threshold) — {{node}}", "refId": "A" },
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "rate(veltrixdb_vlog_gc_skipped_paused_total{node=~\"$node\"}[5m])", "legendFormat": "skipped_paused (GCPaused=true, EWMA stale check pending) — {{node}}", "refId": "B" },
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "rate(veltrixdb_vlog_gc_skipped_empty_total{node=~\"$node\"}[5m])", "legendFormat": "skipped_empty (no live candidates) — {{node}}", "refId": "C" }
+      ],
+      "title": "GC Skip Reason Breakdown / s",
+      "type": "timeseries"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Inside-loop GC diagnostics: how the candidate processing is going.\n\n• read_errors: ReadValue failed for a candidate (bad magic/CRC = VLog corruption, or disk error). If rising, check disk health and dmesg.\n• cas_fails: CAS update was rejected because a concurrent Put changed the index entry before GC could move it. Normal at high write rates — expected to be < 50% of candidates. Very high CAS fail rate = the write rate on this disk is faster than GC can keep up.\n• candidates scanned: total live entries scanned per second. If this is non-zero but gc_runs_total is zero, all CAS operations are failing (check cas_fails) or all ReadValues are erroring (check read_errors).",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "events/s", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 15, "gradientMode": "none", "hideFrom": { "legend": false, "tooltip": false, "viz": false }, "lineInterpolation": "linear", "lineWidth": 2, "pointSize": 5, "scaleDistribution": { "type": "linear" }, "showPoints": "never", "spanNulls": false, "stacking": { "group": "A", "mode": "none" }, "thresholdsStyle": { "mode": "off" } },
+          "mappings": [],
+          "min": 0,
+          "unit": "ops"
+        },
+        "overrides": [
+          { "matcher": { "id": "byRegexp", "options": ".*read_errors.*" }, "properties": [{ "id": "color", "value": { "fixedColor": "dark-red", "mode": "fixed" } }] },
+          { "matcher": { "id": "byRegexp", "options": ".*cas_fails.*" }, "properties": [{ "id": "color", "value": { "fixedColor": "orange", "mode": "fixed" } }] },
+          { "matcher": { "id": "byRegexp", "options": ".*candidates.*" }, "properties": [{ "id": "color", "value": { "fixedColor": "green", "mode": "fixed" } }] }
+        ]
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 117 },
+      "id": 56,
+      "options": { "legend": { "calcs": ["lastNotNull", "sum"], "displayMode": "table", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "rate(veltrixdb_vlog_gc_read_errors_total{node=~\"$node\"}[5m])", "legendFormat": "read_errors (ReadValue failed) — {{node}}", "refId": "A" },
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "rate(veltrixdb_vlog_gc_cas_fails_total{node=~\"$node\"}[5m])", "legendFormat": "cas_fails (concurrent Put won) — {{node}}", "refId": "B" },
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "rate(veltrixdb_vlog_gc_candidates_total{node=~\"$node\"}[5m])", "legendFormat": "candidates scanned/s — {{node}}", "refId": "C" }
+      ],
+      "title": "GC Loop: Read Errors / CAS Fails / Candidates Scanned",
+      "type": "timeseries"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "CAS success rate: fraction of GC candidate moves that successfully updated the index (CAS won). A healthy GC run at low-to-moderate write rates should be > 90%. At very high write rates (100K+ writes/s), 50–80% is acceptable — the CAS-failed orphans are correctly marked dead. If this drops to near 0%, the write rate is too high for GC to make progress and the VLog will grow without bound.\n\nFormula: gc_runs_total / (gc_runs_total + cas_fails). 0 = no successful GC at all.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "mappings": [],
+          "max": 1,
+          "min": 0,
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "red", "value": null }, { "color": "yellow", "value": 0.5 }, { "color": "green", "value": 0.8 }] },
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 125 },
+      "id": 57,
+      "options": { "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "showThresholdLabels": false, "showThresholdMarkers": true },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "sum(rate(veltrixdb_vlog_gc_runs_total{node=~\"$node\"}[5m])) / clamp_min(sum(rate(veltrixdb_vlog_gc_runs_total{node=~\"$node\"}[5m])) + sum(rate(veltrixdb_vlog_gc_cas_fails_total{node=~\"$node\"}[5m])), 1)",
+          "legendFormat": "GC CAS Success Rate",
+          "refId": "A"
+        }
+      ],
+      "title": "GC CAS Success Rate (green >80%)",
+      "type": "gauge"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Overlay of GC candidates scanned per second vs GC bytes reclaimed per second. When candidates are non-zero but reclaimed bytes are near zero, all CAS operations are failing (check cas_fails) or all reads are erroring. Healthy: both lines move together. Degraded: candidates high, reclaimed near zero.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 10, "gradientMode": "none", "hideFrom": { "legend": false, "tooltip": false, "viz": false }, "lineInterpolation": "linear", "lineWidth": 2, "pointSize": 5, "scaleDistribution": { "type": "linear" }, "showPoints": "never", "spanNulls": false, "stacking": { "group": "A", "mode": "none" }, "thresholdsStyle": { "mode": "off" } },
+          "mappings": [],
+          "min": 0,
+          "unit": "short"
+        },
+        "overrides": [
+          { "matcher": { "id": "byRegexp", "options": ".*Bytes.*" }, "properties": [{ "id": "unit", "value": "Bps" }, { "id": "custom.axisPlacement", "value": "right" }] }
+        ]
+      },
+      "gridPos": { "h": 8, "w": 16, "x": 8, "y": 125 },
+      "id": 58,
+      "options": { "legend": { "calcs": ["lastNotNull", "mean"], "displayMode": "table", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "rate(veltrixdb_vlog_gc_candidates_total{node=~\"$node\"}[5m])", "legendFormat": "Candidates Scanned/s — {{node}}", "refId": "A" },
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "rate(veltrixdb_vlog_gc_bytes_total{node=~\"$node\"}[5m])", "legendFormat": "GC Bytes Reclaimed/s — {{node}}", "refId": "B" },
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "rate(veltrixdb_vlog_gc_runs_total{node=~\"$node\"}[5m])", "legendFormat": "GC Runs/s (successful) — {{node}}", "refId": "C" }
+      ],
+      "title": "GC Candidates Scanned vs Bytes Reclaimed vs Runs",
+      "type": "timeseries"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Cumulative count of each GC skip reason. Use this for a quick snapshot of GC health across the entire run (not just the last 5 min). If skipped_paused is non-zero and climbing, GCPaused is stuck. It will auto-clear after 4 minutes of no reads (staleness guard in compactVLog).",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "hideFrom": { "legend": false, "tooltip": false, "viz": false } },
+          "mappings": [],
+          "min": 0,
+          "unit": "short"
+        },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "skipped_paused" }, "properties": [{ "id": "color", "value": { "fixedColor": "red", "mode": "fixed" } }] },
+          { "matcher": { "id": "byName", "options": "skipped_ratio" }, "properties": [{ "id": "color", "value": { "fixedColor": "blue", "mode": "fixed" } }] },
+          { "matcher": { "id": "byName", "options": "skipped_empty" }, "properties": [{ "id": "color", "value": { "fixedColor": "orange", "mode": "fixed" } }] },
+          { "matcher": { "id": "byName", "options": "read_errors" }, "properties": [{ "id": "color", "value": { "fixedColor": "dark-red", "mode": "fixed" } }] },
+          { "matcher": { "id": "byName", "options": "cas_fails" }, "properties": [{ "id": "color", "value": { "fixedColor": "yellow", "mode": "fixed" } }] },
+          { "matcher": { "id": "byName", "options": "gc_runs" }, "properties": [{ "id": "color", "value": { "fixedColor": "green", "mode": "fixed" } }] }
+        ]
+      },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 133 },
+      "id": 59,
+      "options": {
+        "barRadius": 0.1,
+        "barWidth": 0.7,
+        "fullHighlight": false,
+        "groupWidth": 0.7,
+        "legend": { "calcs": ["lastNotNull"], "displayMode": "table", "placement": "right", "showLegend": true },
+        "orientation": "auto",
+        "showValue": "auto",
+        "stacking": "none",
+        "tooltip": { "mode": "multi", "sort": "desc" },
+        "xTickLabelRotation": 0,
+        "xTickLabelSpacing": 200
+      },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "sum(veltrixdb_vlog_gc_runs_total{node=~\"$node\"})", "legendFormat": "gc_runs", "refId": "A" },
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "sum(veltrixdb_vlog_gc_skipped_ratio_total{node=~\"$node\"})", "legendFormat": "skipped_ratio", "refId": "B" },
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "sum(veltrixdb_vlog_gc_skipped_paused_total{node=~\"$node\"})", "legendFormat": "skipped_paused", "refId": "C" },
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "sum(veltrixdb_vlog_gc_skipped_empty_total{node=~\"$node\"})", "legendFormat": "skipped_empty", "refId": "D" },
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "sum(veltrixdb_vlog_gc_read_errors_total{node=~\"$node\"})", "legendFormat": "read_errors", "refId": "E" },
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "sum(veltrixdb_vlog_gc_cas_fails_total{node=~\"$node\"})", "legendFormat": "cas_fails", "refId": "F" }
+      ],
+      "title": "GC Decision Totals Since Restart (gc_runs vs all skip reasons)",
+      "type": "bargauge"
+    },
+
+    { "collapsed": false, "gridPos": { "h": 1, "w": 24, "x": 0, "y": 141 }, "id": 60, "title": "🔌 Connections, Network & Pipeline Coalescing", "type": "row" },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Number of TCP client connections currently open per node. Each connection gets its own goroutine. Sharp drops = client disconnects or node restarts. Flat line at a ceiling = connection-pool saturation on the client side.",
+      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 500 }, { "color": "red", "value": 2000 }] }, "unit": "short" }, "overrides": [] },
+      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 142 },
+      "id": 61,
+      "options": { "colorMode": "background", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
+      "targets": [{ "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "sum by (node) (veltrixdb_server_active_connections{node=~\"$node\"})", "legendFormat": "Connections — {{node}}", "refId": "A" }],
+      "title": "Active TCP Connections",
+      "type": "stat"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Network throughput in and out of the server process. In = client requests (PUT/GET payloads). Out = server responses. Read-heavy workloads show Out > In. Write-heavy show In ≈ Out (small status responses). Sudden drops = client disconnects or NIC saturation.",
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "palette-classic" }, "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 2, "showPoints": "never" }, "unit": "Bps" },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 10, "x": 4, "y": 142 },
+      "id": 62,
+      "options": { "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "rate(veltrixdb_server_network_bytes_in_total{node=~\"$node\"}[5m])", "legendFormat": "Bytes In/s — {{node}}", "refId": "A" },
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "rate(veltrixdb_server_network_bytes_out_total{node=~\"$node\"}[5m])", "legendFormat": "Bytes Out/s — {{node}}", "refId": "B" }
+      ],
+      "title": "Network Throughput (bytes in/out)",
+      "type": "timeseries"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Pipeline coalescing: how many binary protocol PUT/GET frames are being batched per vectorized dispatch. Avg entries/batch = multi_put_entries / multi_put_batches. Higher is better — means the client is sending bursts that the server is coalescing into single MultiPut/MultiGet calls. Low = clients sending one op at a time (no pipelining benefit).",
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "palette-classic" }, "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 2, "showPoints": "never" }, "unit": "short" },
+        "overrides": [
+          { "matcher": { "id": "byRegexp", "options": ".*Entries.*" }, "properties": [{ "id": "custom.axisPlacement", "value": "right" }] }
+        ]
+      },
+      "gridPos": { "h": 8, "w": 10, "x": 14, "y": 142 },
+      "id": 63,
+      "options": { "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "rate(veltrixdb_server_multi_put_batches_total{node=~\"$node\"}[5m])", "legendFormat": "MultiPut Batches/s — {{node}}", "refId": "A" },
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "rate(veltrixdb_server_multi_get_batches_total{node=~\"$node\"}[5m])", "legendFormat": "MultiGet Batches/s — {{node}}", "refId": "B" },
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "rate(veltrixdb_server_multi_put_entries_total{node=~\"$node\"}[5m]) / clamp_min(rate(veltrixdb_server_multi_put_batches_total{node=~\"$node\"}[5m]), 0.001)", "legendFormat": "Avg PUT entries/batch — {{node}}", "refId": "C" },
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "rate(veltrixdb_server_multi_get_entries_total{node=~\"$node\"}[5m]) / clamp_min(rate(veltrixdb_server_multi_get_batches_total{node=~\"$node\"}[5m]), 0.001)", "legendFormat": "Avg GET keys/batch — {{node}}", "refId": "D" }
+      ],
+      "title": "Pipeline Coalescing — MultiPut / MultiGet Batch Efficiency",
+      "type": "timeseries"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "WAL bytes written to disk per second (all disks combined). Includes WAL record framing (key + value + metadata) not just the value payload. Compare with VLog Write Bytes to see the ratio of WAL overhead vs value payload. Under KV-separation: WAL records are ~100 B/write (header only, no value bytes) while VLog gets the full value.",
+      "fieldConfig": { "defaults": { "color": { "mode": "palette-classic" }, "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 2, "showPoints": "never" }, "unit": "Bps" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 150 },
+      "id": 64,
+      "options": { "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "rate(veltrixdb_storage_wal_write_bytes_total{node=~\"$node\"}[5m])", "legendFormat": "WAL Write Bytes/s — {{node}}", "refId": "A" },
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "rate(veltrixdb_storage_wal_batch_entries_total{node=~\"$node\"}[5m])", "legendFormat": "WAL Entries Flushed/s — {{node}}", "refId": "B" }
+      ],
+      "title": "WAL Throughput — Bytes/s + Entries/s",
+      "type": "timeseries"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "VLog raw value bytes written and read per disk per second. Write bytes = total value payload flushed to VLog (excludes 24-byte header and 4K alignment padding). Read bytes = value payload returned to GET callers. Write >> Read = write-heavy workload. Read >> Write = read-dominated with cache misses going to VLog. Zero reads = all GETs served from LIRS cache.",
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "palette-classic" }, "custom": { "drawStyle": "line", "fillOpacity": 8, "lineWidth": 1, "showPoints": "never" }, "unit": "Bps" },
+        "overrides": [
+          { "matcher": { "id": "byRegexp", "options": ".*Read.*" }, "properties": [{ "id": "custom.axisPlacement", "value": "right" }] }
+        ]
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 150 },
+      "id": 65,
+      "options": { "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "rate(veltrixdb_vlog_write_bytes_total{node=~\"$node\"}[5m])", "legendFormat": "VLog Write Bytes/s — disk {{disk}}", "refId": "A" },
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "rate(veltrixdb_vlog_read_bytes_total{node=~\"$node\"}[5m])", "legendFormat": "VLog Read Bytes/s — disk {{disk}}", "refId": "B" }
+      ],
+      "title": "VLog Payload Throughput — Write vs Read Bytes/s per Disk",
+      "type": "timeseries"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "WriteBatcher dropped count = Put() calls that could not be queued in the 65 536-entry async channel and fell back to synchronous execution. Non-zero = channel saturated; increase batchChanDepth or reduce write concurrency. GC CAS throttles = Put() calls delayed 1ms because GC is overwriting live entries faster than it can commit them (>20% CAS fail rate in the last GC batch).",
+      "fieldConfig": { "defaults": { "color": { "mode": "palette-classic" }, "custom": { "drawStyle": "bars", "fillOpacity": 60, "lineWidth": 1 }, "unit": "reqps" }, "overrides": [] },
+      "gridPos": { "h": 6, "w": 24, "x": 0, "y": 158 },
+      "id": 66,
+      "options": { "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "rate(veltrixdb_storage_write_batcher_dropped_total{node=~\"$node\"}[5m])", "legendFormat": "WriteBatcher Drops/s (channel saturated) — {{node}}", "refId": "A" },
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "rate(veltrixdb_storage_gc_cas_throttles_total{node=~\"$node\"}[5m])", "legendFormat": "GC CAS Throttles/s — {{node}}", "refId": "B" }
+      ],
+      "title": "Back-pressure Events — WriteBatcher Drops + GC CAS Throttles",
+      "type": "timeseries"
+    },
+
+    { "collapsed": false, "gridPos": { "h": 1, "w": 24, "x": 0, "y": 164 }, "id": 70, "title": "🖥️ Hardware & Runtime — Go Runtime + NVMe Disk I/O + System", "type": "row" },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Number of goroutines running in the VeltrixDB process. Each TCP connection = 1 goroutine; each per-disk WAL flusher = 1; each defrag goroutine = 1; each replication goroutine = variable. Normal at 1K connections: ~1050 goroutines. Sudden spike = goroutine leak. >10K = investigate.",
+      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 5000 }, { "color": "red", "value": 10000 }] }, "unit": "short" }, "overrides": [] },
+      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 165 },
+      "id": 71,
+      "options": { "colorMode": "background", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
+      "targets": [{ "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "veltrixdb_runtime_goroutines{node=~\"$node\"}", "legendFormat": "Goroutines — {{node}}", "refId": "A" }],
+      "title": "Go Goroutines",
+      "type": "stat"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Go heap in-use bytes (live objects + free-but-not-returned memory). Excludes LIRS cache memory (tracked separately). Increases with key density; decreases after GC. If this grows unbounded alongside index_size_keys growing, check for IndexEntry leaks or accumulating WALEntry objects in flusher channels.",
+      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 8589934592 }, { "color": "red", "value": 17179869184 }] }, "unit": "decbytes" }, "overrides": [] },
+      "gridPos": { "h": 4, "w": 4, "x": 4, "y": 165 },
+      "id": 72,
+      "options": { "colorMode": "background", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
+      "targets": [{ "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "veltrixdb_runtime_heap_inuse_bytes{node=~\"$node\"}", "legendFormat": "Heap In-Use — {{node}}", "refId": "A" }],
+      "title": "Go Heap In-Use",
+      "type": "stat"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Process resident set size (physical RAM pinned by the VeltrixDB process). This is the most important memory metric. Includes: LIRS cache + Go heap + Index Vault hugepages + mmapped VLog + stack. On GKE node with 256 GB cache: expect RSS ~260–280 GB at steady state. If RSS > node allocatable memory = OOM risk.",
+      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 214748364800 }, { "color": "red", "value": 257698037760 }] }, "unit": "decbytes" }, "overrides": [] },
+      "gridPos": { "h": 4, "w": 4, "x": 8, "y": 165 },
+      "id": 73,
+      "options": { "colorMode": "background", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
+      "targets": [{ "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "veltrixdb_process_resident_memory_bytes{node=~\"$node\"}", "legendFormat": "RSS — {{node}}", "refId": "A" }],
+      "title": "Process RSS",
+      "type": "stat"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "System available memory (MemAvailable from /proc/meminfo). This is the OS's estimate of how much RAM can be allocated without swapping — includes reclaimable page cache and buffers. Should stay > 10 GB on a 512 GB node. Approaching 0 = swap pressure; mlockall() will prevent VeltrixDB from being paged but competing processes may OOM.",
+      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [{ "color": "red", "value": null }, { "color": "yellow", "value": 10737418240 }, { "color": "green", "value": 32212254720 }] }, "unit": "decbytes" }, "overrides": [] },
+      "gridPos": { "h": 4, "w": 4, "x": 12, "y": 165 },
+      "id": 74,
+      "options": { "colorMode": "background", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
+      "targets": [{ "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "veltrixdb_system_memory_available_bytes{node=~\"$node\"}", "legendFormat": "Avail — {{node}}", "refId": "A" }],
+      "title": "System Available Memory",
+      "type": "stat"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Open file descriptors in the VeltrixDB process. Normal: 8 WAL files + 8 VLog files + 8 segment files + N client connections + stdio = ~24 + N. If this climbs without a corresponding rise in active_connections, check for file handle leaks in compaction or segment rotation code. Linux default ulimit is 1024; production should be 1M.",
+      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 8000 }, { "color": "red", "value": 900000 }] }, "unit": "short" }, "overrides": [] },
+      "gridPos": { "h": 4, "w": 4, "x": 16, "y": 165 },
+      "id": 75,
+      "options": { "colorMode": "background", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
+      "targets": [{ "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "veltrixdb_process_open_fds{node=~\"$node\"}", "legendFormat": "Open FDs — {{node}}", "refId": "A" }],
+      "title": "Open File Descriptors",
+      "type": "stat"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Go GC stop-the-world pause duration rate in seconds/second. With 1B keys in the index, GC scans a large live set — but VeltrixDB uses hugepage-backed mmap for the index (bypassing Go GC scanning) so pauses should stay < 1ms. Spikes = large transient allocations in WAL serialization or compaction paths. Watch during heavy compaction runs.",
+      "fieldConfig": { "defaults": { "color": { "mode": "palette-classic" }, "custom": { "drawStyle": "line", "fillOpacity": 20, "lineWidth": 2 }, "unit": "s" }, "overrides": [] },
+      "gridPos": { "h": 4, "w": 4, "x": 20, "y": 165 },
+      "id": 76,
+      "options": { "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [{ "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "rate(veltrixdb_runtime_gc_pause_total_seconds_total{node=~\"$node\"}[1m])", "legendFormat": "GC Pause/s — {{node}}", "refId": "A" }],
+      "title": "GC Pause Rate (s/s)",
+      "type": "timeseries"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Go runtime goroutines, heap in-use, and stack in-use over time. All three on one chart lets you correlate goroutine storms with heap pressure and GC frequency. Heap spike + goroutine spike = burst of new connections each allocating buffers. Heap spike without goroutine change = per-op allocation regression (check WAL serialization or compaction).",
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "palette-classic" }, "custom": { "drawStyle": "line", "fillOpacity": 5, "lineWidth": 2, "showPoints": "never" }, "unit": "decbytes" },
+        "overrides": [
+          { "matcher": { "id": "byRegexp", "options": ".*Goroutines.*" }, "properties": [{ "id": "unit", "value": "short" }, { "id": "custom.axisPlacement", "value": "right" }] }
+        ]
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 169 },
+      "id": 77,
+      "options": { "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "veltrixdb_runtime_heap_inuse_bytes{node=~\"$node\"}", "legendFormat": "Heap In-Use — {{node}}", "refId": "A" },
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "veltrixdb_runtime_heap_sys_bytes{node=~\"$node\"}", "legendFormat": "Heap Sys — {{node}}", "refId": "B" },
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "veltrixdb_runtime_stack_inuse_bytes{node=~\"$node\"}", "legendFormat": "Stack In-Use — {{node}}", "refId": "C" },
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "veltrixdb_runtime_goroutines{node=~\"$node\"}", "legendFormat": "Goroutines (right axis) — {{node}}", "refId": "D" }
+      ],
+      "title": "Go Runtime Memory + Goroutines",
+      "type": "timeseries"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "CPU I/O-wait fraction per core from /proc/stat. iowait = fraction of time the CPU was idle while at least one I/O was pending. On NVMe with io_uring SQPOLL, iowait should be near 0 (kernel polling, no blocking syscalls). Non-zero iowait on NVMe = SQPOLL disabled, or queue depth exceeded, or a slow disk. High iowait on cpu0 during writes = WAL fdatasync serializing on a single core.",
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "palette-classic" }, "custom": { "drawStyle": "line", "fillOpacity": 5, "lineWidth": 1, "showPoints": "never" }, "unit": "percentunit", "min": 0, "max": 1 },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 169 },
+      "id": 78,
+      "options": { "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "veltrixdb_system_cpu_iowait_fraction{node=~\"$node\", cpu=\"cpu\"}", "legendFormat": "CPU iowait (aggregate) — {{node}}", "refId": "A" },
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "avg by (node) (veltrixdb_system_cpu_iowait_fraction{node=~\"$node\", cpu!=\"cpu\"})", "legendFormat": "CPU iowait avg per-core — {{node}}", "refId": "B" }
+      ],
+      "title": "CPU I/O-Wait — Aggregate + Per-Core Average",
+      "type": "timeseries"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "NVMe disk read IOPS and write IOPS per device. With 8 disks and io_uring SQPOLL: expect up to ~450K IOPS per device at full throttle. Read IOPS ≈ cache miss rate (VLog pread per miss). Write IOPS ≈ fdatasync rate × group size (one fdatasync covers many writes). Uneven IOPS across nvme0-7 = shard hotspot (some partitions receive more writes than others).",
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "palette-classic" }, "custom": { "drawStyle": "line", "fillOpacity": 8, "lineWidth": 1, "showPoints": "never" }, "unit": "iops" },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 177 },
+      "id": 79,
+      "options": { "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "rate(veltrixdb_disk_reads_completed_total{node=~\"$node\"}[5m])", "legendFormat": "Read IOPS — {{device}}", "refId": "A" },
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "rate(veltrixdb_disk_writes_completed_total{node=~\"$node\"}[5m])", "legendFormat": "Write IOPS — {{device}}", "refId": "B" }
+      ],
+      "title": "NVMe IOPS — Read + Write per Device",
+      "type": "timeseries"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "NVMe read and write bandwidth (bytes/s) per device from /proc/diskstats (sectors × 512). At full NVMe throughput expect 3–7 GB/s per device. Write bandwidth ≈ VLog write bytes + WAL write bytes + segment compaction I/O. Read bandwidth ≈ VLog read bytes (cache miss path) + compaction reads. If write bandwidth >> VLog write bytes, compaction is consuming significant I/O headroom.",
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "palette-classic" }, "custom": { "drawStyle": "line", "fillOpacity": 8, "lineWidth": 1, "showPoints": "never" }, "unit": "Bps" },
+        "overrides": [
+          { "matcher": { "id": "byRegexp", "options": ".*Read.*" }, "properties": [{ "id": "custom.axisPlacement", "value": "right" }] }
+        ]
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 177 },
+      "id": 80,
+      "options": { "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "rate(veltrixdb_disk_written_bytes_total{node=~\"$node\"}[5m])", "legendFormat": "Write BW — {{device}}", "refId": "A" },
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "rate(veltrixdb_disk_read_bytes_total{node=~\"$node\"}[5m])", "legendFormat": "Read BW — {{device}}", "refId": "B" }
+      ],
+      "title": "NVMe Bandwidth — Write + Read per Device",
+      "type": "timeseries"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "NVMe queue depth (IOs in flight) per device from /proc/diskstats. This is a point-in-time snapshot; it will often read 0 for fast NVMe. Sustained non-zero = device is saturated and requests are queuing. io_uring SQPOLL allows 256-deep ring per device — if queue depth is pegged at 256 and throughput is flat, the NVMe's own queue is the bottleneck, not the kernel I/O stack.",
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "palette-classic" }, "custom": { "drawStyle": "line", "fillOpacity": 15, "lineWidth": 2, "showPoints": "never" }, "unit": "short", "min": 0 },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 185 },
+      "id": 81,
+      "options": { "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "veltrixdb_disk_io_in_flight{node=~\"$node\"}", "legendFormat": "Queue Depth — {{device}}", "refId": "A" }
+      ],
+      "title": "NVMe I/O Queue Depth (IOs in flight)",
+      "type": "timeseries"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Average NVMe read and write service time per device = time_ms / completed_ops. On healthy NVMe: read latency 50–200 µs, write latency 100–400 µs. Spiking write latency = write amplification from compaction competing with VLog appends. Spiking read latency = queue depth too high or drive entering thermal throttling.",
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "palette-classic" }, "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 2, "showPoints": "never" }, "unit": "ms", "min": 0 },
+        "overrides": [
+          { "matcher": { "id": "byRegexp", "options": ".*Write.*" }, "properties": [{ "id": "custom.axisPlacement", "value": "right" }] }
+        ]
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 185 },
+      "id": 82,
+      "options": { "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "rate(veltrixdb_disk_read_time_milliseconds_total{node=~\"$node\"}[5m]) / clamp_min(rate(veltrixdb_disk_reads_completed_total{node=~\"$node\"}[5m]), 0.001)", "legendFormat": "Avg Read Latency ms — {{device}}", "refId": "A" },
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "rate(veltrixdb_disk_write_time_milliseconds_total{node=~\"$node\"}[5m]) / clamp_min(rate(veltrixdb_disk_writes_completed_total{node=~\"$node\"}[5m]), 0.001)", "legendFormat": "Avg Write Latency ms — {{device}}", "refId": "B" }
+      ],
+      "title": "NVMe Average I/O Latency — Read + Write per Device",
+      "type": "timeseries"
+    },
+
+    { "collapsed": false, "gridPos": { "h": 1, "w": 24, "x": 0, "y": 194 }, "id": 200, "title": "🔁 Replication — Live Behavior", "type": "row" },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Write operations dispatched to replica nodes per second, by source node. A healthy replication rate tracks write throughput closely. A gap between writes/s and replication writes/s means some writes are not being replicated — check replFailures and replica lag.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 2, "showPoints": "never" },
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 195 },
+      "id": 201,
+      "options": { "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "sum by (node) (rate(veltrixdb_replication_writes_total{node=~\"$node\"}[5m]))", "legendFormat": "Replicated Writes/s — {{node}}", "refId": "A" },
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "sum by (node) (rate(veltrixdb_replication_failures_total{node=~\"$node\"}[5m]))", "legendFormat": "Repl Failures/s — {{node}}", "refId": "B" }
+      ],
+      "title": "Replication Write Rate & Failures / s",
+      "type": "timeseries"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Replication lag in bytes (total bytes not yet acknowledged by replicas) and nanoseconds (maximum lag across all replicas). Bytes > 0 means replicas are behind the leader. Rising ns lag > 500ms indicates a slow or unreachable replica. Anti-entropy runs periodically reconcile diverged state.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 2, "showPoints": "never" }
+        },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "Lag Bytes" }, "properties": [{ "id": "unit", "value": "bytes" }, { "id": "custom.axisPlacement", "value": "left" }] },
+          { "matcher": { "id": "byName", "options": "Lag ms" },    "properties": [{ "id": "unit", "value": "ms" },    { "id": "custom.axisPlacement", "value": "right" }] }
+        ]
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 195 },
+      "id": 202,
+      "options": { "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "sum(veltrixdb_replication_lag_bytes{node=~\"$node\"})", "legendFormat": "Lag Bytes", "refId": "A" },
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "max(veltrixdb_replication_lag_nanoseconds{node=~\"$node\"}) / 1e6", "legendFormat": "Lag ms", "refId": "B" },
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "sum(rate(veltrixdb_replication_anti_entropy_runs_total{node=~\"$node\"}[5m]))", "legendFormat": "Anti-Entropy Runs/s", "refId": "C" }
+      ],
+      "title": "Replication Lag (Bytes + ms) & Anti-Entropy",
+      "type": "timeseries"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Vector clock updates track causal ordering events — each increment = a new write that bumped the logical clock for at least one replica. Conflict resolutions happen when two concurrent writes arrive with overlapping vector clocks; VeltrixDB picks the higher-timestamp winner. A rising conflict rate under normal writes indicates clock drift or a misconfigured replication topology.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 2, "showPoints": "never" },
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 203 },
+      "id": 203,
+      "options": { "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "sum by (node) (rate(veltrixdb_replication_vector_clock_updates_total{node=~\"$node\"}[5m]))", "legendFormat": "Vector Clock Updates/s — {{node}}", "refId": "A" },
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "sum by (node) (rate(veltrixdb_replication_conflict_resolutions_total{node=~\"$node\"}[5m]))", "legendFormat": "Conflict Resolutions/s — {{node}}", "refId": "B" }
+      ],
+      "title": "Replication — Vector Clock Updates & Conflict Resolutions / s",
+      "type": "timeseries"
+    },
+
+    { "collapsed": false, "gridPos": { "h": 1, "w": 24, "x": 0, "y": 212 }, "id": 210, "title": "🖧 Node Lifecycle — Addition / Removal / Rebalance", "type": "row" },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Current number of registered nodes in the consistent-hash ring.",
+      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [{ "color": "red", "value": null }, { "color": "green", "value": 1 }] }, "unit": "short" }, "overrides": [] },
+      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 213 },
+      "id": 211,
+      "options": { "colorMode": "background", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "targets": [{ "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "max(veltrixdb_cluster_nodes_total{node=~\"$node\"})", "legendFormat": "Nodes", "refId": "A" }],
+      "title": "Active Nodes",
+      "type": "stat"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Cumulative node additions since process start. A jump here = scale-out event.",
+      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }, "unit": "short" }, "overrides": [] },
+      "gridPos": { "h": 4, "w": 4, "x": 4, "y": 213 },
+      "id": 212,
+      "options": { "colorMode": "background", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "targets": [{ "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "sum(veltrixdb_cluster_node_additions_total{node=~\"$node\"})", "legendFormat": "Additions", "refId": "A" }],
+      "title": "Node Additions (total)",
+      "type": "stat"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Cumulative node removals since process start. Includes clean decommissions and failure-triggered removals.",
+      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 1 }, { "color": "red", "value": 3 }] }, "unit": "short" }, "overrides": [] },
+      "gridPos": { "h": 4, "w": 4, "x": 8, "y": 213 },
+      "id": 213,
+      "options": { "colorMode": "background", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "targets": [{ "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "sum(veltrixdb_cluster_node_removals_total{node=~\"$node\"})", "legendFormat": "Removals", "refId": "A" }],
+      "title": "Node Removals (total)",
+      "type": "stat"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Total partition rebalance (reshard) operations executed. Each rebalance redistributes partitions across the ring after a membership change.",
+      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }, "unit": "short" }, "overrides": [] },
+      "gridPos": { "h": 4, "w": 4, "x": 12, "y": 213 },
+      "id": 214,
+      "options": { "colorMode": "background", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "targets": [{ "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "sum(veltrixdb_cluster_rebalances_total{node=~\"$node\"})", "legendFormat": "Rebalances", "refId": "A" }],
+      "title": "Partition Rebalances (total)",
+      "type": "stat"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Individual partitions physically moved between nodes during rebalance operations. High counts indicate large topology changes.",
+      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }, "unit": "short" }, "overrides": [] },
+      "gridPos": { "h": 4, "w": 4, "x": 16, "y": 213 },
+      "id": 215,
+      "options": { "colorMode": "background", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "targets": [{ "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "sum(veltrixdb_cluster_partition_migrations_total{node=~\"$node\"})", "legendFormat": "Migrations", "refId": "A" }],
+      "title": "Partition Migrations (total)",
+      "type": "stat"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Partition map version — increments on every membership or partition change. Monotonically increasing; a jump of > 1 in a short interval = multiple topology events in rapid succession.",
+      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }, "unit": "short" }, "overrides": [] },
+      "gridPos": { "h": 4, "w": 4, "x": 20, "y": 213 },
+      "id": 216,
+      "options": { "colorMode": "background", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "targets": [{ "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "max(veltrixdb_cluster_partition_map_version{node=~\"$node\"})", "legendFormat": "Map Version", "refId": "A" }],
+      "title": "Partition Map Version",
+      "type": "stat"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Node count and cluster events over time. Use this timeline to correlate node additions/removals with write/read latency spikes. A node removal without a corresponding recovery event = permanent departure or crash.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 2, "showPoints": "never" }
+        },
+        "overrides": [
+          { "matcher": { "id": "byRegexp", "options": ".*Node Count.*" }, "properties": [{ "id": "unit", "value": "short" }, { "id": "custom.axisPlacement", "value": "right" }] },
+          { "matcher": { "id": "byRegexp", "options": ".*(Add|Remov|Rebalance|Migration).*" }, "properties": [{ "id": "unit", "value": "reqps" }, { "id": "custom.axisPlacement", "value": "left" }] }
+        ]
+      },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 217 },
+      "id": 217,
+      "options": { "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "max(veltrixdb_cluster_nodes_total{node=~\"$node\"})", "legendFormat": "Node Count", "refId": "A" },
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "sum(rate(veltrixdb_cluster_node_additions_total{node=~\"$node\"}[5m]))", "legendFormat": "Node Additions/s", "refId": "B" },
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "sum(rate(veltrixdb_cluster_node_removals_total{node=~\"$node\"}[5m]))", "legendFormat": "Node Removals/s", "refId": "C" },
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "sum(rate(veltrixdb_cluster_rebalances_total{node=~\"$node\"}[5m]))", "legendFormat": "Rebalances/s", "refId": "D" },
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "sum(rate(veltrixdb_cluster_partition_migrations_total{node=~\"$node\"}[5m]))", "legendFormat": "Partition Migrations/s", "refId": "E" }
+      ],
+      "title": "Node Lifecycle Timeline — Count + Add / Remove / Rebalance Events",
+      "type": "timeseries"
+    },
+
+    { "collapsed": false, "gridPos": { "h": 1, "w": 24, "x": 0, "y": 226 }, "id": 220, "title": "📝 WAL Behavior — Group Commit & Throughput", "type": "row" },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "WAL fdatasync flushes per second per node. With a 10 ms flush window the theoretical ceiling is ~100 flushes/s/disk. Each flush amortises N writes. A drop here while write rate holds steady = better batching efficiency. A spike = flush window too short or write bursts overflowing the batch cap.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "drawStyle": "bars", "fillOpacity": 60, "lineWidth": 1, "showPoints": "never" },
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 227 },
+      "id": 221,
+      "options": { "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "sum by (node) (rate(veltrixdb_storage_wal_flushes_total{node=~\"$node\"}[5m]))", "legendFormat": "WAL Flushes/s — {{node}}", "refId": "A" }
+      ],
+      "title": "WAL Flushes / s (fdatasync rate)",
+      "type": "timeseries"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Average number of WAL entries batched per fdatasync: wal_batch_entries / wal_flushes. Higher = better group-commit efficiency (more writes amortised per disk sync). At 100K writes/s and 100 flushes/s you expect ~1000 entries/flush. If this drops below 10 at high write rates, check that --wal-flush-window-ms and --vlog-flush-window-ms are both set to 10.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 2, "showPoints": "never" },
+          "unit": "short",
+          "decimals": 1
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 227 },
+      "id": 222,
+      "options": { "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "sum by (node) (rate(veltrixdb_storage_wal_batch_entries_total{node=~\"$node\"}[5m])) / clamp_min(sum by (node) (rate(veltrixdb_storage_wal_flushes_total{node=~\"$node\"}[5m])), 0.001)", "legendFormat": "Avg Entries/Flush — {{node}}", "refId": "A" }
+      ],
+      "title": "WAL Avg Batch Size (entries per fdatasync)",
+      "type": "timeseries"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Raw bytes written to WAL per second. WAL uses buffered I/O (no O_DIRECT). In KV-separation mode WAL entries are compact (~100 B/write) — the full value lives in the VLog. Spikes here = large burst of key metadata writes. Sustained high WAL bytes with few flushes = batch cap (4096 entries) forcing early flushes.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 2, "showPoints": "never" },
+          "unit": "Bps"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 227 },
+      "id": 223,
+      "options": { "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "sum by (node) (rate(veltrixdb_storage_wal_write_bytes_total{node=~\"$node\"}[5m]))", "legendFormat": "WAL Bytes/s — {{node}}", "refId": "A" }
+      ],
+      "title": "WAL Write Throughput (bytes / s)",
+      "type": "timeseries"
+    },
+
+    { "collapsed": false, "gridPos": { "h": 1, "w": 24, "x": 0, "y": 236 }, "id": 230, "title": "💥 Node Down & WAL Replay — Failure Detection + Recovery", "type": "row" },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Total nodes detected as failed by the gossip heartbeat monitor since startup.",
+      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 1 }, { "color": "red", "value": 3 }] }, "unit": "short" }, "overrides": [] },
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 237 },
+      "id": 231,
+      "options": { "colorMode": "background", "graphMode": "none", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "targets": [{ "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "sum(veltrixdb_failure_detector_nodes_failed_total{node=~\"$node\"})", "legendFormat": "Detected", "refId": "A" }],
+      "title": "Nodes Detected Failed (total)",
+      "type": "stat"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Nodes that recovered after being marked failed — heartbeat resumed within the recovery window.",
+      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }, "unit": "short" }, "overrides": [] },
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 237 },
+      "id": 232,
+      "options": { "colorMode": "background", "graphMode": "none", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "targets": [{ "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "sum(veltrixdb_failure_detector_nodes_recovered_total{node=~\"$node\"})", "legendFormat": "Recovered", "refId": "A" }],
+      "title": "Nodes Recovered (total)",
+      "type": "stat"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Suspected failures that turned out to be false alarms (node rejoined within grace period). A non-zero rate with no matching node removals = network blips causing transient gossip misses. Consider widening --fd-timeout.",
+      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 5 }, { "color": "red", "value": 20 }] }, "unit": "short" }, "overrides": [] },
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 237 },
+      "id": 233,
+      "options": { "colorMode": "background", "graphMode": "none", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "targets": [{ "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "sum(veltrixdb_failure_detector_false_positives_total{node=~\"$node\"})", "legendFormat": "False Positives", "refId": "A" }],
+      "title": "FD False Positives (total)",
+      "type": "stat"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Ratio of recovery pings that succeeded vs attempted. 100% = every failed node eventually came back. Dropping below 80% = nodes are being permanently lost or are unreachable for extended periods.",
+      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [{ "color": "red", "value": null }, { "color": "yellow", "value": 0.5 }, { "color": "green", "value": 0.8 }] }, "unit": "percentunit", "min": 0, "max": 1 }, "overrides": [] },
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 237 },
+      "id": 234,
+      "options": { "colorMode": "background", "graphMode": "none", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "targets": [{ "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "sum(veltrixdb_failure_detector_recovery_success_total{node=~\"$node\"}) / clamp_min(sum(veltrixdb_failure_detector_recovery_attempts_total{node=~\"$node\"}), 1)", "legendFormat": "Recovery Rate", "refId": "A" }],
+      "title": "Recovery Ping Success Rate",
+      "type": "stat"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Timeline of failure-detection events: nodes going down, being marked failed, and being recovered. A failed event with no following recovery = the node did not come back. False positives appear as fail+recover pairs with no corresponding node-removal event. Use this timeline alongside WAL replay metrics to correlate a crash with a subsequent data-replay event.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 2, "showPoints": "auto", "pointSize": 6 },
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 241 },
+      "id": 235,
+      "options": { "legend": { "calcs": ["sum"], "displayMode": "table", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "sum by (node) (rate(veltrixdb_failure_detector_nodes_failed_total{node=~\"$node\"}[5m]))", "legendFormat": "Node Failed — {{node}}", "refId": "A" },
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "sum by (node) (rate(veltrixdb_failure_detector_nodes_recovered_total{node=~\"$node\"}[5m]))", "legendFormat": "Node Recovered — {{node}}", "refId": "B" },
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "sum by (node) (rate(veltrixdb_failure_detector_false_positives_total{node=~\"$node\"}[5m]))", "legendFormat": "False Positive — {{node}}", "refId": "C" },
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "sum by (node) (rate(veltrixdb_cluster_failure_detections_total{node=~\"$node\"}[5m]))", "legendFormat": "Partition-Map Failure — {{node}}", "refId": "D" }
+      ],
+      "title": "Node Down Events — FD Timeline (Failed / Recovered / False-Positive)",
+      "type": "timeseries"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "When a node crashes and restarts, replayWAL() reads its per-disk WAL files and replays every entry whose fdatasync completed before the crash. Each replayed entry is a write that was durable in the WAL but not yet checkpointed. Watch WAL flushes spike on the recovering node — that is the replay path in action. A node that crashes mid-flush loses only the entries in the unflushed window (~10 ms × write rate).",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 2, "showPoints": "never" },
+          "unit": "reqps"
+        },
+        "overrides": [
+          { "matcher": { "id": "byRegexp", "options": ".*Recovery.*" }, "properties": [{ "id": "custom.axisPlacement", "value": "right" }] }
+        ]
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 241 },
+      "id": 236,
+      "options": { "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "sum by (node) (rate(veltrixdb_failure_detector_recovery_attempts_total{node=~\"$node\"}[5m]))", "legendFormat": "Recovery Attempts/s — {{node}}", "refId": "A" },
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "sum by (node) (rate(veltrixdb_failure_detector_recovery_success_total{node=~\"$node\"}[5m]))", "legendFormat": "Recovery Success/s — {{node}}", "refId": "B" },
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "sum by (node) (rate(veltrixdb_failure_detector_recovery_failures_total{node=~\"$node\"}[5m]))", "legendFormat": "Recovery Failures/s — {{node}}", "refId": "C" }
+      ],
+      "title": "Recovery Attempts vs Success — WAL Replay Window",
+      "type": "timeseries"
+    }
+
+  ]
+}

@@ -1,0 +1,154 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: veltrixdb-alerts
+  namespace: veltrixdb
+  labels:
+    app.kubernetes.io/name: veltrixdb
+    prometheus: kube-prometheus
+    role: alert-rules
+spec:
+  groups:
+    - name: veltrixdb.storage
+      interval: 30s
+      rules:
+
+        # ── Write admission throttle ──────────────────────────────────────────
+        - alert: VeltrixDBWriteThrottleActive
+          expr: |
+            rate(veltrixdb_storage_write_admission_throttles_total[2m]) > 10
+          for: 2m
+          labels:
+            severity: warning
+          annotations:
+            summary: "VeltrixDB write admission throttle active on {{ $labels.node }}"
+            description: >
+              Write admission control is throttling Puts because read EWMA > 4 ms.
+              Rate: {{ $value | humanize }}/s.
+              Check veltrixdb_storage_read_latency_seconds histogram for root cause.
+
+        # ── VLog GC stalled ───────────────────────────────────────────────────
+        - alert: VeltrixDBVLogGCStalled
+          expr: |
+            (
+              rate(veltrixdb_vlog_gc_skipped_paused_total[5m]) > 0
+            ) and (
+              veltrixdb_vlog_garbage_ratio > 0.5
+            )
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "VeltrixDB VLog GC paused on {{ $labels.node }}"
+            description: >
+              VLog GC is paused because read latency EWMA > 4 ms and garbage ratio
+              is {{ $value | humanizePercentage }}. GC will auto-resume 4 min after
+              reads return to normal. Check read latency immediately.
+
+        # ── VLog corruption ───────────────────────────────────────────────────
+        - alert: VeltrixDBVLogReadErrors
+          expr: |
+            rate(veltrixdb_vlog_gc_read_errors_total[5m]) > 0
+          for: 1m
+          labels:
+            severity: critical
+          annotations:
+            summary: "VeltrixDB VLog read errors on {{ $labels.node }}"
+            description: >
+              VLog GC is encountering read errors (bad magic or CRC). This indicates
+              possible VLog corruption on disk {{ $labels.disk }}. Run
+              'veltrix-admin check --data-dirs <dirs>' offline immediately.
+
+        # ── Cache hit rate low ────────────────────────────────────────────────
+        - alert: VeltrixDBLowCacheHitRate
+          expr: |
+            (
+              rate(veltrixdb_cache_hits_total[5m])
+            ) / (
+              rate(veltrixdb_cache_hits_total[5m]) +
+              rate(veltrixdb_cache_misses_total[5m]) + 0.001
+            ) < 0.5
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "VeltrixDB cache hit rate below 50% on {{ $labels.node }}"
+            description: >
+              Cache hit rate is {{ $value | humanizePercentage }} over the last 5 min.
+              Consider increasing --cache or --cache-max-size-mb, or check whether
+              the keyspace is larger than the cache capacity.
+
+        # ── WAL flush latency ─────────────────────────────────────────────────
+        - alert: VeltrixDBHighReadLatency
+          expr: |
+            histogram_quantile(0.99,
+              rate(veltrixdb_storage_read_latency_seconds_bucket[5m])
+            ) > 0.010
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "VeltrixDB P99 read latency > 10 ms on {{ $labels.node }}"
+            description: >
+              P99 read latency is {{ $value | humanizeDuration }}.
+              On NVMe hardware this should be < 2 ms. Check for VLog GC pressure,
+              cache eviction storm, or disk saturation.
+
+        # ── Node failure detector ─────────────────────────────────────────────
+        - alert: VeltrixDBNodeFailed
+          expr: veltrixdb_fd_failed_nodes > 0
+          for: 1m
+          labels:
+            severity: critical
+          annotations:
+            summary: "VeltrixDB cluster node failure detected on {{ $labels.node }}"
+            description: >
+              {{ $value }} peer node(s) have missed heartbeats and are marked FAILED.
+              Check pod status and network connectivity. Quorum may be at risk.
+
+        # ── Replication factor drop ───────────────────────────────────────────
+        - alert: VeltrixDBPartitionsUnderreplicated
+          expr: |
+            veltrixdb_cluster_partitions_total - veltrixdb_cluster_healthy_partitions_total > 0
+          for: 2m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Some VeltrixDB partitions are under-replicated on {{ $labels.node }}"
+            description: >
+              {{ $value }} partition(s) have fewer replicas than the configured
+              replication factor. This may be caused by a node failure or network
+              partition. Data durability is reduced until all partitions are healed.
+
+    - name: veltrixdb.process
+      interval: 60s
+      rules:
+
+        # ── Disk space ────────────────────────────────────────────────────────
+        - alert: VeltrixDBDiskUsageHigh
+          expr: |
+            (
+              veltrixdb_storage_segment_bytes_total
+            ) / (
+              node_filesystem_size_bytes{mountpoint=~"/mnt/nvme.*"}
+            ) > 0.85
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "VeltrixDB disk usage > 85% on {{ $labels.node }}"
+            description: >
+              Segment file usage on disk {{ $labels.disk }} is {{ $value | humanizePercentage }}.
+              Run GC ('veltrix-admin compact') or add capacity.
+
+        # ── Process restart ───────────────────────────────────────────────────
+        - alert: VeltrixDBProcessRestarted
+          expr: |
+            increase(process_start_time_seconds{job="veltrixdb"}[5m]) > 0
+          labels:
+            severity: info
+          annotations:
+            summary: "VeltrixDB process restarted on {{ $labels.node }}"
+            description: >
+              The VeltrixDB process on {{ $labels.node }} restarted in the last 5 minutes.
+              Check WAL replay logs for errors.

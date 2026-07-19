@@ -1,0 +1,472 @@
+{
+  "__inputs": [
+    {
+      "name": "DS_PROMETHEUS",
+      "label": "Prometheus",
+      "description": "",
+      "type": "datasource",
+      "pluginId": "prometheus",
+      "pluginName": "Prometheus"
+    }
+  ],
+  "__elements": {},
+  "__requires": [
+    { "type": "grafana",    "id": "grafana",    "name": "Grafana",    "version": "9.0.0" },
+    { "type": "datasource", "id": "prometheus", "name": "Prometheus", "version": "1.0.0" },
+    { "type": "panel", "id": "stat",       "name": "Stat",       "version": "" },
+    { "type": "panel", "id": "timeseries", "name": "Time series","version": "" },
+    { "type": "panel", "id": "bargauge",   "name": "Bar gauge",  "version": "" },
+    { "type": "panel", "id": "row",        "name": "Row",        "version": "" }
+  ],
+  "annotations": { "list": [] },
+  "description": "VeltrixDB CI pipeline: job durations, pass/fail rates, and duration trends across commits and branches.",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "liveNow": false,
+  "refresh": "30s",
+  "schemaVersion": 37,
+  "style": "dark",
+  "tags": ["veltrixdb", "ci", "github-actions"],
+  "time": { "from": "now-24h", "to": "now" },
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "VeltrixDB — CI Pipeline",
+  "uid": "veltrixdb-ci-v1",
+  "version": 1,
+  "weekStart": "",
+
+  "templating": {
+    "list": [
+      {
+        "current": {},
+        "hide": 0,
+        "includeAll": false,
+        "label": "Data Source",
+        "multi": false,
+        "name": "datasource",
+        "options": [],
+        "query": "prometheus",
+        "refresh": 1,
+        "regex": "",
+        "type": "datasource"
+      },
+      {
+        "current": { "selected": true, "text": "All", "value": "$__all" },
+        "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+        "definition": "label_values(veltrixdb_ci_job_duration_seconds, branch)",
+        "hide": 0,
+        "includeAll": true,
+        "label": "Branch",
+        "multi": true,
+        "name": "branch",
+        "options": [],
+        "query": { "query": "label_values(veltrixdb_ci_job_duration_seconds, branch)", "refId": "StandardVariableQuery" },
+        "refresh": 2,
+        "regex": "",
+        "sort": 1,
+        "type": "query"
+      },
+      {
+        "current": { "selected": true, "text": "All", "value": "$__all" },
+        "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+        "definition": "label_values(veltrixdb_ci_job_duration_seconds, job_name)",
+        "hide": 0,
+        "includeAll": true,
+        "label": "Job",
+        "multi": true,
+        "name": "job_name",
+        "options": [],
+        "query": { "query": "label_values(veltrixdb_ci_job_duration_seconds, job_name)", "refId": "StandardVariableQuery" },
+        "refresh": 2,
+        "regex": "",
+        "sort": 1,
+        "type": "query"
+      }
+    ]
+  },
+
+  "panels": [
+
+    { "collapsed": false, "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 }, "id": 1, "title": "🚦 CI Health — At a Glance", "type": "row" },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Last observed result for each CI job: 0 = success (green), 1 = failure (red), 2 = cancelled (yellow). This stat shows the most recent push to the Pushgateway for each job.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "mappings": [
+            { "options": { "0": { "text": "PASS" }, "1": { "text": "FAIL" }, "2": { "text": "CANCELLED" } }, "type": "value" }
+          ],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "red", "value": 1 }, { "color": "yellow", "value": 2 }] },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 1 },
+      "id": 2,
+      "options": { "colorMode": "background", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
+      "targets": [{ "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "veltrixdb_ci_job_status{job_name=\"node-1-storage\",branch=~\"$branch\"}", "legendFormat": "node-1-storage", "refId": "A" }],
+      "title": "node-1-storage",
+      "type": "stat"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Last observed result for the node-2-cluster CI job.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "mappings": [{ "options": { "0": { "text": "PASS" }, "1": { "text": "FAIL" }, "2": { "text": "CANCELLED" } }, "type": "value" }],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "red", "value": 1 }, { "color": "yellow", "value": 2 }] },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 4, "w": 4, "x": 4, "y": 1 },
+      "id": 3,
+      "options": { "colorMode": "background", "graphMode": "none", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "targets": [{ "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "veltrixdb_ci_job_status{job_name=\"node-2-cluster\",branch=~\"$branch\"}", "legendFormat": "node-2-cluster", "refId": "A" }],
+      "title": "node-2-cluster",
+      "type": "stat"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Last observed result for the node-3-integration CI job.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "mappings": [{ "options": { "0": { "text": "PASS" }, "1": { "text": "FAIL" }, "2": { "text": "CANCELLED" } }, "type": "value" }],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "red", "value": 1 }, { "color": "yellow", "value": 2 }] },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 4, "w": 4, "x": 8, "y": 1 },
+      "id": 4,
+      "options": { "colorMode": "background", "graphMode": "none", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "targets": [{ "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "veltrixdb_ci_job_status{job_name=\"node-3-integration\",branch=~\"$branch\"}", "legendFormat": "node-3-integration", "refId": "A" }],
+      "title": "node-3-integration",
+      "type": "stat"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Last observed result for the bench CI job.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "mappings": [{ "options": { "0": { "text": "PASS" }, "1": { "text": "FAIL" }, "2": { "text": "CANCELLED" } }, "type": "value" }],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "red", "value": 1 }, { "color": "yellow", "value": 2 }] },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 4, "w": 4, "x": 12, "y": 1 },
+      "id": 5,
+      "options": { "colorMode": "background", "graphMode": "none", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "targets": [{ "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "veltrixdb_ci_job_status{job_name=\"bench\",branch=~\"$branch\"}", "legendFormat": "bench", "refId": "A" }],
+      "title": "bench",
+      "type": "stat"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Last observed result for the security CI job.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "mappings": [{ "options": { "0": { "text": "PASS" }, "1": { "text": "FAIL" }, "2": { "text": "CANCELLED" } }, "type": "value" }],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "red", "value": 1 }, { "color": "yellow", "value": 2 }] },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 4, "w": 4, "x": 16, "y": 1 },
+      "id": 6,
+      "options": { "colorMode": "background", "graphMode": "none", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "targets": [{ "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "veltrixdb_ci_job_status{job_name=\"security\",branch=~\"$branch\"}", "legendFormat": "security", "refId": "A" }],
+      "title": "security",
+      "type": "stat"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Last observed result for the bench-image CI job (push to main only).",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "mappings": [{ "options": { "0": { "text": "PASS" }, "1": { "text": "FAIL" }, "2": { "text": "CANCELLED" } }, "type": "value" }],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "red", "value": 1 }, { "color": "yellow", "value": 2 }] },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 4, "w": 4, "x": 20, "y": 1 },
+      "id": 7,
+      "options": { "colorMode": "background", "graphMode": "none", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "targets": [{ "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "veltrixdb_ci_job_status{job_name=\"bench-image\",branch=~\"$branch\"}", "legendFormat": "bench-image", "refId": "A" }],
+      "title": "bench-image",
+      "type": "stat"
+    },
+
+    { "collapsed": false, "gridPos": { "h": 1, "w": 24, "x": 0, "y": 6 }, "id": 10, "title": "⏱ Job Duration — Current & Trend", "type": "row" },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Last recorded wall-clock duration (seconds) for each CI job. Grouped by job name. Use this to instantly spot which job is the slowest and whether a recent commit caused a regression. Normal ranges: node-1-storage ~2–4 min, node-2-cluster ~2–3 min, node-3-integration ~8–15 min, bench ~5–10 min, security ~1–2 min.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "unit": "s",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 7 },
+      "id": 11,
+      "options": {
+        "displayMode": "gradient",
+        "maxVizHeight": 300,
+        "minVizHeight": 16,
+        "namePlacement": "auto",
+        "orientation": "horizontal",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "showUnfilled": true,
+        "valueMode": "color"
+      },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "veltrixdb_ci_job_duration_seconds{job_name=~\"$job_name\",branch=~\"$branch\"}", "legendFormat": "{{job_name}}", "refId": "A" }
+      ],
+      "title": "Job Duration — Last Run (seconds)",
+      "type": "bargauge"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Duration trend over time per job. Each point = one CI run push to the Pushgateway. Rising trend = tests or build is getting slower. A sudden spike on a specific job = that job's tests are flaky or a new dependency was added. Time range defaults to last 24 hours — widen to 7d for weekly trends.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "drawStyle": "line", "fillOpacity": 5, "lineWidth": 2, "showPoints": "always", "pointSize": 6, "spanNulls": false },
+          "unit": "s",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 7 },
+      "id": 12,
+      "options": { "legend": { "calcs": ["mean", "max", "last"], "displayMode": "table", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "veltrixdb_ci_job_duration_seconds{job_name=~\"$job_name\",branch=~\"$branch\"}", "legendFormat": "{{job_name}} ({{branch}})", "refId": "A" }
+      ],
+      "title": "Job Duration Trend Over Time",
+      "type": "timeseries"
+    },
+
+    { "collapsed": false, "gridPos": { "h": 1, "w": 24, "x": 0, "y": 16 }, "id": 20, "title": "📈 Per-Job Deep Dive", "type": "row" },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Duration trend for node-1-storage (build + unit tests). Expected range: 120–240s. Regressions here typically mean: new test added, dependency fetch slowed, or go build cache miss.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "fixed", "fixedColor": "blue" },
+          "custom": { "drawStyle": "line", "fillOpacity": 15, "lineWidth": 2, "showPoints": "always", "pointSize": 5 },
+          "unit": "s",
+          "min": 0
+        },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "Status" }, "properties": [{ "id": "unit", "value": "short" }, { "id": "custom.axisPlacement", "value": "right" }, { "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } }] }
+        ]
+      },
+      "gridPos": { "h": 7, "w": 8, "x": 0, "y": 17 },
+      "id": 21,
+      "options": { "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "none" } },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "veltrixdb_ci_job_duration_seconds{job_name=\"node-1-storage\",branch=~\"$branch\"}", "legendFormat": "Duration (s)", "refId": "A" },
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "veltrixdb_ci_job_status{job_name=\"node-1-storage\",branch=~\"$branch\"} * 100", "legendFormat": "Status (0=pass)", "refId": "B" }
+      ],
+      "title": "node-1-storage — Duration & Status",
+      "type": "timeseries"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Duration trend for node-2-cluster (consensus + cluster + replication tests). Expected range: 60–180s. Regressions here typically mean: new cluster test added, gossip timeout increased, or Raft election latency changed.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "fixed", "fixedColor": "green" },
+          "custom": { "drawStyle": "line", "fillOpacity": 15, "lineWidth": 2, "showPoints": "always", "pointSize": 5 },
+          "unit": "s",
+          "min": 0
+        },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "Status" }, "properties": [{ "id": "unit", "value": "short" }, { "id": "custom.axisPlacement", "value": "right" }, { "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } }] }
+        ]
+      },
+      "gridPos": { "h": 7, "w": 8, "x": 8, "y": 17 },
+      "id": 22,
+      "options": { "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "none" } },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "veltrixdb_ci_job_duration_seconds{job_name=\"node-2-cluster\",branch=~\"$branch\"}", "legendFormat": "Duration (s)", "refId": "A" },
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "veltrixdb_ci_job_status{job_name=\"node-2-cluster\",branch=~\"$branch\"} * 100", "legendFormat": "Status (0=pass)", "refId": "B" }
+      ],
+      "title": "node-2-cluster — Duration & Status",
+      "type": "timeseries"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Duration trend for node-3-integration (3-node cluster, crash recovery, leader election). This is the longest job — expected 480–900s. Spikes typically mean: new integration test scenario, leader election timeout, or WAL replay time increased.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "fixed", "fixedColor": "orange" },
+          "custom": { "drawStyle": "line", "fillOpacity": 15, "lineWidth": 2, "showPoints": "always", "pointSize": 5 },
+          "unit": "s",
+          "min": 0
+        },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "Status" }, "properties": [{ "id": "unit", "value": "short" }, { "id": "custom.axisPlacement", "value": "right" }, { "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } }] }
+        ]
+      },
+      "gridPos": { "h": 7, "w": 8, "x": 16, "y": 17 },
+      "id": 23,
+      "options": { "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "none" } },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "veltrixdb_ci_job_duration_seconds{job_name=\"node-3-integration\",branch=~\"$branch\"}", "legendFormat": "Duration (s)", "refId": "A" },
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "veltrixdb_ci_job_status{job_name=\"node-3-integration\",branch=~\"$branch\"} * 100", "legendFormat": "Status (0=pass)", "refId": "B" }
+      ],
+      "title": "node-3-integration — Duration & Status",
+      "type": "timeseries"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Duration trend for bench (200K-key density + GC gate). Expected 180–600s. A sudden increase here = write throughput degraded, GC is slower, or a new bench step was added.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "fixed", "fixedColor": "purple" },
+          "custom": { "drawStyle": "line", "fillOpacity": 15, "lineWidth": 2, "showPoints": "always", "pointSize": 5 },
+          "unit": "s",
+          "min": 0
+        },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "Status" }, "properties": [{ "id": "unit", "value": "short" }, { "id": "custom.axisPlacement", "value": "right" }, { "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } }] }
+        ]
+      },
+      "gridPos": { "h": 7, "w": 8, "x": 0, "y": 24 },
+      "id": 24,
+      "options": { "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "none" } },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "veltrixdb_ci_job_duration_seconds{job_name=\"bench\",branch=~\"$branch\"}", "legendFormat": "Duration (s)", "refId": "A" },
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "veltrixdb_ci_job_status{job_name=\"bench\",branch=~\"$branch\"} * 100", "legendFormat": "Status (0=pass)", "refId": "B" }
+      ],
+      "title": "bench — Duration & Status",
+      "type": "timeseries"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Duration trend for security (govulncheck). Expected 60–120s. Spikes indicate govulncheck scanning a new transitive dependency. Status is informational — this job uses continue-on-error:true.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "fixed", "fixedColor": "yellow" },
+          "custom": { "drawStyle": "line", "fillOpacity": 15, "lineWidth": 2, "showPoints": "always", "pointSize": 5 },
+          "unit": "s",
+          "min": 0
+        },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "Status" }, "properties": [{ "id": "unit", "value": "short" }, { "id": "custom.axisPlacement", "value": "right" }, { "id": "color", "value": { "mode": "fixed", "fixedColor": "orange" } }] }
+        ]
+      },
+      "gridPos": { "h": 7, "w": 8, "x": 8, "y": 24 },
+      "id": 25,
+      "options": { "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "none" } },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "veltrixdb_ci_job_duration_seconds{job_name=\"security\",branch=~\"$branch\"}", "legendFormat": "Duration (s)", "refId": "A" },
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "veltrixdb_ci_job_status{job_name=\"security\",branch=~\"$branch\"} * 100", "legendFormat": "Status (0=pass)", "refId": "B" }
+      ],
+      "title": "security — Duration & Status",
+      "type": "timeseries"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Duration trend for bench-image (Docker build + push). Expected 120–300s on cache hit, 300–600s on cache miss. Only runs on push to main. Spikes = cache miss or DockerHub rate-limit.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "fixed", "fixedColor": "light-blue" },
+          "custom": { "drawStyle": "line", "fillOpacity": 15, "lineWidth": 2, "showPoints": "always", "pointSize": 5 },
+          "unit": "s",
+          "min": 0
+        },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "Status" }, "properties": [{ "id": "unit", "value": "short" }, { "id": "custom.axisPlacement", "value": "right" }, { "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } }] }
+        ]
+      },
+      "gridPos": { "h": 7, "w": 8, "x": 16, "y": 24 },
+      "id": 26,
+      "options": { "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "none" } },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "veltrixdb_ci_job_duration_seconds{job_name=\"bench-image\",branch=~\"$branch\"}", "legendFormat": "Duration (s)", "refId": "A" },
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "veltrixdb_ci_job_status{job_name=\"bench-image\",branch=~\"$branch\"} * 100", "legendFormat": "Status (0=pass)", "refId": "B" }
+      ],
+      "title": "bench-image — Duration & Status",
+      "type": "timeseries"
+    },
+
+    { "collapsed": false, "gridPos": { "h": 1, "w": 24, "x": 0, "y": 32 }, "id": 30, "title": "📊 Aggregates — Total Pipeline Duration & Pass Rate", "type": "row" },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Sum of all job durations for a single run gives the total compute-minutes billed. The critical path (slowest sequential dependency chain) is: node-1 || node-2 → bench; node-3 runs in parallel. Reducing node-3-integration time directly shortens wall-clock CI time.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 2, "showPoints": "always", "pointSize": 5 },
+          "unit": "s",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 16, "x": 0, "y": 33 },
+      "id": 31,
+      "options": { "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "sum(veltrixdb_ci_job_duration_seconds{branch=~\"$branch\"}) by (run_id)", "legendFormat": "Total Compute-s (run {{run_id}})", "refId": "A" },
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "max(veltrixdb_ci_job_duration_seconds{job_name=\"node-3-integration\",branch=~\"$branch\"})", "legendFormat": "Critical-path (integration)", "refId": "B" }
+      ],
+      "title": "Total Compute Duration & Critical-Path Duration",
+      "type": "timeseries"
+    },
+
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Fraction of CI runs that completed with status=0 (success) over the selected time window. Below 90% = flaky tests or infra issues. Below 70% = something structurally broken. Each data point is derived from the most recent push per job — the average across all jobs gives the pipeline pass rate.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "red", "value": null }, { "color": "yellow", "value": 0.7 }, { "color": "green", "value": 0.9 }] },
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 33 },
+      "id": 32,
+      "options": { "colorMode": "background", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"] }, "orientation": "auto" },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "1 - avg(veltrixdb_ci_job_status{branch=~\"$branch\",job_name=~\"$job_name\"})", "legendFormat": "Pipeline Pass Rate", "refId": "A" }
+      ],
+      "title": "Pipeline Pass Rate",
+      "type": "stat"
+    }
+
+  ]
+}

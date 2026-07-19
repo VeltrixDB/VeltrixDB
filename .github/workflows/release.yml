@@ -1,0 +1,137 @@
+name: Release
+
+# Runs only after CI completes successfully on the default branch.
+# Flow: CI passes → bump minor tag (v1.0 → v1.1 → …) → Docker push → GitHub Release.
+#
+# Uses GITHUB_TOKEN to push images to GHCR (ghcr.io/veltrixdb/veltrixdb).
+# No additional secrets are required.
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+    branches: [main, master]
+
+permissions:
+  contents: write   # create tags + releases
+  packages: write   # push to GHCR
+
+jobs:
+  # ── 1. Auto-increment the minor version tag ─────────────────────────────────
+  tag:
+    name: Bump version tag
+    runs-on: ubuntu-latest
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    outputs:
+      tag: ${{ steps.bump.outputs.tag }}
+      prev_tag: ${{ steps.bump.outputs.prev_tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute and push next tag
+        id: bump
+        run: |
+          git fetch --tags --quiet
+          LATEST=$(git tag -l 'v1.*' --sort=-version:refname \
+                    | grep -E '^v1\.[0-9]+$' | head -1)
+          PREV="${LATEST}"
+          if [ -z "$LATEST" ]; then
+            NEXT="v1.0"
+          else
+            MINOR=$(echo "$LATEST" | sed 's/^v1\.//')
+            NEXT="v1.$((MINOR + 1))"
+          fi
+          echo "tag=$NEXT"       >> "$GITHUB_OUTPUT"
+          echo "prev_tag=$PREV"  >> "$GITHUB_OUTPUT"
+          git tag "$NEXT"
+          git push origin "$NEXT"
+
+  # ── 2. Build + push Docker image to GHCR ───────────────────────────────────
+  docker:
+    name: Build + push Docker image
+    runs-on: ubuntu-latest
+    needs: tag
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: |
+            ghcr.io/veltrixdb/veltrixdb:${{ needs.tag.outputs.tag }}
+            ghcr.io/veltrixdb/veltrixdb:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            VERSION=${{ needs.tag.outputs.tag }}
+
+  # ── 3. Create GitHub Release with changelog ─────────────────────────────────
+  # Runs after tagging only — independent of whether Docker push succeeded.
+  release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    needs: tag
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Generate changelog
+        id: changelog
+        run: |
+          git fetch --tags --quiet
+          TAG="${{ needs.tag.outputs.tag }}"
+          PREV="${{ needs.tag.outputs.prev_tag }}"
+
+          if [ -z "$PREV" ]; then
+            NOTES=$(git log --pretty=format:"- %s (%h)" HEAD)
+          else
+            NOTES=$(git log --pretty=format:"- %s (%h)" "${PREV}..${TAG}")
+          fi
+
+          {
+            echo "notes<<__ENDNOTES__"
+            echo "$NOTES"
+            echo "__ENDNOTES__"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ needs.tag.outputs.tag }}"
+          PREV="${{ needs.tag.outputs.prev_tag }}"
+          RANGE="${PREV:+${PREV}..}${TAG}"
+
+          gh release delete "$TAG" --yes 2>/dev/null || true
+
+          gh release create "$TAG" \
+            --title "VeltrixDB ${TAG}" \
+            --notes "## What's changed in ${TAG}
+
+          ${{ steps.changelog.outputs.notes }}
+
+          ## Docker image
+
+          \`\`\`
+          docker pull ghcr.io/veltrixdb/veltrixdb:${TAG}
+          \`\`\`
+
+          ## Full diff
+          https://github.com/${{ github.repository }}/compare/${RANGE}"

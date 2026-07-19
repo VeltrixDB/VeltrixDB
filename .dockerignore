@@ -1,0 +1,7 @@
+.git
+.github
+*.md
+cpp/
+k8s/
+veltrixdb-data/
+*.log

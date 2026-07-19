@@ -1,0 +1,54 @@
+---
+# Kubernetes Job: 1-billion-write benchmark
+# 3-node cluster · 512 workers × batch-size 4096 · 2 hours
+#
+# Usage:
+#   VELTRIX_IMAGE=<image:tag> VELTRIX_ADDR=<host>:<port> \
+#     envsubst < bench-job.yaml | kubectl apply -n veltrixdb -f -
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: veltrixdb-bench-1b
+  namespace: veltrixdb
+  labels:
+    app.kubernetes.io/name: veltrixdb-bench
+spec:
+  parallelism: 3
+  completions: 3
+  completionMode: Indexed
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 7200
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: veltrixdb-bench
+    spec:
+      restartPolicy: Never
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: loadtest
+          image: ${VELTRIX_IMAGE}
+          imagePullPolicy: Always
+          command: ["/loadtest"]
+          args:
+            - --addr=$(VELTRIX_ADDR)
+            - --mode=write
+            - --batch-size=4096
+            - --concurrency=512
+            - --duration=21600
+            - --num-keys=2000000000
+            - --value-size=128
+            - --report-every=60
+            - --safe-reads
+          env:
+            - name: VELTRIX_ADDR
+              value: "${VELTRIX_ADDR}"
+            - name: KEY_OFFSET
+              value: "${KEY_OFFSET}"
+          resources:
+            requests:
+              cpu: "8"
+              memory: "8Gi"
+            limits:
+              cpu: "16"
+              memory: "16Gi"
