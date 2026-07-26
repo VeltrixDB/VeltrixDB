@@ -22,6 +22,7 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/VeltrixDB/veltrixdb/consensus"
 	"github.com/VeltrixDB/veltrixdb/replication"
@@ -107,10 +108,10 @@ type clusterParams struct {
 	peers       []peerSpec
 
 	// inter-node TLS
-	tlsCert  string
-	tlsKey   string
-	tlsCA    string
-	mutual   bool
+	tlsCert string
+	tlsKey  string
+	tlsCA   string
+	mutual  bool
 }
 
 // buildCoordinator constructs the coordinator for raft/replicated mode and
@@ -202,19 +203,36 @@ func buildReplicatedCoordinator(p clusterParams) (*coordinator, func(), *replica
 	}
 
 	re := replication.NewReplicationEngine(p.nodeID, cfg)
+	// Feed each replica's ack watermark into the engine so the tombstone GC
+	// reaper won't drop a delete a replica hasn't yet applied.
+	re.SetAckObserver(pCurrentEngine.SetReplicaWatermark)
 	re.Start()
 
-	// Apply received ops to the local engine.
+	// Apply received ops to the local engine under last-writer-wins keyed on the
+	// op's origin timestamp, so replicas that receive concurrent writes in
+	// different orders converge to the same value instead of diverging by
+	// arrival order (see storage/lww.go). A stale op (superseded by a newer
+	// local write) is dropped, not an error.
 	applyFn := func(op *replication.WriteOperation) error {
-		if op.IsTombstone {
-			return pCurrentEngine.Delete(op.Key)
+		originNs := op.Timestamp
+		if originNs == 0 {
+			// Defensive: an op from an older peer without an origin clock — fall
+			// back to arrival time so it still participates in LWW.
+			originNs = time.Now().UnixNano()
 		}
-		if err := pCurrentEngine.Put(op.Key, op.Value, op.TTL); err != nil {
+		if op.IsTombstone {
+			_, err := pCurrentEngine.ApplyLWWDelete(op.Key, originNs)
+			return err
+		}
+		applied, err := pCurrentEngine.ApplyLWWPut(op.Key, op.Value, op.TTL, originNs)
+		if err != nil {
 			return err
 		}
 		// Vector writes replicate as plain KV on the reserved "@vec/" prefix;
-		// refresh this replica's in-RAM searchable index as well.
-		if storage.IsVectorKey(op.Key) {
+		// refresh this replica's in-RAM searchable index as well — but only when
+		// this write actually won the LWW race (otherwise we'd resurrect a
+		// superseded vector).
+		if applied && storage.IsVectorKey(op.Key) {
 			if err := pCurrentEngine.LoadVectorBlob(op.Key, op.Value); err != nil {
 				log.Printf("[repl] vector index refresh %q: %v", op.Key, err)
 			}

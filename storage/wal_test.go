@@ -156,18 +156,78 @@ func TestWAL_Serialization(t *testing.T) {
 		t.Fatalf("read wal: %v", err)
 	}
 
-	content := string(data)
-	// The WAL file must contain the key and the "7|" version.
-	for _, want := range []string{key, "|7|"} {
-		found := false
-		for i := 0; i <= len(content)-len(want); i++ {
-			if content[i:i+len(want)] == want {
-				found = true
-				break
-			}
+	// The WAL is now a key-safe binary format (wal_codec.go). Verify by parsing
+	// the record back rather than substring-matching a text layout.
+	recs, consumed := parseWALBuffer(data)
+	if consumed != len(data) {
+		t.Fatalf("parseWALBuffer consumed %d of %d bytes", consumed, len(data))
+	}
+	if len(recs) != 1 {
+		t.Fatalf("want 1 record, got %d", len(recs))
+	}
+	r := recs[0]
+	if r.key != key {
+		t.Errorf("key: want %q, got %q", key, r.key)
+	}
+	if string(r.value) != string(value) {
+		t.Errorf("value: want %q, got %q", value, r.value)
+	}
+	if r.version != 7 {
+		t.Errorf("version: want 7, got %d", r.version)
+	}
+	if r.timestampNs != 12345678 {
+		t.Errorf("timestamp: want 12345678, got %d", r.timestampNs)
+	}
+	if r.isTombstone {
+		t.Errorf("isTombstone: want false")
+	}
+}
+
+// TestWAL_BinarySafeKeys is a regression test for the data-loss bug where keys
+// containing the old text-format delimiters ('|', '\n') corrupted replay and
+// silently dropped the record and everything after it. Every such key must now
+// round-trip through the WAL and replay intact.
+func TestWAL_BinarySafeKeys(t *testing.T) {
+	wal, dir := newTestWAL(t, 0 /*immediate*/, 1024)
+
+	keys := []string{
+		"plain-key",
+		"pipe|in|key",
+		"newline\nin\nkey",
+		"both|and\nhere",
+		"carriage\r\nreturn",
+		"trailing-pipe|",
+	}
+	for i, k := range keys {
+		v := []byte(fmt.Sprintf("val-with-|-and-\n-%d", i))
+		e := &WALEntry{
+			Timestamp: int64(1000 + i),
+			Key:       k,
+			KeyLen:    uint32(len(k)),
+			Value:     v,
+			ValueLen:  uint32(len(v)),
+			Checksum:  computeCRC32C(v),
+			Version:   uint64(i + 1),
 		}
-		if !found {
-			t.Errorf("WAL missing %q in:\n%s", want, content)
+		if err := wal.append(e); err != nil {
+			t.Fatalf("append %q: %v", k, err)
+		}
+	}
+
+	got, err := replayWAL(filepath.Join(dir, "wal.log"))
+	if err != nil {
+		t.Fatalf("replayWAL: %v", err)
+	}
+	if len(got) != len(keys) {
+		t.Fatalf("replay returned %d entries, want %d (records after a bad key were dropped)", len(got), len(keys))
+	}
+	for i, k := range keys {
+		if got[i].key != k {
+			t.Errorf("entry %d: key want %q, got %q", i, k, got[i].key)
+		}
+		wantVal := fmt.Sprintf("val-with-|-and-\n-%d", i)
+		if string(got[i].value) != wantVal {
+			t.Errorf("entry %d: value want %q, got %q", i, wantVal, got[i].value)
 		}
 	}
 }

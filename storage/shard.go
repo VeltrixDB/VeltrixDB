@@ -226,6 +226,52 @@ func (si *shardedIndex) markTombstone(key string, nowUs int64) bool {
 	return true
 }
 
+// markTombstoneStamped tombstones key with an explicit LWW clock (origin
+// nanoseconds). When the key is not present and insertIfAbsent is true it
+// inserts a fresh tombstone entry so a delete that races ahead of the put it
+// supersedes still wins under re-ordered replicated delivery. Returns false
+// only when the key is absent and insertIfAbsent is false.
+func (si *shardedIndex) markTombstoneStamped(key string, nowUs, lwwNs int64, insertIfAbsent bool, shardID uint16) bool {
+	shard, _ := si.shardFor(key)
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
+
+	entry, ok := shard.entries[key]
+	if !ok {
+		if !insertIfAbsent {
+			return false
+		}
+		// Add to the bloom filter — otherwise get()'s bloom fast path would
+		// report this freshly-inserted tombstone as "definitely not present".
+		if b := shard.bloom; b != nil {
+			b.Add(fnv64a(key))
+		}
+		shard.entries[key] = &IndexEntry{
+			KeyHash:          fnv64a(key),
+			KeySize:          uint32(len(key)),
+			WriteTimestampUs: nowUs,
+			LWWStampNs:       lwwNs,
+			SchemaVersion:    CurrentSchemaVersion,
+			ShardID:          shardID,
+			Flags:            FlagTombstone,
+		}
+		return true
+	}
+	if !entry.IsTombstone() {
+		si.keyCount.Add(-1)
+	}
+	entry.MarkTombstone(nowUs)
+	entry.LWWStampNs = lwwNs
+	if si.ordered != nil {
+		si.ordered.Remove(key)
+	}
+	if _, hadDirty := shard.dirtyValues[key]; hadDirty {
+		si.dirtyCount.Add(-1)
+	}
+	delete(shard.dirtyValues, key)
+	return true
+}
+
 // markTiered sets FlagTiered on an IndexEntry after the TierManager has
 // successfully demoted its value to the cold tier.  Subsequent Gets will serve
 // the value from the cold tier; defrag.go's GC will skip relocating the entry
@@ -373,7 +419,8 @@ func (si *shardedIndex) vlogCandidates(diskIdx, numDisks int, gcHorizon uint64) 
 // were re-appended on replay). When in doubt, we round up — never down.
 //
 // alignedSize must match the encoding used by VLog.beginAppend:
-//   alignedLen = (vlogHeaderBytes + valueSize + vlogBlockSize-1) &^ (vlogBlockSize-1)
+//
+//	alignedLen = (vlogHeaderBytes + valueSize + vlogBlockSize-1) &^ (vlogBlockSize-1)
 //
 // Returns 0 when no entries reference diskIdx (fresh device).
 func (si *shardedIndex) maxVLogEndOffset(diskIdx, numDisks int) uint64 {

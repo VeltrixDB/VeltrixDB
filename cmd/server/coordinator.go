@@ -41,7 +41,12 @@ package main
 //	                  across N copies before ACK but NOT linearizability under
 //	                  concurrent writers, because there is no leader election or
 //	                  single-writer ordering — every node accepts writes for its
-//	                  local keyspace.  Reads are local.
+//	                  local keyspace.  Reads are local.  Concurrent conflicting
+//	                  writes are resolved by last-writer-wins on an origin
+//	                  wall-clock stamp carried to every replica (storage/lww.go),
+//	                  so replicas CONVERGE rather than diverge by arrival order.
+//	                  LWW is convergent, not linearizable, and only as good as
+//	                  clock sync — use raft mode when you need a single order.
 
 import (
 	"fmt"
@@ -209,13 +214,22 @@ func (c *coordinator) submitVoid(cmd fsmCmd) error {
 
 // replicateWrite hands a completed local write to the replication engine and,
 // for Quorum/Strong consistency, blocks until the required copies acknowledge.
+// The op is stamped with the current time as its last-writer-wins origin clock.
 func (c *coordinator) replicateWrite(key string, value []byte, ttl int32, tombstone bool) error {
+	return c.replicateWriteAt(key, value, ttl, tombstone, time.Now().UnixNano())
+}
+
+// replicateWriteAt is replicateWrite with an explicit origin timestamp (ns).
+// Put/Delete pass the SAME timestamp they used for the local ApplyLWW apply so
+// the origin node and every replica store an identical LWW clock for the write
+// and therefore converge (see storage/lww.go).
+func (c *coordinator) replicateWriteAt(key string, value []byte, ttl int32, tombstone bool, originNs int64) error {
 	seq := c.reqSeq.Add(1)
 	op := &replication.WriteOperation{
 		SeqNum:      seq,
 		Key:         key,
 		Value:       value,
-		Timestamp:   time.Now().UnixNano(),
+		Timestamp:   originNs,
 		TTL:         ttl,
 		NodeID:      c.localID,
 		IsTombstone: tombstone,
@@ -250,10 +264,14 @@ func (c *coordinator) Put(key string, value []byte, ttl int32) error {
 	case modeRaft:
 		return c.submitVoid(fsmCmd{Op: opPut, Key: key, Value: value, TTL: ttl})
 	case modeReplicated:
-		if err := c.engine.Put(key, value, ttl); err != nil {
+		// Stamp one origin clock and apply it both locally (LWW) and on every
+		// replica, so concurrent writers converge instead of diverging by
+		// arrival order.
+		originNs := time.Now().UnixNano()
+		if _, err := c.engine.ApplyLWWPut(key, value, ttl, originNs); err != nil {
 			return err
 		}
-		return c.replicateWrite(key, value, ttl, false)
+		return c.replicateWriteAt(key, value, ttl, false, originNs)
 	}
 	return fmt.Errorf("coordinator: bad mode")
 }
@@ -266,10 +284,11 @@ func (c *coordinator) Delete(key string) error {
 	case modeRaft:
 		return c.submitVoid(fsmCmd{Op: opDelete, Key: key})
 	case modeReplicated:
-		if err := c.engine.Delete(key); err != nil {
+		originNs := time.Now().UnixNano()
+		if _, err := c.engine.ApplyLWWDelete(key, originNs); err != nil {
 			return err
 		}
-		return c.replicateWrite(key, nil, -1, true)
+		return c.replicateWriteAt(key, nil, -1, true, originNs)
 	}
 	return fmt.Errorf("coordinator: bad mode")
 }

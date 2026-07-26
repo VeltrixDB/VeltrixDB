@@ -14,11 +14,12 @@ const vlogMagic = uint32(0x564C5402)
 
 // vlogHeaderBytes is the fixed record header size in the VLog.
 // Layout (24 bytes, matches the on-disk format in vlog.go):
-//   0  4  Magic
-//   4  4  ValLen
-//   8  4  CRC32C of value
-//  12  4  Reserved
-//  16  8  WriteTimestampUs
+//
+//	 0  4  Magic
+//	 4  4  ValLen
+//	 8  4  CRC32C of value
+//	12  4  Reserved
+//	16  8  WriteTimestampUs
 const vlogHeaderBytes = 24
 
 // ── Index entry flags ────────────────────────────────────────────────────────
@@ -55,7 +56,7 @@ const (
 //	52- 53  ShardID          uint16   owning index shard
 //	54      Flags            uint8    FlagXxx bitmask
 //	55      SchemaVersion    uint8    format version for rolling upgrades
-//	56- 63  _reserved        [8]byte  zero-padded; future HLC/CRDT extension
+//	56- 63  LWWStampNs       int64    origin wall-clock (ns) — last-writer-wins clock
 type IndexEntry struct {
 	KeyHash          uint64
 	DiskOffset       uint64
@@ -69,7 +70,15 @@ type IndexEntry struct {
 	ShardID          uint16
 	Flags            uint8
 	SchemaVersion    uint8
-	_reserved        [8]byte
+	// LWWStampNs is the ORIGIN wall-clock time (nanoseconds) of the write that
+	// produced this entry. In replicated mode it is stamped once at the
+	// coordinating node and carried to every replica, so all replicas resolve
+	// concurrent writes to the same key identically (last-writer-wins by this
+	// clock, ties broken deterministically) and converge regardless of the
+	// order writes arrive — see StorageEngine.ApplyLWWPut/ApplyLWWDelete. For
+	// standalone/raft writes it is simply the local write time. Zero on entries
+	// rebuilt from pre-1.1 data; lwwClock() then falls back to WriteTimestampUs.
+	LWWStampNs int64
 }
 
 func init() {
@@ -92,6 +101,16 @@ func (e *IndexEntry) MarkTombstone(nowUs int64) {
 	e.Flags |= FlagTombstone
 	e.ValueSize = 0
 	e.WriteTimestampUs = nowUs
+}
+
+// lwwClock returns the entry's last-writer-wins clock in nanoseconds. It prefers
+// the explicit origin stamp (LWWStampNs) and falls back to WriteTimestampUs
+// (µs → ns) for entries rebuilt from pre-1.1 data that predate the stamp.
+func lwwClock(e *IndexEntry) int64 {
+	if e.LWWStampNs != 0 {
+		return e.LWWStampNs
+	}
+	return e.WriteTimestampUs * 1000
 }
 
 // ── WAL ──────────────────────────────────────────────────────────────────────
@@ -201,11 +220,11 @@ const (
 // ── Metrics ──────────────────────────────────────────────────────────────────
 
 type EvictionMetrics struct {
-	TotalEvictions     *atomic.Uint64
-	LIRSEvictions      *atomic.Uint64
-	TTLEvictions       *atomic.Uint64
-	DefragEvictions    *atomic.Uint64
-	EvictionLatencyNs  *atomic.Int64
+	TotalEvictions    *atomic.Uint64
+	LIRSEvictions     *atomic.Uint64
+	TTLEvictions      *atomic.Uint64
+	DefragEvictions   *atomic.Uint64
+	EvictionLatencyNs *atomic.Int64
 }
 
 type StorageMetrics struct {
@@ -226,13 +245,18 @@ type StorageMetrics struct {
 	DefragRuns          *atomic.Uint64
 	TombstonesCollected *atomic.Uint64
 	BackPressureEvents  *atomic.Uint64
-	EvictionMetrics     *EvictionMetrics
+	// LWWConflictsResolved counts replicated writes dropped because a newer
+	// write already won under last-writer-wins (see lww.go). A non-zero rate is
+	// normal under concurrent multi-writer traffic and confirms convergence is
+	// actively resolving conflicts rather than letting replicas diverge.
+	LWWConflictsResolved *atomic.Uint64
+	EvictionMetrics      *EvictionMetrics
 
 	// VLog metrics (Key-Value Separation path only)
-	VLogWrites   *atomic.Uint64 // values appended to VLog
-	VLogReads    *atomic.Uint64 // values read from VLog (cache miss path)
-	VLogGCRuns   *atomic.Uint64 // VLog compaction passes that reclaimed ≥1 byte
-	VLogGCBytes  *atomic.Uint64 // bytes reclaimed by VLog GC
+	VLogWrites  *atomic.Uint64 // values appended to VLog
+	VLogReads   *atomic.Uint64 // values read from VLog (cache miss path)
+	VLogGCRuns  *atomic.Uint64 // VLog compaction passes that reclaimed ≥1 byte
+	VLogGCBytes *atomic.Uint64 // bytes reclaimed by VLog GC
 
 	// VLog GC diagnostic counters — expose why GC is or is not making progress.
 	VLogGCSkippedRatio  *atomic.Uint64 // compactVLog exited: GCRatio < threshold
@@ -283,9 +307,9 @@ type StorageMetrics struct {
 	// ── Server metrics (wired by cmd/server at startup) ──────────────────────
 	// All fields are atomic so the server goroutines can update them without
 	// holding any storage lock.
-	ActiveConnections  *atomic.Int64  // current open TCP connections (gauge)
-	NetworkBytesIn     *atomic.Uint64 // cumulative bytes read from clients
-	NetworkBytesOut    *atomic.Uint64 // cumulative bytes written to clients
+	ActiveConnections *atomic.Int64  // current open TCP connections (gauge)
+	NetworkBytesIn    *atomic.Uint64 // cumulative bytes read from clients
+	NetworkBytesOut   *atomic.Uint64 // cumulative bytes written to clients
 
 	// ── Pipeline coalescing (binary protocol tryCoalesce* paths) ─────────────
 	MultiPutBatches *atomic.Uint64 // number of vectorized MultiPut batches dispatched
@@ -307,8 +331,8 @@ type VLogStats struct {
 	FileBytes         int64
 	LiveBytes         int64
 	GarbageRatio      float64
-	WriteBytes        int64 // raw value bytes written (unpadded, excludes header + alignment padding)
-	ReadBytes         int64 // raw value bytes returned to callers
+	WriteBytes        int64   // raw value bytes written (unpadded, excludes header + alignment padding)
+	ReadBytes         int64   // raw value bytes returned to callers
 	WriteLatencyEWMAs float64 // EWMA of per-write latency in seconds (sampled 1-in-32)
 	ReadLatencyEWMAs  float64 // EWMA of per-read latency in seconds (sampled 1-in-32)
 	Slow              bool    // true when this disk's EWMA is > 5× the cluster median
@@ -316,23 +340,24 @@ type VLogStats struct {
 
 func newStorageMetrics() *StorageMetrics {
 	return &StorageMetrics{
-		Writes:              &atomic.Uint64{},
-		Reads:               &atomic.Uint64{},
-		Deletes:             &atomic.Uint64{},
-		WritesLatencyNs:     &atomic.Int64{},
-		ReadsLatencyNs:      &atomic.Int64{},
-		DeletesLatencyNs:    &atomic.Int64{},
-		CacheHits:           &atomic.Uint64{},
-		CacheMisses:         &atomic.Uint64{},
-		BloomFilterFalsePos: &atomic.Uint64{},
-		BloomFilterSkipped:  &atomic.Uint64{},
-		CompactionRuns:      &atomic.Uint64{},
-		DiskFailures:        &atomic.Uint64{},
-		WALFlushes:          &atomic.Uint64{},
-		SSTableCreations:    &atomic.Uint64{},
-		DefragRuns:          &atomic.Uint64{},
-		TombstonesCollected: &atomic.Uint64{},
-		BackPressureEvents:  &atomic.Uint64{},
+		Writes:               &atomic.Uint64{},
+		Reads:                &atomic.Uint64{},
+		Deletes:              &atomic.Uint64{},
+		WritesLatencyNs:      &atomic.Int64{},
+		ReadsLatencyNs:       &atomic.Int64{},
+		DeletesLatencyNs:     &atomic.Int64{},
+		CacheHits:            &atomic.Uint64{},
+		CacheMisses:          &atomic.Uint64{},
+		BloomFilterFalsePos:  &atomic.Uint64{},
+		BloomFilterSkipped:   &atomic.Uint64{},
+		CompactionRuns:       &atomic.Uint64{},
+		DiskFailures:         &atomic.Uint64{},
+		WALFlushes:           &atomic.Uint64{},
+		SSTableCreations:     &atomic.Uint64{},
+		DefragRuns:           &atomic.Uint64{},
+		TombstonesCollected:  &atomic.Uint64{},
+		BackPressureEvents:   &atomic.Uint64{},
+		LWWConflictsResolved: &atomic.Uint64{},
 		EvictionMetrics: &EvictionMetrics{
 			TotalEvictions:    &atomic.Uint64{},
 			LIRSEvictions:     &atomic.Uint64{},
@@ -345,12 +370,12 @@ func newStorageMetrics() *StorageMetrics {
 		VLogGCRuns:  &atomic.Uint64{},
 		VLogGCBytes: &atomic.Uint64{},
 
-		VLogGCSkippedRatio:  &atomic.Uint64{},
-		VLogGCSkippedPaused: &atomic.Uint64{},
-		VLogGCSkippedEmpty:  &atomic.Uint64{},
-		VLogGCReadErrors:    &atomic.Uint64{},
-		VLogGCCASFails:      &atomic.Uint64{},
-		VLogGCCandidates:    &atomic.Uint64{},
+		VLogGCSkippedRatio:   &atomic.Uint64{},
+		VLogGCSkippedPaused:  &atomic.Uint64{},
+		VLogGCSkippedEmpty:   &atomic.Uint64{},
+		VLogGCReadErrors:     &atomic.Uint64{},
+		VLogGCCASFails:       &atomic.Uint64{},
+		VLogGCCandidates:     &atomic.Uint64{},
 		VLogGCEmergencyRuns:  &atomic.Uint64{},
 		VLogBlkDiscardErrors: &atomic.Uint64{},
 
@@ -364,13 +389,13 @@ func newStorageMetrics() *StorageMetrics {
 
 		Admission: &AdmissionControl{},
 
-		ActiveConnections:  &atomic.Int64{},
-		NetworkBytesIn:     &atomic.Uint64{},
-		NetworkBytesOut:    &atomic.Uint64{},
-		MultiPutBatches:    &atomic.Uint64{},
-		MultiPutEntries:    &atomic.Uint64{},
-		MultiGetBatches:    &atomic.Uint64{},
-		MultiGetEntries:    &atomic.Uint64{},
+		ActiveConnections: &atomic.Int64{},
+		NetworkBytesIn:    &atomic.Uint64{},
+		NetworkBytesOut:   &atomic.Uint64{},
+		MultiPutBatches:   &atomic.Uint64{},
+		MultiPutEntries:   &atomic.Uint64{},
+		MultiGetBatches:   &atomic.Uint64{},
+		MultiGetEntries:   &atomic.Uint64{},
 
 		ObserveWriteLatency:  func(float64) {},
 		ObserveReadLatency:   func(float64) {},
@@ -382,9 +407,13 @@ func newStorageMetrics() *StorageMetrics {
 
 type StorageConfig struct {
 	// Memory / index
-	MaxMemorySizeMB    uint64
-	NumShards          int // index shard count; must be power of 2 (default 256)
-	WALBufferSizeMB    uint32
+	MaxMemorySizeMB uint64
+	// NumShards is DEPRECATED and ignored. The index shard count is a
+	// compile-time constant (storage.numShards = 8192) because the fixed-size
+	// shard array and the C++ layer's kNumShards must agree exactly. The field
+	// is retained only so existing configs/tests that set it still compile.
+	NumShards       int
+	WALBufferSizeMB uint32
 
 	// SSD / storage
 	//
@@ -394,8 +423,8 @@ type StorageConfig struct {
 	// The WAL is placed on DataDirPaths[0].
 	//
 	// DataDirPath: single-disk fallback used when DataDirPaths is empty.
-	DataDirPaths          []string // multi-disk: one entry per NVMe device
-	DataDirPath           string   // single-disk fallback
+	DataDirPaths []string // multi-disk: one entry per NVMe device
+	DataDirPath  string   // single-disk fallback
 
 	// RawVLogDevices: optional list of raw block devices (e.g. /dev/nvme0n1)
 	// where the VLog is stored directly, bypassing the filesystem entirely.
@@ -411,7 +440,7 @@ type StorageConfig struct {
 	// GC reclaim uses BLKDISCARD ioctl (NVMe TRIM) instead of fallocate
 	// PUNCH_HOLE, freeing flash erase blocks rather than just FS extents.
 	// Saves ~25 µs P99 read tail and ~70 µs P99 write tail vs XFS+O_DIRECT.
-	RawVLogDevices []string
+	RawVLogDevices        []string
 	SSTableBlockSizeMB    uint32
 	SSTableMaxSizeMB      uint64
 	BloomFilterBitsPerKey uint16
@@ -463,9 +492,9 @@ type StorageConfig struct {
 	// Audit log: append-only JSONL of mutating operations.  When AuditLogPath
 	// is empty, auditing is disabled.  Designed for compliance frameworks that
 	// require tamper-evident records separate from the data plane.
-	AuditLogPath        string
-	AuditChannelDepth   int           // 0 → 8192 default
-	AuditSyncEvery      time.Duration // 0 → 1 s default
+	AuditLogPath      string
+	AuditChannelDepth int           // 0 → 8192 default
+	AuditSyncEvery    time.Duration // 0 → 1 s default
 
 	// Compaction
 	CompactionThreads  uint16
@@ -474,8 +503,8 @@ type StorageConfig struct {
 	WriteAmplification float64
 
 	// LIRS cache
-	CacheMaxSizeMB  uint32
-	LIRRatio        float64 // fraction of cache reserved for LIR set (default 0.95)
+	CacheMaxSizeMB   uint32
+	LIRRatio         float64 // fraction of cache reserved for LIR set (default 0.95)
 	TTLCheckInterval time.Duration
 
 	// GC / defragmentation
@@ -524,9 +553,9 @@ type StorageConfig struct {
 	// BackPressureThreshold: if dirtyCount exceeds this ceiling, Put() sleeps
 	// BackPressureSleepMs before appending to the WAL — ScyllaDB-style soft
 	// stall that prevents unbounded memtable growth under sustained overload.
-	DirtyFlushThreshold  int // default 5_000_000
+	DirtyFlushThreshold   int // default 5_000_000
 	BackPressureThreshold int // default 15_000_000
-	BackPressureSleepMs  int // default 1
+	BackPressureSleepMs   int // default 1
 
 	// Continuous WAL archiving for point-in-time recovery (pitr.go).
 	//
@@ -555,65 +584,65 @@ type StorageConfig struct {
 
 func DefaultStorageConfig() *StorageConfig {
 	return &StorageConfig{
-	
 
 		// --- Memory / Index Tuning ---
-        MaxMemorySizeMB:       65536,         // 64GB Memtable (Writing 1B keys absorbs better)
-        NumShards:             1024,          // High granularity for 64 cores
-        WALBufferSizeMB:       512,           // Increased for parallel writes across 8 disks
+		MaxMemorySizeMB: 65536, // 64GB Memtable (Writing 1B keys absorbs better)
+		NumShards:       0,     // ignored — real shard count is the fixed numShards=8192 constant
+		WALBufferSizeMB: 512,   // Increased for parallel writes across 8 disks
 
-        // --- SSD / Storage Tuning (8x NVMe RAID-0 logic) ---
-        // DataDirPaths should be used for 8 disks as discussed earlier
-        DataDirPath:          "/var/lib/veltrixdb/data",
-        SSTableBlockSizeMB:    1,             // Small blocks = faster random access for 1B keys
-        SSTableMaxSizeMB:      1024,          // Increased to 1GB to keep file count low for 1B keys
-        BloomFilterBitsPerKey: 14,            // Increased from 10 to 14 to reduce false positives at 1B scale
-        KeyValueSeparation:    true,          // Enable this for better compaction efficiency
+		// --- SSD / Storage Tuning (8x NVMe RAID-0 logic) ---
+		// DataDirPaths should be used for 8 disks as discussed earlier
+		DataDirPath:           "/var/lib/veltrixdb/data",
+		SSTableBlockSizeMB:    1,    // Small blocks = faster random access for 1B keys
+		SSTableMaxSizeMB:      1024, // Increased to 1GB to keep file count low for 1B keys
+		BloomFilterBitsPerKey: 14,   // Increased from 10 to 14 to reduce false positives at 1B scale
+		KeyValueSeparation:    true, // Enable this for better compaction efficiency
 
-        // Per-shard Bloom filter for negative-lookup acceleration.
-        // 4 M bits/shard × 1024 shards = 512 MB. ~1% FP rate at 400 K keys/shard.
-        // Disable on memory-constrained nodes by setting BloomFilterShardBits=0.
-        BloomFilterShardBits:  1 << 22,
-        BloomFilterHashes:     7,
+		// Per-shard Bloom filter for negative-lookup acceleration.
+		// 4 M bits/shard (512 KB) × 8192 shards ≈ 4 GB. At 1B keys that is
+		// ~122 K keys/shard → well under 1% FP with 7 hashes.
+		// Disable on memory-constrained nodes by setting BloomFilterShardBits=0.
+		BloomFilterShardBits: 1 << 22,
+		BloomFilterHashes:    7,
 
-        // Background scrubber: 50 MB/s per disk, ~2 hour full pass on 375 GB.
-        ScrubEnabled:          true,
-        ScrubMBPerSec:         50,
+		// Background scrubber: 50 MB/s per disk, ~2 hour full pass on 375 GB.
+		ScrubEnabled:  true,
+		ScrubMBPerSec: 50,
 
-        // --- Compaction (The "Stall" Killer) ---
-        CompactionThreads:     16,            // Using 25% of your 64 cores
-        CompactionInterval:    5 * time.Second, // More frequent checks for 1B scale
-        MaxCompactionLevel:    7,             // Increased for deeper LSM tree
-        WriteAmplification:    8.0,           // Tighter control
+		// --- Compaction (The "Stall" Killer) ---
+		CompactionThreads:  16,              // Using 25% of your 64 cores
+		CompactionInterval: 5 * time.Second, // More frequent checks for 1B scale
+		MaxCompactionLevel: 7,               // Increased for deeper LSM tree
+		WriteAmplification: 8.0,             // Tighter control
 
-        // --- LIRS Cache (The 256GB Shield) ---
-        CacheMaxSizeMB:        262144,        // 256GB - 80% RAM rule
-        LIRRatio:              0.90,          // 90% LIR - Keep most keys immortal in RAM
-        TTLCheckInterval:      30 * time.Second, // Less frequent to save CPU cycles
+		// --- LIRS Cache (The 256GB Shield) ---
+		CacheMaxSizeMB:   262144,           // 256GB - 80% RAM rule
+		LIRRatio:         0.90,             // 90% LIR - Keep most keys immortal in RAM
+		TTLCheckInterval: 30 * time.Second, // Less frequent to save CPU cycles
 
-        // --- GC / Defragmentation ---
-        GCGracePeriodSec:      86400,
-        DefragInterval:        120 * time.Second, // Relaxed for high-throughput
-        DefragThreshold:       0.30,          // GC when 30% of VLog is dead — fires earlier with smaller passes vs old 50% bursts
+		// --- GC / Defragmentation ---
+		GCGracePeriodSec: 86400,
+		DefragInterval:   120 * time.Second, // Relaxed for high-throughput
+		DefragThreshold:  0.30,              // GC when 30% of VLog is dead — fires earlier with smaller passes vs old 50% bursts
 
-        // --- WAL + VLog Group-Commit Flush Windows ---
-        // 10 ms windows give batch_size ≈ (writes/s/disk) × 0.010.
-        // At 10 K writes/s/disk: batch_size ≈ 100 — crosses the target.
-        // With concurrent WAL+VLog (Put() submits both then waits for both),
-        // P99 ≈ max(WALWindow, VLogWindow) + fdatasync ≈ 10.2 ms on NVMe.
-        WALFlushWindowMs:      15,            // 15 ms group-commit window; matches WriteBatcher batchFlushDur for ~200 entries/batch
-        VLogFlushWindowMs:     15,            // must match WALFlushWindowMs (Invariant 20)
-        WALMaxBatchEntries:    4096,          // force early flush at 4096 entries; headroom for 100K+/s bursts
+		// --- WAL + VLog Group-Commit Flush Windows ---
+		// 10 ms windows give batch_size ≈ (writes/s/disk) × 0.010.
+		// At 10 K writes/s/disk: batch_size ≈ 100 — crosses the target.
+		// With concurrent WAL+VLog (Put() submits both then waits for both),
+		// P99 ≈ max(WALWindow, VLogWindow) + fdatasync ≈ 10.2 ms on NVMe.
+		WALFlushWindowMs:   15,   // 15 ms group-commit window; matches WriteBatcher batchFlushDur for ~200 entries/batch
+		VLogFlushWindowMs:  15,   // must match WALFlushWindowMs (Invariant 20)
+		WALMaxBatchEntries: 4096, // force early flush at 4096 entries; headroom for 100K+/s bursts
 
-        // --- Write Stall / Back-pressure ---
-        // At 1B keys, these must be very aggressive
-        DirtyFlushThreshold:   10_000_000,    // 10M keys before flush (Absorb bigger bursts)
-        BackPressureThreshold: 30_000_000,    // Stall only when really needed
-        BackPressureSleepMs:   1,             // Micro-stalls to prevent OOM
+		// --- Write Stall / Back-pressure ---
+		// At 1B keys, these must be very aggressive
+		DirtyFlushThreshold:   10_000_000, // 10M keys before flush (Absorb bigger bursts)
+		BackPressureThreshold: 30_000_000, // Stall only when really needed
+		BackPressureSleepMs:   1,          // Micro-stalls to prevent OOM
 
-        // --- Compression ---
-        Compression:           "zstd",
-        CompressionLevel:      1,
+		// --- Compression ---
+		Compression:      "zstd",
+		CompressionLevel: 1,
 	}
 }
 
@@ -643,8 +672,8 @@ func ReadHeavyConfig() *StorageConfig {
 	c := DefaultStorageConfig()
 
 	// --- Memory / Cache ---
-	c.CacheMaxSizeMB = 409600        // 400 GB — leave 112 GB for index, OS, network buffers
-	c.LIRRatio = 0.95                // 95% LIR — protect hot keys harder
+	c.CacheMaxSizeMB = 409600 // 400 GB — leave 112 GB for index, OS, network buffers
+	c.LIRRatio = 0.95         // 95% LIR — protect hot keys harder
 	c.TTLCheckInterval = 60 * time.Second
 
 	// --- GC ---

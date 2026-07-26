@@ -92,6 +92,52 @@ jobs:
             --sha    "${{ github.sha }}" \
             --branch "${{ github.ref_name }}"
 
+  # ── Node 2b: Jepsen-style chaos tests ─────────────────────────────────────
+  # Cycles random network partitions through a 5-node Raft cluster and a
+  # 2-replica LWW setup, asserting the safety invariants (no split-brain, no
+  # acknowledged-write loss, replica convergence to the correct LWW winner).
+  # Run with -race because these tests are heavily concurrent.
+  node-2b-chaos:
+    name: "Node 2b — partition chaos (raft + replicated)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: record start time
+        id: t0
+        run: echo "ts=$(date +%s)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.21"
+          cache: true
+
+      # Raft chaos is timing-sensitive (randomized election timeouts); run it
+      # without -race so a slow runner can't squeeze election deadlines. Its
+      # locking/persistence paths are covered under -race by the consensus unit
+      # suite in node-2.
+      - name: raft partition chaos (5 nodes, no split-brain / no loss)
+        run: CGO_ENABLED=0 go test -v -timeout 300s -count=1 -run 'TestChaos_' ./consensus/...
+
+      # The convergence test is heavily concurrent (multi-writer apply); run it
+      # under -race to catch data races in the LWW apply path.
+      - name: replicated LWW convergence chaos (2 replicas, reordered delivery)
+        run: go test -race -v -timeout 300s -count=1 -run 'TestChaos_' ./storage/...
+
+      - name: push CI metrics
+        if: always()
+        env:
+          PUSH_GW_URL: ${{ secrets.PUSH_GW_URL }}
+        run: |
+          bash scripts/push-ci-metrics.sh \
+            --job    "node-2b-chaos" \
+            --start  "${{ steps.t0.outputs.ts }}" \
+            --status "${{ job.status }}" \
+            --run-id "${{ github.run_id }}" \
+            --sha    "${{ github.sha }}" \
+            --branch "${{ github.ref_name }}"
+
   # ── Node 3: 3-node integration tests ──────────────────────────────────────
   # Spins up 3 real server processes on the runner and runs full integration
   # tests: crash recovery, node failover, leader election, backup/restore.

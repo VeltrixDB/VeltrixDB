@@ -85,7 +85,9 @@ func (rn *RaftNode) ReadIndex(timeout time.Duration) (uint64, error) {
 			if reply.Term > term {
 				rn.mu.Lock()
 				if reply.Term > rn.ps.CurrentTerm {
-					rn.becomeFollower(reply.Term)
+					if err := rn.becomeFollower(reply.Term); err != nil {
+						rn.logPersistFail("read-index reply step-down", err)
+					}
 				}
 				rn.mu.Unlock()
 				return

@@ -133,6 +133,14 @@ type Defragmenter struct {
 	// device. Nil-safe: nil means "never failed" (tests construct
 	// Defragmenter directly).
 	diskFailed func(int) bool
+
+	// canReapTombstone, when set, gates tombstone reaping on replica
+	// acknowledgement watermarks (tombstone_replicated.go) IN ADDITION to the
+	// grace period: a tombstone a lagging replica has not yet acked is retained
+	// so anti-entropy can still deliver the delete before the tombstone is
+	// dropped (prevents zombie resurrection). Nil-safe: nil means grace-period
+	// only (single-node deployments and tests that build Defragmenter directly).
+	canReapTombstone func(tombstoneWriteTsUs, nowUs, gracePeriodSec int64) bool
 }
 
 // skipDisk is the nil-safe breaker check used inside run().
@@ -437,12 +445,12 @@ func (d *Defragmenter) compactVLog(diskIdx int, vl *VLog) {
 
 	// gcReloc holds the state needed to CAS-update the index after a batch flush.
 	type gcReloc struct {
-		key         string
-		oldOffset   uint64
-		newOffset   int64
-		valueSize   uint32 // used for MarkDead on both success and CAS-fail paths
-		oldPacked   bool   // packed flag of the record being relocated (for MarkDead)
-		newPacked   bool   // true when relocated copy is packed (always true today — VLogBatcher packs)
+		key       string
+		oldOffset uint64
+		newOffset int64
+		valueSize uint32 // used for MarkDead on both success and CAS-fail paths
+		oldPacked bool   // packed flag of the record being relocated (for MarkDead)
+		newPacked bool   // true when relocated copy is packed (always true today — VLogBatcher packs)
 	}
 
 	batcher := vl.NewBatcher()
@@ -680,6 +688,15 @@ func (d *Defragmenter) reapExpiredTombstones() {
 		// Ensure the grace period still holds (clock may have skipped).
 		nowUs := time.Now().UnixMicro()
 		if nowUs-entry.WriteTimestampUs < gracePeriodUs {
+			continue
+		}
+
+		// Replica-watermark safety: in a replicated deployment, do not reap a
+		// tombstone that a lagging replica has not yet acknowledged — otherwise
+		// anti-entropy from that replica could resurrect the deleted key. No-op
+		// for single-node (no replicas tracked) and when the hook is unset.
+		if d.canReapTombstone != nil &&
+			!d.canReapTombstone(entry.WriteTimestampUs, nowUs, d.config.GCGracePeriodSec) {
 			continue
 		}
 

@@ -142,7 +142,8 @@ cluster/   partition_map.go    consistent-hash ring (FNV-1a, 64 vnodes/node), ep
            gossip.go            TCP gossip listener + digest exchange
 
 replication/ async / quorum / strong replication modes
-             vector clocks, anti-entropy, tombstone watermarks
+             last-writer-wins conflict resolution (origin-clock, convergent),
+             anti-entropy, replica-ack tombstone watermarks
 
 consensus/  Raft — leader election + log replication + snapshots
 ```
@@ -208,6 +209,13 @@ term/leader, peers, partition epoch, and per-replica replication lag.
   with `--checkpoint`, replays missed writes (including deletes) through the
   durable `/admin/changes` catch-up feed on restart — zero-loss at
   last-write-wins semantics.
+- **Replicated-mode conflict resolution**: every write carries an origin
+  wall-clock stamp applied identically on all replicas; apply is
+  last-writer-wins on that stamp with deterministic tie-breaks
+  (`storage/lww.go`), so replicas that receive concurrent writes in different
+  orders CONVERGE instead of diverging. Tombstone GC is gated on per-replica
+  ack watermarks so a delete is never reaped before a lagging replica has seen
+  it. LWW is convergent, not linearizable — use raft mode for a single order.
 
 ### Remaining gaps
 

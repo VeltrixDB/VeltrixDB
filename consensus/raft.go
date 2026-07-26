@@ -705,9 +705,15 @@ func (rn *RaftNode) HandleRequestVote(args RequestVoteArgs) RequestVoteReply {
 		return reply
 	}
 
-	// A higher term always causes this server to become a follower.
+	// A higher term always causes this server to become a follower. If the term
+	// change cannot be persisted, do not proceed to grant a vote — an un-durable
+	// term/vote would be lost on restart and could break election safety.
 	if args.Term > rn.ps.CurrentTerm {
-		rn.becomeFollower(args.Term)
+		if err := rn.becomeFollower(args.Term); err != nil {
+			rn.logPersistFail("HandleRequestVote becomeFollower", err)
+			reply.Term = rn.ps.CurrentTerm
+			return reply // VoteGranted stays false
+		}
 	}
 
 	// Grant vote only if:
@@ -718,7 +724,14 @@ func (rn *RaftNode) HandleRequestVote(args RequestVoteArgs) RequestVoteReply {
 
 	if canVote && logUpToDate {
 		rn.ps.VotedFor = args.CandidateID
-		_ = rn.saveState()
+		if err := rn.saveState(); err != nil {
+			// The vote is not durable — do not grant it. Revert so in-memory
+			// state matches what is (still) on disk.
+			rn.ps.VotedFor = ""
+			rn.logPersistFail("HandleRequestVote saveState", err)
+			reply.Term = rn.ps.CurrentTerm
+			return reply // VoteGranted stays false
+		}
 		rn.resetElectionTimer()
 		reply.VoteGranted = true
 	}
@@ -738,9 +751,15 @@ func (rn *RaftNode) HandleAppendEntries(args AppendEntriesArgs) AppendEntriesRep
 		return reply
 	}
 
-	// Valid leader contact — become/stay follower and reset timer.
+	// Valid leader contact — become/stay follower and reset timer. If the term
+	// change cannot be persisted, reject this RPC rather than ack an append under
+	// an un-durable term.
 	if args.Term > rn.ps.CurrentTerm {
-		rn.becomeFollower(args.Term)
+		if err := rn.becomeFollower(args.Term); err != nil {
+			rn.logPersistFail("HandleAppendEntries becomeFollower", err)
+			reply.Term = rn.ps.CurrentTerm
+			return reply // Success stays false
+		}
 	}
 	rn.role = RoleFollower
 	rn.currentRole.Store(int32(RoleFollower))
@@ -807,7 +826,15 @@ func (rn *RaftNode) HandleAppendEntries(args AppendEntriesArgs) AppendEntriesRep
 		// removed the entry our current config came from.
 		rn.refreshConfigFromLog()
 	}
-	_ = rn.saveState()
+	// Persist the (possibly extended/truncated) log before acking. If this
+	// fails, do not report success: the leader must not count this follower's
+	// append as durable. It will retry; our in-memory log is re-derivable from
+	// the leader's next AppendEntries.
+	if err := rn.saveState(); err != nil {
+		rn.logPersistFail("HandleAppendEntries saveState", err)
+		reply.Term = rn.ps.CurrentTerm
+		return reply // Success stays false
+	}
 
 	// Advance commit index.
 	if args.LeaderCommit > rn.commitIndex {
@@ -884,7 +911,19 @@ func (rn *RaftNode) startElection() {
 	rn.ps.VotedFor = rn.id
 	rn.role = RoleCandidate
 	rn.currentRole.Store(int32(RoleCandidate))
-	_ = rn.saveState()
+	// If the new term + self-vote cannot be persisted, abort the election: a
+	// candidate that isn't durable at its own term could, after a restart, vote
+	// again in the same term and violate election safety.
+	if err := rn.saveState(); err != nil {
+		rn.logPersistFail("startElection saveState", err)
+		rn.ps.CurrentTerm--
+		rn.ps.VotedFor = ""
+		rn.role = RoleFollower
+		rn.currentRole.Store(int32(RoleFollower))
+		rn.resetElectionTimer()
+		rn.mu.Unlock()
+		return
+	}
 
 	term := rn.ps.CurrentTerm
 	lastIdx := rn.lastLogIndex()
@@ -925,7 +964,9 @@ func (rn *RaftNode) startElection() {
 			rn.mu.Lock()
 			defer rn.mu.Unlock()
 			if reply.Term > rn.ps.CurrentTerm {
-				rn.becomeFollower(reply.Term)
+				if err := rn.becomeFollower(reply.Term); err != nil {
+					rn.logPersistFail("reply step-down", err)
+				}
 				return
 			}
 			if reply.VoteGranted && rn.ps.CurrentTerm == term && rn.role == RoleCandidate {
@@ -988,14 +1029,30 @@ func (rn *RaftNode) becomeLeader() {
 
 // becomeFollower reverts this node to Follower with the given term.
 // Must be called with rn.mu held.
-func (rn *RaftNode) becomeFollower(term uint64) {
+// becomeFollower reverts this node to Follower with the given term and persists
+// the new (term, votedFor). It returns the persistence error so safety-critical
+// callers (RPC handlers about to grant a vote or ack an append) can refuse to
+// acknowledge when the term change is not durable. Step-down paths that react to
+// a higher term seen in a reply treat persistence failure as non-fatal (they
+// still relinquish leadership in memory, which is the conservative action) but
+// log it loudly.
+func (rn *RaftNode) becomeFollower(term uint64) error {
 	rn.ps.CurrentTerm = term
 	rn.ps.VotedFor = ""
 	rn.role = RoleFollower
 	rn.currentRole.Store(int32(RoleFollower))
 	// Any Submit callers blocked on a commit will never be satisfied by us.
 	rn.failWaitersLocked(ErrNotLeader)
-	_ = rn.saveState()
+	return rn.saveState()
+}
+
+// logPersistFail reports a durable-state write failure that could not be cleanly
+// propagated to a caller. A failing state fsync is a serious condition (full or
+// failing disk) that risks Raft safety on restart, so it must be visible.
+func (rn *RaftNode) logPersistFail(ctx string, err error) {
+	if err != nil {
+		log.Printf("[raft] CRITICAL: %s: durable state write failed: %v — node state may be unsafe on restart", ctx, err)
+	}
 }
 
 // stepDownLocked demotes a leader to follower within the same term (used when
@@ -1069,7 +1126,9 @@ func (rn *RaftNode) broadcastAppendEntries() {
 			defer rn.mu.Unlock()
 
 			if reply.Term > rn.ps.CurrentTerm {
-				rn.becomeFollower(reply.Term)
+				if err := rn.becomeFollower(reply.Term); err != nil {
+					rn.logPersistFail("reply step-down", err)
+				}
 				return
 			}
 			if rn.role != RoleLeader || rn.ps.CurrentTerm != term {
