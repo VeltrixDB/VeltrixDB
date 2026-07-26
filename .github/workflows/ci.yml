@@ -120,6 +120,11 @@ jobs:
       - name: raft partition chaos (5 nodes, no split-brain / no loss)
         run: CGO_ENABLED=0 go test -v -timeout 300s -count=1 -run 'TestChaos_' ./consensus/...
 
+      # -race forces CGO_ENABLED=1, which compiles the Linux io_uring path
+      # (cgo_uring_linux.cpp) — that needs liburing headers on the runner.
+      - name: install liburing (cgo io_uring build dep for -race)
+        run: sudo apt-get update && sudo apt-get install -y liburing-dev
+
       # The convergence test is heavily concurrent (multi-writer apply); run it
       # under -race to catch data races in the LWW apply path.
       - name: replicated LWW convergence chaos (2 replicas, reordered delivery)
