@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -46,7 +45,7 @@ var walRespPool = sync.Pool{
 //	concurrency and sub-5 ms at ≥8 concurrent writers.
 type WriteAheadLog struct {
 	file           *os.File
-	walPath        string        // absolute path to wal.log (used for truncation on clean close)
+	walPath        string // absolute path to wal.log (used for truncation on clean close)
 	appendCh       chan *walItem
 	doneCh         chan struct{}
 	walFlushes     *atomic.Uint64 // pointer into StorageMetrics
@@ -59,9 +58,9 @@ type WriteAheadLog struct {
 	// existing file size at open (pre-existing content is durable by
 	// definition) and advanced by the flusher AFTER each successful fdatasync.
 	durableBytes atomic.Int64
-	flushWindow    time.Duration // 0 = flush immediately after channel drain
-	maxBatch       int           // max entries per flush (safety cap)
-	diskIdx        int           // for log prefixes
+	flushWindow  time.Duration // 0 = flush immediately after channel drain
+	maxBatch     int           // max entries per flush (safety cap)
+	diskIdx      int           // for log prefixes
 }
 
 type walItem struct {
@@ -160,61 +159,26 @@ func (wal *WriteAheadLog) appendAll(entries []*WALEntry) []error {
 	return errs
 }
 
-// serializeBufPool avoids per-call allocation for the WAL header line.
-// The line is: timestamp|tombstone|key|valueLen|crc32hex|version\n
-// For a 16-byte key + typical field widths this is ~60-80 bytes.
+// serializeBufPool avoids per-call allocation for the WAL record buffer.
 var serializeBufPool = sync.Pool{New: func() any { b := make([]byte, 0, 128); return &b }}
 
+// serialize encodes entry into a single key-safe binary WAL record (see
+// wal_codec.go). vlogOffset>0 means the value is already durable in the VLog at
+// that offset, so no value bytes are inlined; vlogOffset==0 inlines the value
+// (non-KV-sep mode). The record carries an explicit keyLen and a body CRC, so
+// keys may contain arbitrary bytes (including '|' and '\n', which corrupted the
+// old text format's framing) and torn tails are detected on replay.
 func (wal *WriteAheadLog) serialize(entry *WALEntry) []byte {
 	bufPtr := serializeBufPool.Get().(*[]byte)
 	buf := (*bufPtr)[:0]
 
-	// Header: timestamp|tombstone|key|valueLen|crc32hex|version|vlogOffset|packed\n
-	// 8-field format. vlogOffset=0 means value bytes follow on the next line
-	// (non-KV-sep mode or old-format compatibility). vlogOffset>0 means the
-	// value is already durable in the VLog at that offset — no value bytes here.
-	// packed='1' means the VLog record at vlogOffset shares its 4 KB block
-	// with other records (block packing); packed='0' means it owns a full
-	// 4 KB block (legacy unpacked layout). Replay restores FlagPacked from
-	// this field. Old 7-field WAL records are still parsed (packed defaults
-	// to false).
-	buf = strconv.AppendInt(buf, entry.Timestamp, 10)
-	buf = append(buf, '|')
-	if entry.IsTombstone {
-		buf = append(buf, '1')
-	} else {
-		buf = append(buf, '0')
-	}
-	buf = append(buf, '|')
-	buf = append(buf, entry.Key...)
-	buf = append(buf, '|')
-	buf = strconv.AppendUint(buf, uint64(entry.ValueLen), 10)
-	buf = append(buf, '|')
-	buf = strconv.AppendUint(buf, uint64(entry.Checksum), 16)
-	buf = append(buf, '|')
-	buf = strconv.AppendUint(buf, entry.Version, 10)
-	buf = append(buf, '|')
-	buf = strconv.AppendInt(buf, entry.VLogOffset, 10)
-	buf = append(buf, '|')
-	if entry.Packed {
-		buf = append(buf, '1')
-	} else {
-		buf = append(buf, '0')
-	}
-	buf = append(buf, '\n')
+	buf = encodeWALRecord(buf, entry.Timestamp, entry.IsTombstone, entry.Packed,
+		entry.Key, entry.ValueLen, entry.Value, entry.Checksum, entry.Version, entry.VLogOffset)
 
-	var result []byte
-	// Write value bytes only when the value is NOT stored in VLog (VLogOffset==0)
-	// and the entry carries value data (non-tombstone with a non-empty payload).
-	if !entry.IsTombstone && len(entry.Value) > 0 && entry.VLogOffset == 0 {
-		result = make([]byte, len(buf)+len(entry.Value)+1)
-		copy(result, buf)
-		copy(result[len(buf):], entry.Value)
-		result[len(buf)+len(entry.Value)] = '\n'
-	} else {
-		result = make([]byte, len(buf))
-		copy(result, buf)
-	}
+	// The pooled buffer is handed to the flusher, so return a right-sized copy
+	// and keep the (possibly grown) backing array in the pool for reuse.
+	result := make([]byte, len(buf))
+	copy(result, buf)
 
 	*bufPtr = buf
 	serializeBufPool.Put(bufPtr)
@@ -370,6 +334,6 @@ func (wal *WriteAheadLog) close() error {
 
 // checkpoint writes a compacted WAL (one record per live key) via an atomic
 // rename so keys survive a clean restart.  Must be called after close().
-func (wal *WriteAheadLog) checkpoint(index *shardedIndex, numDisks int, kvSep bool, version uint64) error {
-	return writeWALCheckpoint(wal.walPath, index, wal.diskIdx, numDisks, kvSep, version)
+func (wal *WriteAheadLog) checkpoint(index *shardedIndex, numDisks int, kvSep bool, version uint64, segReader segValueReader) error {
+	return writeWALCheckpoint(wal.walPath, index, wal.diskIdx, numDisks, kvSep, version, segReader)
 }

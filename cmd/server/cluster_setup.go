@@ -22,6 +22,7 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/VeltrixDB/veltrixdb/consensus"
 	"github.com/VeltrixDB/veltrixdb/replication"
@@ -107,10 +108,10 @@ type clusterParams struct {
 	peers       []peerSpec
 
 	// inter-node TLS
-	tlsCert  string
-	tlsKey   string
-	tlsCA    string
-	mutual   bool
+	tlsCert string
+	tlsKey  string
+	tlsCA   string
+	mutual  bool
 }
 
 // buildCoordinator constructs the coordinator for raft/replicated mode and
@@ -202,25 +203,64 @@ func buildReplicatedCoordinator(p clusterParams) (*coordinator, func(), *replica
 	}
 
 	re := replication.NewReplicationEngine(p.nodeID, cfg)
+	// Feed each replica's ack watermark into the engine so the tombstone GC
+	// reaper won't drop a delete a replica hasn't yet applied.
+	re.SetAckObserver(pCurrentEngine.SetReplicaWatermark)
 	re.Start()
 
-	// Apply received ops to the local engine.
+	// Apply received ops to the local engine under last-writer-wins keyed on the
+	// op's origin timestamp, so replicas that receive concurrent writes in
+	// different orders converge to the same value instead of diverging by
+	// arrival order (see storage/lww.go). A stale op (superseded by a newer
+	// local write) is dropped, not an error.
 	applyFn := func(op *replication.WriteOperation) error {
-		if op.IsTombstone {
-			return pCurrentEngine.Delete(op.Key)
+		originNs := op.Timestamp
+		if originNs == 0 {
+			// Defensive: an op from an older peer without an origin clock — fall
+			// back to arrival time so it still participates in LWW.
+			originNs = time.Now().UnixNano()
 		}
-		if err := pCurrentEngine.Put(op.Key, op.Value, op.TTL); err != nil {
+		if op.IsTombstone {
+			_, err := pCurrentEngine.ApplyLWWDelete(op.Key, originNs)
+			return err
+		}
+		applied, err := pCurrentEngine.ApplyLWWPut(op.Key, op.Value, op.TTL, originNs)
+		if err != nil {
 			return err
 		}
 		// Vector writes replicate as plain KV on the reserved "@vec/" prefix;
-		// refresh this replica's in-RAM searchable index as well.
-		if storage.IsVectorKey(op.Key) {
+		// refresh this replica's in-RAM searchable index as well — but only when
+		// this write actually won the LWW race (otherwise we'd resurrect a
+		// superseded vector).
+		if applied && storage.IsVectorKey(op.Key) {
 			if err := pCurrentEngine.LoadVectorBlob(op.Key, op.Value); err != nil {
 				log.Printf("[repl] vector index refresh %q: %v", op.Key, err)
 			}
 		}
 		return nil
 	}
+	// Anti-entropy: serve this node's per-shard digests and shard entries so
+	// peers can reconcile writes they missed while partitioned/crashed (the
+	// live push path only retries, it never backfills a replica that fell
+	// behind). Must be set before StartReplicationServer.
+	re.SetSyncHandlers(
+		pCurrentEngine.ShardDigests,
+		func(shardID uint16) ([]replication.SyncEntry, error) {
+			entries, err := pCurrentEngine.FetchShard(shardID)
+			if err != nil {
+				return nil, err
+			}
+			out := make([]replication.SyncEntry, len(entries))
+			for i, e := range entries {
+				out[i] = replication.SyncEntry{
+					Key: e.Key, Value: e.Value, LWWStampNs: e.LWWStampNs,
+					Tombstone: e.Tombstone, TTLSeconds: e.TTLSeconds,
+				}
+			}
+			return out, nil
+		},
+	)
+
 	replListen := p.replAddr
 	if replListen == "" {
 		replListen = deriveAddr(p.clientAddr, offReplication)
@@ -238,6 +278,34 @@ func buildReplicatedCoordinator(p clusterParams) (*coordinator, func(), *replica
 	log.Printf("[repl] mode active  node=%s  server=%s  consistency=%s  replicas=%d",
 		p.nodeID, replListen, consistencyName(p.consistency), len(p.peers))
 
+	// Periodic anti-entropy reconcile loop: pull each peer's divergent shards
+	// and LWW-apply them, converging this node toward the union. Bidirectional
+	// convergence follows because every node runs the same loop.
+	aeInterval := cfg.AntiEntropyInterval
+	if aeInterval <= 0 {
+		aeInterval = 30 * time.Second
+	}
+	aeStop := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(aeInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-aeStop:
+				return
+			case <-ticker.C:
+				for _, id := range re.ReplicaIDs() {
+					n, err := pCurrentEngine.Reconcile(tcpPeerSync{re: re, id: id})
+					if err != nil {
+						log.Printf("[antientropy] reconcile from %s: %v", id, err)
+					} else if n > 0 {
+						log.Printf("[antientropy] reconciled %d entries from %s", n, id)
+					}
+				}
+			}
+		}
+	}()
+
 	c := &coordinator{
 		mode:        modeReplicated,
 		engine:      pCurrentEngine,
@@ -247,8 +315,34 @@ func buildReplicatedCoordinator(p clusterParams) (*coordinator, func(), *replica
 		replFactor:  p.replFactor,
 		replTimeout: int(cfg.ReplicationTimeout.Milliseconds()),
 	}
-	cleanup := func() { _ = re.Close() }
+	cleanup := func() { close(aeStop); _ = re.Close() }
 	return c, cleanup, re.GetMetrics(), nil
+}
+
+// tcpPeerSync adapts a replica (reached over the replication engine's client)
+// to storage.PeerSync, converting replication.SyncEntry ↔ storage.SyncEntry.
+type tcpPeerSync struct {
+	re *replication.ReplicationEngine
+	id string
+}
+
+func (p tcpPeerSync) ShardDigests() (map[uint16]uint64, error) {
+	return p.re.FetchPeerDigests(p.id)
+}
+
+func (p tcpPeerSync) FetchShard(shardID uint16) ([]storage.SyncEntry, error) {
+	wire, err := p.re.FetchPeerShard(p.id, shardID)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]storage.SyncEntry, len(wire))
+	for i, e := range wire {
+		out[i] = storage.SyncEntry{
+			Key: e.Key, Value: e.Value, LWWStampNs: e.LWWStampNs,
+			Tombstone: e.Tombstone, TTLSeconds: e.TTLSeconds,
+		}
+	}
+	return out, nil
 }
 
 // pCurrentEngine is set by main() before buildCoordinator is called.  A package

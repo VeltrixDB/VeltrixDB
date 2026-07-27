@@ -65,7 +65,7 @@ const (
 type ReplicaState int
 
 const (
-	ReplicaStateSync    ReplicaState = iota
+	ReplicaStateSync ReplicaState = iota
 	ReplicaStateSync_Pending
 	ReplicaStateLag
 	ReplicaStateFailed
@@ -169,6 +169,93 @@ type ReplicationEngine struct {
 	// Populated by AddReplica (real TCP/TLS client) or SetReplicaTransport
 	// (custom/test transport).
 	clients map[string]ReplicaTransport
+
+	// ackObserver, when set, is called after a replica durably acks a batch with
+	// the replica's ID and the highest origin write timestamp (µs) it has now
+	// applied. The engine wires this to StorageEngine.SetReplicaWatermark so the
+	// tombstone GC reaper only drops a delete once every replica that acks has
+	// seen it (prevents zombie resurrection). nil-safe.
+	ackObserver func(replicaID string, appliedTsUs int64)
+
+	// syncDigestFn / syncFetchFn serve anti-entropy pulls FROM peers to this
+	// node's replication server. Wired via SetSyncHandlers before
+	// StartReplicationServer.
+	syncDigestFn func() (map[uint16]uint64, error)
+	syncFetchFn  func(shardID uint16) ([]SyncEntry, error)
+}
+
+// SyncPuller is the pull side of anti-entropy: a transport that can fetch a
+// peer's shard digests and shard entries. *ReplicationClient implements it.
+type SyncPuller interface {
+	FetchDigests() (map[uint16]uint64, error)
+	FetchShard(shardID uint16) ([]SyncEntry, error)
+}
+
+// SetSyncHandlers registers the anti-entropy digest/fetch handlers this node
+// serves to peers. Must be called before StartReplicationServer.
+func (re *ReplicationEngine) SetSyncHandlers(
+	digestFn func() (map[uint16]uint64, error),
+	fetchFn func(shardID uint16) ([]SyncEntry, error),
+) {
+	re.mu.Lock()
+	re.syncDigestFn = digestFn
+	re.syncFetchFn = fetchFn
+	re.mu.Unlock()
+}
+
+// peerPuller returns the SyncPuller for replicaID, or an error if the replica
+// is unknown or its transport does not support anti-entropy pulls.
+func (re *ReplicationEngine) peerPuller(replicaID string) (SyncPuller, error) {
+	re.mu.RLock()
+	c, ok := re.clients[replicaID]
+	re.mu.RUnlock()
+	if !ok || c == nil {
+		return nil, fmt.Errorf("unknown replica %q", replicaID)
+	}
+	p, ok := c.(SyncPuller)
+	if !ok {
+		return nil, fmt.Errorf("replica %q transport does not support anti-entropy", replicaID)
+	}
+	return p, nil
+}
+
+// FetchPeerDigests pulls a peer's per-shard digests over its replication client.
+func (re *ReplicationEngine) FetchPeerDigests(replicaID string) (map[uint16]uint64, error) {
+	p, err := re.peerPuller(replicaID)
+	if err != nil {
+		return nil, err
+	}
+	return p.FetchDigests()
+}
+
+// FetchPeerShard pulls a peer's entries for one shard over its replication client.
+func (re *ReplicationEngine) FetchPeerShard(replicaID string, shardID uint16) ([]SyncEntry, error) {
+	p, err := re.peerPuller(replicaID)
+	if err != nil {
+		return nil, err
+	}
+	return p.FetchShard(shardID)
+}
+
+// ReplicaIDs returns the set of registered replica node IDs (for a reconcile
+// loop to iterate).
+func (re *ReplicationEngine) ReplicaIDs() []string {
+	re.mu.RLock()
+	defer re.mu.RUnlock()
+	ids := make([]string, 0, len(re.clients))
+	for id := range re.clients {
+		ids = append(ids, id)
+	}
+	return ids
+}
+
+// SetAckObserver registers a callback invoked when a replica acks a batch,
+// carrying the highest origin write timestamp (µs) that replica has applied.
+// Used to feed StorageEngine.SetReplicaWatermark for tombstone-reap safety.
+func (re *ReplicationEngine) SetAckObserver(fn func(replicaID string, appliedTsUs int64)) {
+	re.mu.Lock()
+	re.ackObserver = fn
+	re.mu.Unlock()
 }
 
 // ReplicaTransport abstracts the per-replica transport so tests and future
@@ -187,15 +274,15 @@ type ReplicaTransport interface {
 // under RLock, writes under Lock).  The atomic fields are safe to touch
 // without the engine lock.
 type ReplicaInfo struct {
-	NodeID         string
-	Address        string
-	Port           int
-	State          ReplicaState
-	LastAckSeqNum  uint64
-	LagBytes       atomic.Uint64
-	LagNs          atomic.Int64
-	FailureCount   atomic.Uint64
-	SyncedAt       int64
+	NodeID        string
+	Address       string
+	Port          int
+	State         ReplicaState
+	LastAckSeqNum uint64
+	LagBytes      atomic.Uint64
+	LagNs         atomic.Int64
+	FailureCount  atomic.Uint64
+	SyncedAt      int64
 }
 
 // NewReplicationEngine creates a new replication engine
@@ -379,7 +466,7 @@ func (re *ReplicationEngine) WaitForReplication(seqNum uint64, targetReplicas in
 func (re *ReplicationEngine) GetReplicaLag() map[string]ReplicaLagInfo {
 	re.mu.RLock()
 	defer re.mu.RUnlock()
-	
+
 	lag := make(map[string]ReplicaLagInfo)
 	for nodeID, replica := range re.replicaStates {
 		lag[nodeID] = ReplicaLagInfo{
@@ -424,26 +511,26 @@ func (rs ReplicaState) String() string {
 func (re *ReplicationEngine) backgroundReplicationWorker() {
 	ticker := time.NewTicker(time.Duration(re.config.FlushIntervalMs) * time.Millisecond)
 	defer ticker.Stop()
-	
+
 	batch := make([]*WriteOperation, 0, re.config.BatchSize)
-	
+
 	for {
 		select {
 		case <-re.done:
 			return
 		case op := <-re.writeQueue:
 			batch = append(batch, op)
-			
+
 			// Store pending write
 			re.mu.Lock()
 			re.pendingWrites[op.SeqNum] = op
 			re.mu.Unlock()
-			
+
 			if len(batch) >= re.config.BatchSize {
 				re.replicateBatch(batch)
 				batch = make([]*WriteOperation, 0, re.config.BatchSize)
 			}
-		
+
 		case <-ticker.C:
 			if len(batch) > 0 {
 				re.replicateBatch(batch)
@@ -614,10 +701,14 @@ func (re *ReplicationEngine) clearPending(ops []*WriteOperation) {
 func (re *ReplicationEngine) sendToReplica(r *ReplicaInfo, ops []*WriteOperation) error {
 	var batchBytes uint64
 	var maxSeq uint64
+	var maxTsNs int64
 	for _, op := range ops {
 		batchBytes += uint64(len(op.Key) + len(op.Value))
 		if op.SeqNum > maxSeq {
 			maxSeq = op.SeqNum
+		}
+		if op.Timestamp > maxTsNs {
+			maxTsNs = op.Timestamp
 		}
 	}
 
@@ -625,17 +716,25 @@ func (re *ReplicationEngine) sendToReplica(r *ReplicaInfo, ops []*WriteOperation
 	err := re.sendReplicationRPC(r, ops)
 
 	re.mu.Lock()
+	var ackObserver func(string, int64)
 	if err == nil {
 		if maxSeq > r.LastAckSeqNum {
 			r.LastAckSeqNum = maxSeq
 		}
 		r.State = ReplicaStateSync
+		ackObserver = re.ackObserver
 	} else {
 		r.State = ReplicaStateFailed
 	}
 	re.mu.Unlock()
 
 	if err == nil {
+		// Advance this replica's tombstone-reap watermark to the highest origin
+		// timestamp it has now durably applied (ns → µs). SetReplicaWatermark is
+		// monotonic, so out-of-order batches never regress it.
+		if ackObserver != nil && maxTsNs > 0 {
+			ackObserver(r.NodeID, maxTsNs/1000)
+		}
 		r.LagBytes.Store(0)
 		r.LagNs.Store(time.Since(start).Nanoseconds())
 		return nil
@@ -669,7 +768,7 @@ func (re *ReplicationEngine) sendReplicationRPC(replica *ReplicaInfo, ops []*Wri
 func (re *ReplicationEngine) backgroundAntiEntropyWorker() {
 	ticker := time.NewTicker(re.config.AntiEntropyInterval)
 	defer ticker.Stop()
-	
+
 	for {
 		select {
 		case <-re.done:
@@ -691,7 +790,7 @@ func (re *ReplicationEngine) runAntiEntropy() {
 		}
 	}
 	re.mu.Unlock()
-	
+
 	for _, replica := range replicas {
 		// Find operations that haven't been synced to this replica
 		re.mu.RLock()
@@ -702,7 +801,7 @@ func (re *ReplicationEngine) runAntiEntropy() {
 			}
 		}
 		re.mu.RUnlock()
-		
+
 		if len(pendingOps) > 0 {
 			// sendToReplica records ack progress so a caught-up replica
 			// transitions back to ReplicaStateSync.
@@ -715,7 +814,7 @@ func (re *ReplicationEngine) runAntiEntropy() {
 func (re *ReplicationEngine) backgroundLagMonitor() {
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
-	
+
 	for {
 		select {
 		case <-re.done:
@@ -748,6 +847,13 @@ func (re *ReplicationEngine) StartReplicationServer(listenAddr string, applyFn A
 	}
 	if err != nil {
 		return err
+	}
+	// Serve anti-entropy pulls if handlers were registered (SetSyncHandlers).
+	re.mu.RLock()
+	dfn, ffn := re.syncDigestFn, re.syncFetchFn
+	re.mu.RUnlock()
+	if dfn != nil || ffn != nil {
+		srv.SetSyncHandlers(dfn, ffn)
 	}
 	go srv.ListenAndServe()
 	// Stop the server when the engine is closed.
@@ -785,7 +891,7 @@ func (vv *VersionVector) HappenedBefore(other *VersionVector) bool {
 	other.mu.RLock()
 	defer vv.mu.RUnlock()
 	defer other.mu.RUnlock()
-	
+
 	atLeastOneLess := false
 	for node := range vv.Clock {
 		if vv.Clock[node] > other.Clock[node] {
@@ -804,11 +910,11 @@ func (vv *VersionVector) Concurrent(other *VersionVector) bool {
 	other.mu.RLock()
 	defer vv.mu.RUnlock()
 	defer other.mu.RUnlock()
-	
+
 	// Check if neither happens-before the other
 	vvLess := false
 	otherLess := false
-	
+
 	for node := range vv.Clock {
 		if vv.Clock[node] < other.Clock[node] {
 			vvLess = true
@@ -816,6 +922,6 @@ func (vv *VersionVector) Concurrent(other *VersionVector) bool {
 			otherLess = true
 		}
 	}
-	
+
 	return vvLess && otherLess
 }

@@ -232,7 +232,9 @@ func (rn *RaftNode) takeSnapshot(ssm SnapshotStateMachine) {
 		rn.lastIncludedTerm = term
 		rn.baseConfig = cfg.clone()
 		rn.baseConfigIndex = cfgIdx
-		_ = rn.saveState()
+		if err := rn.saveState(); err != nil {
+			rn.logPersistFail("takeSnapshot saveState", err)
+		}
 		log.Printf("[raft] node=%s snapshot taken  idx=%d term=%d retained_log=%d",
 			rn.id, idx, term, len(rn.ps.Log))
 	}
@@ -282,7 +284,9 @@ func (rn *RaftNode) sendSnapshot(peer string, term uint64) {
 	rn.mu.Lock()
 	defer rn.mu.Unlock()
 	if reply.Term > rn.ps.CurrentTerm {
-		rn.becomeFollower(reply.Term)
+		if err := rn.becomeFollower(reply.Term); err != nil {
+			rn.logPersistFail("sendSnapshot reply step-down", err)
+		}
 		return
 	}
 	if rn.role != RoleLeader || rn.ps.CurrentTerm != term {
@@ -312,7 +316,11 @@ func (rn *RaftNode) HandleInstallSnapshot(args InstallSnapshotArgs) InstallSnaps
 		return reply
 	}
 	if args.Term > rn.ps.CurrentTerm {
-		rn.becomeFollower(args.Term)
+		if err := rn.becomeFollower(args.Term); err != nil {
+			rn.logPersistFail("HandleInstallSnapshot becomeFollower", err)
+			reply.Term = rn.ps.CurrentTerm
+			return reply // term not durable — do not install under it
+		}
 	}
 	rn.role = RoleFollower
 	rn.currentRole.Store(int32(RoleFollower))
@@ -369,7 +377,9 @@ func (rn *RaftNode) HandleInstallSnapshot(args InstallSnapshotArgs) InstallSnaps
 	rn.baseConfig = args.Config.clone()
 	rn.baseConfigIndex = args.ConfigIndex
 	rn.refreshConfigFromLog()
-	_ = rn.saveState()
+	if err := rn.saveState(); err != nil {
+		rn.logPersistFail("HandleInstallSnapshot saveState", err)
+	}
 	rn.resetElectionTimer() // second reset: the restore above may have been slow
 
 	log.Printf("[raft] node=%s installed snapshot from %s  idx=%d term=%d retained_log=%d",

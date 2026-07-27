@@ -222,7 +222,7 @@ func (sw *SegmentWriter) close() error {
 //
 //	shard 0 → disk 0,  shard 1 → disk 1,  …  shard N → disk N%numDisks
 //
-// This distributes the 256 shards evenly across all disks so every disk
+// This distributes the 8192 shards evenly across all disks so every disk
 // receives the same number of shards regardless of how many disks are present.
 func diskForShard(shardID uint16, numDisks int) int {
 	if numDisks <= 1 {

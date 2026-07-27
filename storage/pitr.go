@@ -478,6 +478,19 @@ func parseWALBuffer(data []byte) ([]archivedWALRecord, int) {
 	pos := 0
 
 	for pos < len(data) {
+		// Binary records (current format) start with walBinaryMagic; legacy text
+		// records start with an ASCII digit. Detect per record so a mixed buffer
+		// (legacy bytes followed by binary bytes) parses correctly.
+		if data[pos] == walBinaryMagic {
+			rec, consumed, ok := decodeBinaryWALRecord(data[pos:])
+			if !ok {
+				break // partial or corrupt tail — retry on a later pass
+			}
+			recs = append(recs, rec)
+			pos += consumed
+			continue
+		}
+
 		nl := bytes.IndexByte(data[pos:], '\n')
 		if nl < 0 {
 			break
@@ -548,31 +561,12 @@ func parseWALBuffer(data []byte) ([]archivedWALRecord, int) {
 	return recs, pos
 }
 
-// appendArchiveRecord serialises one self-contained record in the legacy
-// 6-field inline-value WAL format that replayWAL parses directly:
-// timestamp|tombstone|key|valueLen|crc32hex|version\n[value\n]
+// appendArchiveRecord serialises one self-contained record in the key-safe
+// binary WAL format (see wal_codec.go) that replayWAL parses directly. Archive
+// records always inline the value (vlogOffset==0) so each segment is
+// self-contained regardless of later VLog GC.
 func appendArchiveRecord(buf []byte, tsNs int64, tombstone bool, key string, value []byte, crc uint32, version uint64) []byte {
-	buf = strconv.AppendInt(buf, tsNs, 10)
-	buf = append(buf, '|')
-	if tombstone {
-		buf = append(buf, '1')
-	} else {
-		buf = append(buf, '0')
-	}
-	buf = append(buf, '|')
-	buf = append(buf, key...)
-	buf = append(buf, '|')
-	buf = strconv.AppendUint(buf, uint64(len(value)), 10)
-	buf = append(buf, '|')
-	buf = strconv.AppendUint(buf, uint64(crc), 16)
-	buf = append(buf, '|')
-	buf = strconv.AppendUint(buf, version, 10)
-	buf = append(buf, '\n')
-	if !tombstone && len(value) > 0 {
-		buf = append(buf, value...)
-		buf = append(buf, '\n')
-	}
-	return buf
+	return encodeWALRecord(buf, tsNs, tombstone, false, key, uint32(len(value)), value, crc, version, 0)
 }
 
 // ── point-in-time restore ─────────────────────────────────────────────────────

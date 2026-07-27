@@ -41,12 +41,12 @@ func computeCRC32C(data []byte) uint32 {
 //
 //	When StorageConfig.DataDirPaths has N entries, the engine creates N
 //	SegmentWriters (one per disk) and N compaction goroutines.  Shards are
-//	spread across disks via shard_id % N so every disk handles 256/N shards.
+//	spread across disks via shard_id % N so every disk handles 8192/N shards.
 //	All disk I/O is therefore parallel — no disk is a bottleneck for another.
 type StorageEngine struct {
 	config   *StorageConfig
 	index    *shardedIndex
-	wals     []*WriteAheadLog  // one per disk; wals[i] lives on dirs[i]
+	wals     []*WriteAheadLog // one per disk; wals[i] lives on dirs[i]
 	cache    Cache
 	segments []*SegmentWriter // one per disk; len == numDisks
 	vlogs    []*VLog          // one per disk; non-nil when KeyValueSeparation=true
@@ -54,6 +54,12 @@ type StorageEngine struct {
 	metrics  *StorageMetrics
 	done     chan struct{}
 	version  atomic.Uint64
+
+	// lwwLocks stripe per-key serialization for replicated last-writer-wins
+	// applies (ApplyLWWPut/ApplyLWWDelete). Holding the stripe across the
+	// read-decide-write makes the conflict resolution atomic against other
+	// replicated applies to the same key. Zero-value usable; no init needed.
+	lwwLocks [lwwLockStripes]sync.Mutex
 
 	// Per-disk compaction queues: compactionQueues[diskIdx] feeds the
 	// compaction goroutine that owns diskIdx.
@@ -126,9 +132,8 @@ func NewStorageEngine(cfg *StorageConfig) (*StorageEngine, error) {
 	if cfg == nil {
 		cfg = DefaultStorageConfig()
 	}
-	if cfg.NumShards == 0 {
-		cfg.NumShards = 256
-	}
+	// cfg.NumShards is deprecated and ignored — the shard count is the fixed
+	// compile-time constant numShards (8192). See StorageConfig.NumShards.
 
 	// Resolve disk paths: DataDirPaths wins; fall back to single DataDirPath.
 	dirs := cfg.DataDirPaths
@@ -365,6 +370,11 @@ func NewStorageEngine(cfg *StorageConfig) (*StorageEngine, error) {
 	}
 	se.initDiskHealth(len(wals))
 	defrag.diskFailed = se.diskIsFailed
+	// Gate tombstone reaping on replica watermarks (tombstone_replicated.go), not
+	// just the grace period. The method value reads se.tombstones at call time
+	// (set below, before the defrag loop runs), so a lagging replica cannot have
+	// a delete reaped before it has acked it.
+	defrag.canReapTombstone = se.CanReapTombstone
 	// Restore the global version counter so new writes start strictly above any
 	// version that appears in the replayed WAL entries.
 	if maxReplayVersion > 0 {
@@ -502,6 +512,15 @@ func NewStorageEngine(cfg *StorageConfig) (*StorageEngine, error) {
 // With KV separation there is no "dirty flush to segment" step; compaction
 // only needs to GC the VLog, not merge key-value records.
 func (se *StorageEngine) Put(key string, value []byte, ttl int32) error {
+	return se.putStamped(key, value, ttl, time.Now().UnixNano())
+}
+
+// putStamped is Put with an explicit origin wall-clock timestamp (nanoseconds).
+// The stamp becomes the entry's LWWStampNs / WriteTimestampUs and the WAL record
+// timestamp, so a replicated write carries the SAME clock to every replica.
+// Local writes call Put, which passes time.Now(); replicated applies pass the
+// coordinating node's origin timestamp (see ApplyLWWPut).
+func (se *StorageEngine) putStamped(key string, value []byte, ttl int32, wallNs int64) error {
 	_, span := tracing.Start(context.Background(), "engine.Put")
 	defer span.End()
 	span.SetAttribute("key.size", len(key))
@@ -538,8 +557,8 @@ func (se *StorageEngine) Put(key string, value []byte, ttl int32) error {
 		oldIdxVal, _ = se.Get(key) // nil when the key is absent
 	}
 
-	start := time.Now()
-	nowUs := start.UnixMicro()
+	start := time.Now() // local clock, for latency metrics only
+	nowUs := wallNs / 1000
 	version := se.version.Add(1)
 	crc := computeCRC32C(value)
 
@@ -550,7 +569,7 @@ func (se *StorageEngine) Put(key string, value []byte, ttl int32) error {
 	}
 
 	walEntry := walEntryPool.Get().(*WALEntry)
-	walEntry.Timestamp = start.UnixNano()
+	walEntry.Timestamp = wallNs
 	walEntry.KeyLen = uint32(len(key))
 	walEntry.Key = key
 	walEntry.ValueLen = uint32(len(value))
@@ -568,6 +587,7 @@ func (se *StorageEngine) Put(key string, value []byte, ttl int32) error {
 		UncompressedSize: uint32(len(value)),
 		KeySize:          uint32(len(key)),
 		WriteTimestampUs: nowUs,
+		LWWStampNs:       wallNs,
 		CRC32C:           crc,
 		SchemaVersion:    CurrentSchemaVersion,
 		ShardID:          shardID,
@@ -836,6 +856,15 @@ func (se *StorageEngine) Get(key string) ([]byte, error) {
 // Defragmenter reaps it after GCGracePeriodSec to give lagging replicas time
 // to receive the delete before the tombstone disappears.
 func (se *StorageEngine) Delete(key string) error {
+	return se.deleteStamped(key, time.Now().UnixNano(), false)
+}
+
+// deleteStamped is Delete with an explicit origin wall-clock timestamp (ns).
+// insertIfAbsent controls the last-writer-wins tombstone behaviour: when true
+// (replicated apply) a tombstone entry is created even for a key not present
+// locally, so a delete that arrives before the put it supersedes still wins on
+// re-ordered delivery; when false (normal Delete) an absent key stays a no-op.
+func (se *StorageEngine) deleteStamped(key string, wallNs int64, insertIfAbsent bool) error {
 	// Secondary-index maintenance: capture the old value before tombstoning
 	// so the obsolete "@idx/..." entries can be diff-removed afterwards.
 	// One atomic load when no indexes are defined.
@@ -845,11 +874,11 @@ func (se *StorageEngine) Delete(key string) error {
 		oldIdxVal, _ = se.Get(key)
 	}
 
-	start := time.Now()
-	nowUs := start.UnixMicro()
+	start := time.Now() // local clock, for latency metrics only
+	nowUs := wallNs / 1000
 
 	walEntry := walEntryPool.Get().(*WALEntry)
-	walEntry.Timestamp = start.UnixNano()
+	walEntry.Timestamp = wallNs
 	walEntry.KeyLen = uint32(len(key))
 	walEntry.Key = key
 	walEntry.IsTombstone = true
@@ -872,7 +901,7 @@ func (se *StorageEngine) Delete(key string) error {
 		}
 	}
 
-	se.index.markTombstone(key, nowUs)
+	se.index.markTombstoneStamped(key, nowUs, wallNs, insertIfAbsent, delShardID)
 	se.cache.Evict(key)
 
 	se.metrics.Deletes.Add(1)
@@ -958,7 +987,7 @@ func (se *StorageEngine) DeleteNS(ns, key string) error {
 }
 
 // DropNamespace deletes every key that belongs to namespace ns.
-// It scans all 1024 shards in parallel (one goroutine per shard group),
+// It scans all 8192 shards in parallel (one goroutine per shard group),
 // collects matching keys, then calls Delete on each.
 // Returns the number of keys deleted.
 func (se *StorageEngine) DropNamespace(ns string) (int, error) {
@@ -1237,9 +1266,10 @@ func (se *StorageEngine) Checkpoint() error {
 	version := se.version.Load()
 	numDisks := len(se.wals)
 	kvSep := se.config.KeyValueSeparation
+	segReader := se.segmentValueReader(kvSep)
 	var firstErr error
 	for _, w := range se.wals {
-		if err := w.checkpoint(se.index, numDisks, kvSep, version); err != nil && firstErr == nil {
+		if err := w.checkpoint(se.index, numDisks, kvSep, version, segReader); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}
@@ -1366,10 +1396,10 @@ func (se *StorageEngine) GetDiskStats() []DiskStat {
 	stats := make([]DiskStat, len(se.segments))
 	for i, sw := range se.segments {
 		stats[i] = DiskStat{
-			DiskIdx:       i,
-			Path:          sw.DiskPath(),
-			SegmentBytes:  sw.DiskSize(),
-			ShardsOnDisk:  numShards / len(se.segments),
+			DiskIdx:      i,
+			Path:         sw.DiskPath(),
+			SegmentBytes: sw.DiskSize(),
+			ShardsOnDisk: numShards / len(se.segments),
 		}
 	}
 	return stats
@@ -1415,16 +1445,18 @@ func (se *StorageEngine) Close() error {
 	close(se.sst.done)
 
 	var firstErr error
-	for _, sw := range se.segments {
-		if err := sw.close(); err != nil && firstErr == nil {
-			firstErr = err
-		}
-	}
 	for _, vl := range se.vlogs {
 		if err := vl.close(); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}
+	// Write the compacted checkpoint WAL BEFORE closing segment files: in
+	// non-KV-sep mode a live key whose value was already flushed to a segment is
+	// no longer in shard.dirtyValues, so the checkpoint reads it back from the
+	// still-open segment (segmentValueReader). Closing segments first would lose
+	// those keys on a clean restart.
+	kvSep := se.config.KeyValueSeparation
+	segReader := se.segmentValueReader(kvSep)
 	for _, w := range se.wals {
 		if err := w.close(); err != nil && firstErr == nil {
 			firstErr = err
@@ -1433,11 +1465,40 @@ func (se *StorageEngine) Close() error {
 		// keys survive a clean restart.  The checkpoint is written to a temp
 		// file and atomically renamed so a crash mid-write leaves the old WAL
 		// intact.  Replay on next startup is O(numKeys) not O(totalWrites).
-		if err := w.checkpoint(se.index, len(se.wals), se.config.KeyValueSeparation, se.version.Load()); err != nil && firstErr == nil {
+		if err := w.checkpoint(se.index, len(se.wals), kvSep, se.version.Load(), segReader); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	for _, sw := range se.segments {
+		if err := sw.close(); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}
 	return firstErr
+}
+
+// segmentValueReader returns a segValueReader that reads a live entry's value
+// back from its segment file. In KV-sep mode values live in the VLog (the
+// checkpoint stores the VLog offset directly), so no segment read is ever
+// needed and this returns nil.
+func (se *StorageEngine) segmentValueReader(kvSep bool) segValueReader {
+	if kvSep {
+		return nil
+	}
+	return func(entry *IndexEntry) ([]byte, bool) {
+		if entry == nil || int(entry.SegmentID) >= len(se.segments) {
+			return nil, false
+		}
+		sw := se.segments[entry.SegmentID]
+		if sw == nil {
+			return nil, false
+		}
+		v, err := sw.ReadValue(int64(entry.DiskOffset), entry.KeySize, entry.ValueSize)
+		if err != nil || computeCRC32C(v) != entry.CRC32C {
+			return nil, false
+		}
+		return v, true
+	}
 }
 
 // ── Background workers ────────────────────────────────────────────────────────

@@ -40,15 +40,32 @@ import (
 )
 
 const (
-	replMagic          uint32 = 0x52454C50 // "RELP"
-	replDialTimeout           = 3 * time.Second
-	replSendTimeout           = 10 * time.Second
-	replMaxBackoff            = 30 * time.Second
-	replMaxSendAttempts       = 3
+	replMagic           uint32 = 0x52454C50 // "RELP"
+	replDialTimeout            = 3 * time.Second
+	replSendTimeout            = 10 * time.Second
+	replMaxBackoff             = 30 * time.Second
+	replMaxSendAttempts        = 3
 
 	replAckOK  byte = 0x00
 	replAckErr byte = 0x01
+
+	// Message kinds (byte after the magic in every request/response frame).
+	kindBatch   byte = 0x00 // req: gob([]*WriteOperation)  resp: [1B ack status]
+	kindDigests byte = 0x01 // req: (empty)                 resp: gob(map[uint16]uint64)
+	kindFetch   byte = 0x02 // req: gob(shardID uint16)      resp: gob([]SyncEntry)
+	kindError   byte = 0xFF // resp only: payload is a UTF-8 error message
 )
+
+// SyncEntry is the wire form of one key's replicable state during anti-entropy.
+// It mirrors storage.SyncEntry; the cmd/server bridge converts between the two
+// (replication must not import storage). It is gob-encoded on the wire.
+type SyncEntry struct {
+	Key        string
+	Value      []byte
+	LWWStampNs int64
+	Tombstone  bool
+	TTLSeconds int32
+}
 
 // ── TLS configuration ─────────────────────────────────────────────────────────
 
@@ -224,20 +241,104 @@ func (c *ReplicationClient) Send(ops []*WriteOperation) error {
 			continue
 		}
 		conn.SetDeadline(time.Now().Add(replSendTimeout))
-		if err := sendBatch(conn, ops); err != nil {
+		payload, encErr := gobEncode(ops)
+		if encErr != nil {
+			return fmt.Errorf("encode batch: %w", encErr) // not retryable
+		}
+		if err := writeFrame(conn, kindBatch, payload); err != nil {
 			lastErr = err
 			c.closeConn()
 			continue
 		}
-		if err := readAck(conn); err != nil {
+		kind, resp, err := readFrame(conn)
+		if err != nil {
 			lastErr = fmt.Errorf("read ack: %w", err)
 			c.closeConn()
 			continue
+		}
+		if kind == kindError {
+			return fmt.Errorf("replica error: %s", string(resp)) // applied-error is not retryable
+		}
+		if kind != kindBatch || len(resp) != 1 || resp[0] != replAckOK {
+			return fmt.Errorf("replica reported apply error")
 		}
 		c.backoff = 100 * time.Millisecond // reset on success
 		return nil
 	}
 	return fmt.Errorf("send to %s failed after %d attempts: %w", c.addr, replMaxSendAttempts, lastErr)
+}
+
+// roundTrip sends one framed request and reads one framed response, serialized
+// with sendMu (one in-flight exchange per connection). Used by the anti-entropy
+// pull RPCs. On a kindError response it returns the remote error message.
+func (c *ReplicationClient) roundTrip(kind byte, payload []byte) (byte, []byte, error) {
+	c.sendMu.Lock()
+	defer c.sendMu.Unlock()
+	var lastErr error
+	for attempt := 0; attempt < replMaxSendAttempts; attempt++ {
+		if attempt > 0 && !c.wait() {
+			return 0, nil, fmt.Errorf("client closed")
+		}
+		conn, err := c.getConn()
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		conn.SetDeadline(time.Now().Add(replSendTimeout))
+		if err := writeFrame(conn, kind, payload); err != nil {
+			lastErr = err
+			c.closeConn()
+			continue
+		}
+		rKind, resp, err := readFrame(conn)
+		if err != nil {
+			lastErr = err
+			c.closeConn()
+			continue
+		}
+		if rKind == kindError {
+			return 0, nil, fmt.Errorf("remote: %s", string(resp))
+		}
+		c.backoff = 100 * time.Millisecond
+		return rKind, resp, nil
+	}
+	return 0, nil, fmt.Errorf("rpc to %s failed after %d attempts: %w", c.addr, replMaxSendAttempts, lastErr)
+}
+
+// FetchDigests requests the replica's per-shard digests (anti-entropy).
+func (c *ReplicationClient) FetchDigests() (map[uint16]uint64, error) {
+	kind, resp, err := c.roundTrip(kindDigests, nil)
+	if err != nil {
+		return nil, err
+	}
+	if kind != kindDigests {
+		return nil, fmt.Errorf("unexpected response kind 0x%02x", kind)
+	}
+	var digests map[uint16]uint64
+	if err := gobDecode(resp, &digests); err != nil {
+		return nil, fmt.Errorf("decode digests: %w", err)
+	}
+	return digests, nil
+}
+
+// FetchShard requests all of the replica's entries for one shard (anti-entropy).
+func (c *ReplicationClient) FetchShard(shardID uint16) ([]SyncEntry, error) {
+	req, err := gobEncode(shardID)
+	if err != nil {
+		return nil, err
+	}
+	kind, resp, err := c.roundTrip(kindFetch, req)
+	if err != nil {
+		return nil, err
+	}
+	if kind != kindFetch {
+		return nil, fmt.Errorf("unexpected response kind 0x%02x", kind)
+	}
+	var entries []SyncEntry
+	if err := gobDecode(resp, &entries); err != nil {
+		return nil, fmt.Errorf("decode shard entries: %w", err)
+	}
+	return entries, nil
 }
 
 // Close shuts down the client.
@@ -299,12 +400,27 @@ func (c *ReplicationClient) wait() bool {
 
 // ── Server ────────────────────────────────────────────────────────────────────
 
-// ReplicationServer accepts incoming batches and applies them via applyFn.
+// ReplicationServer accepts incoming batches and applies them via applyFn, and
+// serves anti-entropy digest/fetch requests via the optional sync handlers.
 type ReplicationServer struct {
 	listener net.Listener
 	applyFn  ApplyFn
+	// digestFn / fetchFn serve anti-entropy pulls. Nil ⇒ the server replies
+	// with kindError to those requests (anti-entropy not enabled on this node).
+	digestFn func() (map[uint16]uint64, error)
+	fetchFn  func(shardID uint16) ([]SyncEntry, error)
 	done     chan struct{}
 	wg       sync.WaitGroup
+}
+
+// SetSyncHandlers wires the anti-entropy digest/fetch handlers. Safe to call
+// before ListenAndServe.
+func (s *ReplicationServer) SetSyncHandlers(
+	digestFn func() (map[uint16]uint64, error),
+	fetchFn func(shardID uint16) ([]SyncEntry, error),
+) {
+	s.digestFn = digestFn
+	s.fetchFn = fetchFn
 }
 
 // NewReplicationServer creates a plaintext-TCP server but does not start it.
@@ -377,12 +493,27 @@ func (s *ReplicationServer) Addr() string {
 func (s *ReplicationServer) serveConn(conn net.Conn) {
 	for {
 		conn.SetDeadline(time.Now().Add(60 * time.Second))
-		ops, err := receiveBatch(conn)
+		kind, payload, err := readFrame(conn)
 		if err != nil {
 			if err != io.EOF {
 				log.Printf("[repl] receive error from %s: %v", conn.RemoteAddr(), err)
 			}
 			return
+		}
+		if err := s.handleRequest(conn, kind, payload); err != nil {
+			return // connection is unusable
+		}
+	}
+}
+
+// handleRequest dispatches one request frame and writes exactly one response
+// frame. Returns an error only when the connection can no longer be used.
+func (s *ReplicationServer) handleRequest(conn net.Conn, kind byte, payload []byte) error {
+	switch kind {
+	case kindBatch:
+		var ops []*WriteOperation
+		if err := gobDecode(payload, &ops); err != nil {
+			return writeFrame(conn, kindError, []byte("decode batch: "+err.Error()))
 		}
 		status := replAckOK
 		for _, op := range ops {
@@ -391,85 +522,109 @@ func (s *ReplicationServer) serveConn(conn net.Conn) {
 				status = replAckErr
 			}
 		}
-		// Application-level ack: written only after the batch was applied.
-		if _, err := conn.Write([]byte{status}); err != nil {
-			log.Printf("[repl] write ack to %s: %v", conn.RemoteAddr(), err)
-			return
-		}
-	}
-}
+		return writeFrame(conn, kindBatch, []byte{status})
 
-// readAck reads the replica's 1-byte application-level ack.
-func readAck(conn net.Conn) error {
-	var b [1]byte
-	if _, err := io.ReadFull(conn, b[:]); err != nil {
-		return err
+	case kindDigests:
+		if s.digestFn == nil {
+			return writeFrame(conn, kindError, []byte("anti-entropy not enabled"))
+		}
+		digests, err := s.digestFn()
+		if err != nil {
+			return writeFrame(conn, kindError, []byte(err.Error()))
+		}
+		out, err := gobEncode(digests)
+		if err != nil {
+			return writeFrame(conn, kindError, []byte("encode digests: "+err.Error()))
+		}
+		return writeFrame(conn, kindDigests, out)
+
+	case kindFetch:
+		if s.fetchFn == nil {
+			return writeFrame(conn, kindError, []byte("anti-entropy not enabled"))
+		}
+		var shardID uint16
+		if err := gobDecode(payload, &shardID); err != nil {
+			return writeFrame(conn, kindError, []byte("decode shard id: "+err.Error()))
+		}
+		entries, err := s.fetchFn(shardID)
+		if err != nil {
+			return writeFrame(conn, kindError, []byte(err.Error()))
+		}
+		out, err := gobEncode(entries)
+		if err != nil {
+			return writeFrame(conn, kindError, []byte("encode entries: "+err.Error()))
+		}
+		return writeFrame(conn, kindFetch, out)
+
+	default:
+		return writeFrame(conn, kindError, []byte(fmt.Sprintf("unknown request kind 0x%02x", kind)))
 	}
-	if b[0] != replAckOK {
-		return fmt.Errorf("replica reported apply error (status 0x%02x)", b[0])
-	}
-	return nil
 }
 
 // ── Wire format ───────────────────────────────────────────────────────────────
+//
+// Every request and response is one frame:
+//   [magic:4][kind:1][payloadLen:4][payload:payloadLen]   (all little-endian)
 
-func sendBatch(conn net.Conn, ops []*WriteOperation) error {
-	// Encode payload.
-	pr, pw := io.Pipe()
-	go func() {
-		err := gob.NewEncoder(pw).Encode(ops)
-		pw.CloseWithError(err)
-	}()
-
-	// Buffer it so we know the length before writing.
-	var buf []byte
-	{
-		b, err := io.ReadAll(pr)
-		if err != nil {
-			return fmt.Errorf("encode: %w", err)
-		}
-		buf = b
+func gobEncode(v any) ([]byte, error) {
+	var buf byteWriter
+	if err := gob.NewEncoder(&buf).Encode(v); err != nil {
+		return nil, err
 	}
+	return buf.buf, nil
+}
 
-	hdr := make([]byte, 8)
+func gobDecode(data []byte, v any) error {
+	return gob.NewDecoder(&byteReader{buf: data}).Decode(v)
+}
+
+func writeFrame(conn net.Conn, kind byte, payload []byte) error {
+	if len(payload) > 64<<20 {
+		return fmt.Errorf("frame payload too large: %d bytes", len(payload))
+	}
+	hdr := make([]byte, 9)
 	binary.LittleEndian.PutUint32(hdr[0:4], replMagic)
-	binary.LittleEndian.PutUint32(hdr[4:8], uint32(len(buf)))
-
+	hdr[4] = kind
+	binary.LittleEndian.PutUint32(hdr[5:9], uint32(len(payload)))
 	if _, err := conn.Write(hdr); err != nil {
 		return fmt.Errorf("write header: %w", err)
 	}
-	if _, err := conn.Write(buf); err != nil {
-		return fmt.Errorf("write payload: %w", err)
+	if len(payload) > 0 {
+		if _, err := conn.Write(payload); err != nil {
+			return fmt.Errorf("write payload: %w", err)
+		}
 	}
 	return nil
 }
 
-func receiveBatch(conn net.Conn) ([]*WriteOperation, error) {
-	hdr := make([]byte, 8)
+func readFrame(conn net.Conn) (byte, []byte, error) {
+	hdr := make([]byte, 9)
 	if _, err := io.ReadFull(conn, hdr); err != nil {
-		return nil, err
+		return 0, nil, err
 	}
-	magic := binary.LittleEndian.Uint32(hdr[0:4])
-	if magic != replMagic {
-		return nil, fmt.Errorf("bad magic 0x%08x", magic)
+	if magic := binary.LittleEndian.Uint32(hdr[0:4]); magic != replMagic {
+		return 0, nil, fmt.Errorf("bad magic 0x%08x", magic)
 	}
-	payloadLen := binary.LittleEndian.Uint32(hdr[4:8])
-	if payloadLen > 64<<20 { // 64 MB sanity cap
-		return nil, fmt.Errorf("payload too large: %d bytes", payloadLen)
+	kind := hdr[4]
+	n := binary.LittleEndian.Uint32(hdr[5:9])
+	if n > 64<<20 {
+		return 0, nil, fmt.Errorf("frame payload too large: %d bytes", n)
 	}
+	buf := make([]byte, n)
+	if n > 0 {
+		if _, err := io.ReadFull(conn, buf); err != nil {
+			return 0, nil, fmt.Errorf("read payload: %w", err)
+		}
+	}
+	return kind, buf, nil
+}
 
-	buf := make([]byte, payloadLen)
-	if _, err := io.ReadFull(conn, buf); err != nil {
-		return nil, fmt.Errorf("read payload: %w", err)
-	}
+// byteWriter is a minimal io.Writer accumulating into a slice (for gobEncode).
+type byteWriter struct{ buf []byte }
 
-	var ops []*WriteOperation
-	if err := gob.NewDecoder(
-		&byteReader{buf: buf},
-	).Decode(&ops); err != nil {
-		return nil, fmt.Errorf("decode: %w", err)
-	}
-	return ops, nil
+func (w *byteWriter) Write(p []byte) (int, error) {
+	w.buf = append(w.buf, p...)
+	return len(p), nil
 }
 
 // byteReader wraps a []byte as an io.Reader for gob.NewDecoder.

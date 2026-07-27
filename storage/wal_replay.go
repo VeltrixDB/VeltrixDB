@@ -56,6 +56,28 @@ func replayWAL(walPath string) ([]walReplayEntry, error) {
 	var entries []walReplayEntry
 
 	for {
+		// Peek the first byte of the next record to pick the format. Binary
+		// records (this build) start with walBinaryMagic; legacy text records
+		// start with an ASCII digit (the timestamp). A mixed file — legacy
+		// records written before an upgrade followed by binary records — is
+		// handled record-by-record because both paths leave the reader exactly
+		// on the next record boundary.
+		marker, err := br.ReadByte()
+		if err != nil {
+			break // EOF or I/O error: entries parsed so far are valid.
+		}
+		if marker == walBinaryMagic {
+			rec, ok := readBinaryWALRecord(br)
+			if !ok {
+				break // torn or corrupt tail — drop it and everything after.
+			}
+			entries = append(entries, rec)
+			continue
+		}
+		if err := br.UnreadByte(); err != nil {
+			break
+		}
+
 		line, err := br.ReadString('\n')
 		if err != nil {
 			// EOF or I/O error: entries parsed so far are valid.
@@ -214,6 +236,7 @@ func applyWALReplay(
 			UncompressedSize: e.valueLen,
 			KeySize:          uint32(len(e.key)),
 			WriteTimestampUs: nowUs,
+			LWWStampNs:       e.timestampNs, // preserve origin LWW clock (ns)
 			CRC32C:           e.crc,
 			SchemaVersion:    CurrentSchemaVersion,
 			ShardID:          shardID,
@@ -280,7 +303,14 @@ func walPathForDir(dir string) string {
 // rename to walPath — so a crash mid-write leaves the old WAL intact.
 //
 // Must be called after the WAL flusher goroutine has stopped (w.close()).
-func writeWALCheckpoint(walPath string, index *shardedIndex, diskIdx, numDisks int, kvSep bool, version uint64) error {
+// segValueReader resolves the value bytes for a live IndexEntry whose value was
+// already flushed to a segment file (so it is no longer in shard.dirtyValues).
+// It returns ok=false when the value cannot be recovered. Used only in
+// non-KV-sep mode; nil is a valid argument (callers that never flush to
+// segments, e.g. KV-sep, pass nil).
+type segValueReader func(entry *IndexEntry) (value []byte, ok bool)
+
+func writeWALCheckpoint(walPath string, index *shardedIndex, diskIdx, numDisks int, kvSep bool, version uint64, segReader segValueReader) error {
 	tmpPath := walPath + ".ckpt"
 	f, err := os.Create(tmpPath)
 	if err != nil {
@@ -300,44 +330,35 @@ func writeWALCheckpoint(walPath string, index *shardedIndex, diskIdx, numDisks i
 				continue // deleted keys are not checkpointed
 			}
 
-			ts := entry.WriteTimestampUs * 1000 // μs → ns (WAL stores nanoseconds)
+			ts := lwwClock(entry) // ns — preserves the origin LWW clock across restart
 			if ts == 0 {
 				ts = now
 			}
 
-			// Serialise in the same 7-field pipe-delimited format as wal.serialize():
-			// timestamp|0|key|valueLen|crcHex|version|vlogOffset\n
+			// Serialise in the same key-safe binary format as wal.serialize()
+			// (see wal_codec.go) so replayWAL parses it identically.
 			buf = buf[:0]
-			buf = strconv.AppendInt(buf, ts, 10)
-			buf = append(buf, '|', '0', '|')
-			buf = append(buf, key...)
-			buf = append(buf, '|')
-			buf = strconv.AppendUint(buf, uint64(entry.ValueSize), 10)
-			buf = append(buf, '|')
-			buf = strconv.AppendUint(buf, uint64(entry.CRC32C), 16)
-			buf = append(buf, '|')
-			buf = strconv.AppendUint(buf, version, 10)
-			buf = append(buf, '|')
+			packed := entry.Flags&FlagPacked != 0
 
 			if kvSep && entry.DiskOffset > 0 {
 				// Value is durable in VLog — header-only record, no value bytes.
-				buf = strconv.AppendInt(buf, int64(entry.DiskOffset), 10)
-				buf = append(buf, '\n')
+				buf = encodeWALRecord(buf, ts, false, packed, key, entry.ValueSize, nil, entry.CRC32C, version, int64(entry.DiskOffset))
 				_, writeErr = bw.Write(buf)
 			} else {
-				// Non-KV-sep (or missing vlogOffset): embed value bytes from the
-				// dirty map.  If the dirty value is gone (already flushed to segment
-				// before Close was called) we have no bytes to write — skip.
+				// Non-KV-sep (or missing vlogOffset): embed value bytes. Prefer the
+				// dirty map; if the value was already flushed to a segment before
+				// Close, read it back so a clean restart never loses the key.
 				dirtyVal := shard.dirtyValues[key]
-				if len(dirtyVal) == 0 {
-					continue
-				}
-				buf = append(buf, '0', '\n') // vlogOffset=0 → value bytes follow
-				if _, writeErr = bw.Write(buf); writeErr == nil {
-					if _, writeErr = bw.Write(dirtyVal); writeErr == nil {
-						writeErr = bw.WriteByte('\n')
+				if len(dirtyVal) == 0 && segReader != nil {
+					if v, ok := segReader(entry); ok {
+						dirtyVal = v
 					}
 				}
+				if len(dirtyVal) == 0 {
+					continue // genuinely no bytes recoverable — skip
+				}
+				buf = encodeWALRecord(buf, ts, false, packed, key, uint32(len(dirtyVal)), dirtyVal, entry.CRC32C, version, 0)
+				_, writeErr = bw.Write(buf)
 			}
 		}
 		shard.mu.RUnlock()

@@ -254,3 +254,46 @@ func TestRaftFSM_NamespaceHashVectorOps(t *testing.T) {
 	}
 	apply(fsmCmd{Op: opIdxDrop, Key: "bycity"})
 }
+
+// TestRaftFSM_SnapshotPreservesTTL verifies that a key written with a TTL keeps
+// its expiry across Snapshot → Restore, and an immortal key stays immortal.
+// Regression test: snapshots previously dropped all TTLs, making restored keys
+// immortal (and expired keys would resurrect forever).
+func TestRaftFSM_SnapshotPreservesTTL(t *testing.T) {
+	src := newRaftFSM(newFSMTestEngine(t))
+	apply := func(c fsmCmd) {
+		t.Helper()
+		if err := src.Apply(mustEncodeCmd(t, c)); err != nil {
+			t.Fatalf("apply %+v: %v", c, err)
+		}
+	}
+
+	apply(fsmCmd{Op: opPut, Key: "immortal", Value: []byte("forever"), TTL: -1})
+	apply(fsmCmd{Op: opPut, Key: "ttl-key", Value: []byte("soon"), TTL: 3600})
+
+	snap, err := src.Snapshot()
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+
+	dst := newRaftFSM(newFSMTestEngine(t))
+	if err := dst.Restore(snap); err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
+
+	// Immortal key: present, TTL == -1.
+	if v, err := dst.engine.Get("immortal"); err != nil || string(v) != "forever" {
+		t.Fatalf("immortal key: got %q err=%v", v, err)
+	}
+	if ttl := dst.engine.GetTTLForKey("immortal"); ttl != -1 {
+		t.Errorf("immortal key TTL after restore = %d, want -1", ttl)
+	}
+
+	// TTL'd key: present with a bounded remaining TTL (not immortal, not expired).
+	if v, err := dst.engine.Get("ttl-key"); err != nil || string(v) != "soon" {
+		t.Fatalf("ttl-key: got %q err=%v", v, err)
+	}
+	if ttl := dst.engine.GetTTLForKey("ttl-key"); ttl <= 0 || ttl > 3600 {
+		t.Errorf("ttl-key TTL after restore = %d, want (0, 3600] — TTL not preserved", ttl)
+	}
+}

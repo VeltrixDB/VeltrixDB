@@ -7,6 +7,66 @@ Types: `Added`, `Changed`, `Fixed`, `Performance`, `Breaking`
 
 ---
 
+## [Unreleased]
+
+Correctness hardening pass — fixes found in a durability/distributed-systems
+audit of the 1.1 line.
+
+### Added
+- **Digest-based anti-entropy** (`storage/antientropy.go`): each node summarises
+  every shard as a 64-bit digest folded over its entries' (key, LWW clock,
+  tombstone). A periodic reconcile pulls a peer's divergent shards and
+  LWW-applies them, so a replica that MISSED writes while partitioned/crashed is
+  backfilled to convergence — closing the gap the retry-only resend left open.
+  Wired over the replication transport (new digest/fetch RPCs + `SyncEntry` wire
+  type) with a periodic loop in replicated mode. Tested in-process, over real
+  TCP, and end-to-end (a cold replica backfills 500 entries + tombstones to
+  digest-equality). New WAL codec fuzz targets (`FuzzWALCodec*`).
+
+### Fixed
+- **Snapshot TTL preservation** (`cmd/server/raft_fsm.go`): raft snapshots now
+  carry each key's remaining TTL, so a follower restored from a snapshot no
+  longer turns TTL'd keys immortal. Legacy snapshots without the field decode as
+  immortal (prior behaviour).
+- **WAL is now binary-safe (data-loss on recovery).** The write-ahead log
+  used a pipe/newline-delimited text record; a key containing `|` or `\n`
+  corrupted replay framing and silently dropped that record **and every
+  record after it**. Records are now length-prefixed binary with a per-record
+  CRC (`storage/wal_codec.go`); keys may contain arbitrary bytes. Legacy text
+  WALs are still read (per-record format auto-detection), so upgrades are
+  seamless. Covers the live WAL, the clean-shutdown checkpoint, and the PITR
+  archive/restore paths.
+- **Replicated-mode silent divergence.** `--mode replicated` applied received
+  writes in arrival order with no conflict resolution, so two replicas that
+  saw concurrent writes to a key in different orders could diverge
+  permanently. Writes now carry an origin wall-clock stamp applied identically
+  on every replica; apply is last-writer-wins on that stamp with deterministic
+  tie-breaks, so replicas converge regardless of arrival order
+  (`storage/lww.go`, `ApplyLWWPut`/`ApplyLWWDelete`). Delete-before-put
+  re-ordering is handled via LWW tombstones. New metric
+  `veltrixdb_lww_conflicts_resolved_total`.
+- **Raft persistence errors no longer swallowed.** `HandleRequestVote`,
+  `HandleAppendEntries`, `HandleInstallSnapshot` and `startElection` now refuse
+  to grant a vote / ack an append / begin an election when the durable state
+  write (`fsync`) fails, instead of acknowledging un-persisted state — closing
+  a safety gap where a crash could lose a granted vote or accepted term.
+- **Tombstone GC now honors replica watermarks.** `reapExpiredTombstones`
+  previously checked only the local grace period; it now also consults
+  per-replica ack watermarks (`CanReapTombstone`), which the replication
+  engine feeds on each successful ack — so a delete is never reaped before a
+  lagging replica has seen it (prevents zombie resurrection).
+- **Non-KV-sep clean-restart durability.** The shutdown checkpoint skipped
+  live keys whose value had already flushed to a segment (value no longer in
+  RAM), losing them on a clean restart. The checkpoint now reads such values
+  back from the still-open segment files.
+
+### Changed
+- `StorageConfig.NumShards` is deprecated and ignored — the shard count is the
+  fixed compile-time constant `numShards` (8192). Stale "256/1024 shards"
+  comments corrected throughout.
+
+---
+
 ## [1.1.0] — 2026-07-18
 
 Distributed-completeness release: everything that previously applied

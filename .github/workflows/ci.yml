@@ -92,6 +92,68 @@ jobs:
             --sha    "${{ github.sha }}" \
             --branch "${{ github.ref_name }}"
 
+  # ── Node 2b: Jepsen-style chaos tests ─────────────────────────────────────
+  # Cycles random network partitions through a 5-node Raft cluster and a
+  # 2-replica LWW setup, asserting the safety invariants (no split-brain, no
+  # acknowledged-write loss, replica convergence to the correct LWW winner).
+  # Pure-Go (CGO_ENABLED=0) like the rest of CI; -race needs cgo + the C++
+  # bridge lib that CI does not build, so race coverage is a local/dev concern.
+  node-2b-chaos:
+    name: "Node 2b — partition chaos (raft + replicated)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: record start time
+        id: t0
+        run: echo "ts=$(date +%s)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.21"
+          cache: true
+
+      # Raft chaos is timing-sensitive (randomized election timeouts); run it
+      # without -race so a slow runner can't squeeze election deadlines. Its
+      # locking/persistence paths are covered under -race by the consensus unit
+      # suite in node-2.
+      - name: raft partition chaos (5 nodes, no split-brain / no loss)
+        run: CGO_ENABLED=0 go test -tags chaos -v -timeout 300s -count=1 -run 'TestChaos_' ./consensus/...
+
+      # The convergence test is heavily concurrent (multi-writer apply). We run
+      # it with CGO_ENABLED=0 like the rest of the storage suite: the whole CI
+      # builds pure-Go, and -race would force CGO_ENABLED=1 which drags in the
+      # C++ io_uring/storage-bridge link (liburing + the bridge .cpp lib) that
+      # CI does not build. The LWW apply path's data-race freedom is verified
+      # under -race in local/dev runs; here we assert the convergence invariant.
+      - name: replicated LWW convergence chaos (2 replicas, reordered delivery)
+        run: CGO_ENABLED=0 go test -tags chaos -v -timeout 300s -count=1 -run 'TestChaos_' ./storage/...
+
+      # Bounded live fuzzing of the binary WAL codec. The deterministic seed
+      # corpus already gates in node-1 (go test runs FuzzXxx seeds); this does
+      # real coverage-guided fuzzing on the Linux runner. Best-effort so a
+      # toolchain hiccup never reds the PR — a real find still shows in the log
+      # and writes a reproducer artifact.
+      - name: WAL codec fuzz (bounded, best-effort)
+        continue-on-error: true
+        run: |
+          CGO_ENABLED=0 go test -run '^$' -fuzz 'FuzzWALCodecRoundTrip$' -fuzztime 40s ./storage/
+          CGO_ENABLED=0 go test -run '^$' -fuzz 'FuzzWALCodecCorruptionSafe$' -fuzztime 40s ./storage/
+
+      - name: push CI metrics
+        if: always()
+        env:
+          PUSH_GW_URL: ${{ secrets.PUSH_GW_URL }}
+        run: |
+          bash scripts/push-ci-metrics.sh \
+            --job    "node-2b-chaos" \
+            --start  "${{ steps.t0.outputs.ts }}" \
+            --status "${{ job.status }}" \
+            --run-id "${{ github.run_id }}" \
+            --sha    "${{ github.sha }}" \
+            --branch "${{ github.ref_name }}"
+
   # ── Node 3: 3-node integration tests ──────────────────────────────────────
   # Spins up 3 real server processes on the runner and runs full integration
   # tests: crash recovery, node failover, leader election, backup/restore.
