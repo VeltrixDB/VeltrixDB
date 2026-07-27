@@ -1,3 +1,9 @@
+//go:build chaos
+
+// Build-tagged so it runs ONLY in the dedicated chaos CI job (go test -tags
+// chaos). Kept out of the default ./consensus/... suite because it is slow
+// (~50s) and its CPU load would perturb timing-sensitive neighbours like
+// TestApplyBatch_CoalescesUnderLoad on shared CI runners.
 package consensus
 
 // chaos_test.go — Jepsen-style partition chaos for the Raft layer.

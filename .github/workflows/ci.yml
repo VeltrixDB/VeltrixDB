@@ -119,7 +119,7 @@ jobs:
       # locking/persistence paths are covered under -race by the consensus unit
       # suite in node-2.
       - name: raft partition chaos (5 nodes, no split-brain / no loss)
-        run: CGO_ENABLED=0 go test -v -timeout 300s -count=1 -run 'TestChaos_' ./consensus/...
+        run: CGO_ENABLED=0 go test -tags chaos -v -timeout 300s -count=1 -run 'TestChaos_' ./consensus/...
 
       # The convergence test is heavily concurrent (multi-writer apply). We run
       # it with CGO_ENABLED=0 like the rest of the storage suite: the whole CI
@@ -128,7 +128,7 @@ jobs:
       # CI does not build. The LWW apply path's data-race freedom is verified
       # under -race in local/dev runs; here we assert the convergence invariant.
       - name: replicated LWW convergence chaos (2 replicas, reordered delivery)
-        run: CGO_ENABLED=0 go test -v -timeout 300s -count=1 -run 'TestChaos_' ./storage/...
+        run: CGO_ENABLED=0 go test -tags chaos -v -timeout 300s -count=1 -run 'TestChaos_' ./storage/...
 
       - name: push CI metrics
         if: always()

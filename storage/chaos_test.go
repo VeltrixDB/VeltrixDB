@@ -1,3 +1,8 @@
+//go:build chaos
+
+// Build-tagged so it runs ONLY in the dedicated chaos CI job (go test -tags
+// chaos), keeping the slow, CPU-heavy chaos run out of the default
+// ./storage/... suite.
 package storage
 
 // chaos_test.go — Jepsen-style convergence chaos for replicated last-writer-wins.
