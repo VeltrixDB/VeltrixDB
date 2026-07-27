@@ -176,6 +176,77 @@ type ReplicationEngine struct {
 	// tombstone GC reaper only drops a delete once every replica that acks has
 	// seen it (prevents zombie resurrection). nil-safe.
 	ackObserver func(replicaID string, appliedTsUs int64)
+
+	// syncDigestFn / syncFetchFn serve anti-entropy pulls FROM peers to this
+	// node's replication server. Wired via SetSyncHandlers before
+	// StartReplicationServer.
+	syncDigestFn func() (map[uint16]uint64, error)
+	syncFetchFn  func(shardID uint16) ([]SyncEntry, error)
+}
+
+// SyncPuller is the pull side of anti-entropy: a transport that can fetch a
+// peer's shard digests and shard entries. *ReplicationClient implements it.
+type SyncPuller interface {
+	FetchDigests() (map[uint16]uint64, error)
+	FetchShard(shardID uint16) ([]SyncEntry, error)
+}
+
+// SetSyncHandlers registers the anti-entropy digest/fetch handlers this node
+// serves to peers. Must be called before StartReplicationServer.
+func (re *ReplicationEngine) SetSyncHandlers(
+	digestFn func() (map[uint16]uint64, error),
+	fetchFn func(shardID uint16) ([]SyncEntry, error),
+) {
+	re.mu.Lock()
+	re.syncDigestFn = digestFn
+	re.syncFetchFn = fetchFn
+	re.mu.Unlock()
+}
+
+// peerPuller returns the SyncPuller for replicaID, or an error if the replica
+// is unknown or its transport does not support anti-entropy pulls.
+func (re *ReplicationEngine) peerPuller(replicaID string) (SyncPuller, error) {
+	re.mu.RLock()
+	c, ok := re.clients[replicaID]
+	re.mu.RUnlock()
+	if !ok || c == nil {
+		return nil, fmt.Errorf("unknown replica %q", replicaID)
+	}
+	p, ok := c.(SyncPuller)
+	if !ok {
+		return nil, fmt.Errorf("replica %q transport does not support anti-entropy", replicaID)
+	}
+	return p, nil
+}
+
+// FetchPeerDigests pulls a peer's per-shard digests over its replication client.
+func (re *ReplicationEngine) FetchPeerDigests(replicaID string) (map[uint16]uint64, error) {
+	p, err := re.peerPuller(replicaID)
+	if err != nil {
+		return nil, err
+	}
+	return p.FetchDigests()
+}
+
+// FetchPeerShard pulls a peer's entries for one shard over its replication client.
+func (re *ReplicationEngine) FetchPeerShard(replicaID string, shardID uint16) ([]SyncEntry, error) {
+	p, err := re.peerPuller(replicaID)
+	if err != nil {
+		return nil, err
+	}
+	return p.FetchShard(shardID)
+}
+
+// ReplicaIDs returns the set of registered replica node IDs (for a reconcile
+// loop to iterate).
+func (re *ReplicationEngine) ReplicaIDs() []string {
+	re.mu.RLock()
+	defer re.mu.RUnlock()
+	ids := make([]string, 0, len(re.clients))
+	for id := range re.clients {
+		ids = append(ids, id)
+	}
+	return ids
 }
 
 // SetAckObserver registers a callback invoked when a replica acks a batch,
@@ -776,6 +847,13 @@ func (re *ReplicationEngine) StartReplicationServer(listenAddr string, applyFn A
 	}
 	if err != nil {
 		return err
+	}
+	// Serve anti-entropy pulls if handlers were registered (SetSyncHandlers).
+	re.mu.RLock()
+	dfn, ffn := re.syncDigestFn, re.syncFetchFn
+	re.mu.RUnlock()
+	if dfn != nil || ffn != nil {
+		srv.SetSyncHandlers(dfn, ffn)
 	}
 	go srv.ListenAndServe()
 	// Stop the server when the engine is closed.

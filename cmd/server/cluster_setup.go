@@ -239,6 +239,28 @@ func buildReplicatedCoordinator(p clusterParams) (*coordinator, func(), *replica
 		}
 		return nil
 	}
+	// Anti-entropy: serve this node's per-shard digests and shard entries so
+	// peers can reconcile writes they missed while partitioned/crashed (the
+	// live push path only retries, it never backfills a replica that fell
+	// behind). Must be set before StartReplicationServer.
+	re.SetSyncHandlers(
+		pCurrentEngine.ShardDigests,
+		func(shardID uint16) ([]replication.SyncEntry, error) {
+			entries, err := pCurrentEngine.FetchShard(shardID)
+			if err != nil {
+				return nil, err
+			}
+			out := make([]replication.SyncEntry, len(entries))
+			for i, e := range entries {
+				out[i] = replication.SyncEntry{
+					Key: e.Key, Value: e.Value, LWWStampNs: e.LWWStampNs,
+					Tombstone: e.Tombstone, TTLSeconds: e.TTLSeconds,
+				}
+			}
+			return out, nil
+		},
+	)
+
 	replListen := p.replAddr
 	if replListen == "" {
 		replListen = deriveAddr(p.clientAddr, offReplication)
@@ -256,6 +278,34 @@ func buildReplicatedCoordinator(p clusterParams) (*coordinator, func(), *replica
 	log.Printf("[repl] mode active  node=%s  server=%s  consistency=%s  replicas=%d",
 		p.nodeID, replListen, consistencyName(p.consistency), len(p.peers))
 
+	// Periodic anti-entropy reconcile loop: pull each peer's divergent shards
+	// and LWW-apply them, converging this node toward the union. Bidirectional
+	// convergence follows because every node runs the same loop.
+	aeInterval := cfg.AntiEntropyInterval
+	if aeInterval <= 0 {
+		aeInterval = 30 * time.Second
+	}
+	aeStop := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(aeInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-aeStop:
+				return
+			case <-ticker.C:
+				for _, id := range re.ReplicaIDs() {
+					n, err := pCurrentEngine.Reconcile(tcpPeerSync{re: re, id: id})
+					if err != nil {
+						log.Printf("[antientropy] reconcile from %s: %v", id, err)
+					} else if n > 0 {
+						log.Printf("[antientropy] reconciled %d entries from %s", n, id)
+					}
+				}
+			}
+		}
+	}()
+
 	c := &coordinator{
 		mode:        modeReplicated,
 		engine:      pCurrentEngine,
@@ -265,8 +315,34 @@ func buildReplicatedCoordinator(p clusterParams) (*coordinator, func(), *replica
 		replFactor:  p.replFactor,
 		replTimeout: int(cfg.ReplicationTimeout.Milliseconds()),
 	}
-	cleanup := func() { _ = re.Close() }
+	cleanup := func() { close(aeStop); _ = re.Close() }
 	return c, cleanup, re.GetMetrics(), nil
+}
+
+// tcpPeerSync adapts a replica (reached over the replication engine's client)
+// to storage.PeerSync, converting replication.SyncEntry ↔ storage.SyncEntry.
+type tcpPeerSync struct {
+	re *replication.ReplicationEngine
+	id string
+}
+
+func (p tcpPeerSync) ShardDigests() (map[uint16]uint64, error) {
+	return p.re.FetchPeerDigests(p.id)
+}
+
+func (p tcpPeerSync) FetchShard(shardID uint16) ([]storage.SyncEntry, error) {
+	wire, err := p.re.FetchPeerShard(p.id, shardID)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]storage.SyncEntry, len(wire))
+	for i, e := range wire {
+		out[i] = storage.SyncEntry{
+			Key: e.Key, Value: e.Value, LWWStampNs: e.LWWStampNs,
+			Tombstone: e.Tombstone, TTLSeconds: e.TTLSeconds,
+		}
+	}
+	return out, nil
 }
 
 // pCurrentEngine is set by main() before buildCoordinator is called.  A package

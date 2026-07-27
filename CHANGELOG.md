@@ -12,7 +12,22 @@ Types: `Added`, `Changed`, `Fixed`, `Performance`, `Breaking`
 Correctness hardening pass — fixes found in a durability/distributed-systems
 audit of the 1.1 line.
 
+### Added
+- **Digest-based anti-entropy** (`storage/antientropy.go`): each node summarises
+  every shard as a 64-bit digest folded over its entries' (key, LWW clock,
+  tombstone). A periodic reconcile pulls a peer's divergent shards and
+  LWW-applies them, so a replica that MISSED writes while partitioned/crashed is
+  backfilled to convergence — closing the gap the retry-only resend left open.
+  Wired over the replication transport (new digest/fetch RPCs + `SyncEntry` wire
+  type) with a periodic loop in replicated mode. Tested in-process, over real
+  TCP, and end-to-end (a cold replica backfills 500 entries + tombstones to
+  digest-equality). New WAL codec fuzz targets (`FuzzWALCodec*`).
+
 ### Fixed
+- **Snapshot TTL preservation** (`cmd/server/raft_fsm.go`): raft snapshots now
+  carry each key's remaining TTL, so a follower restored from a snapshot no
+  longer turns TTL'd keys immortal. Legacy snapshots without the field decode as
+  immortal (prior behaviour).
 - **WAL is now binary-safe (data-loss on recovery).** The write-ahead log
   used a pipe/newline-delimited text record; a key containing `|` or `\n`
   corrupted replay framing and silently dropped that record **and every

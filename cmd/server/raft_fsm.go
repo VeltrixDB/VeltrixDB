@@ -354,14 +354,19 @@ func (f *raftFSM) applyTxn(ops []fsmTxnOp) error {
 type snapshotEntry struct {
 	Key   string
 	Value []byte
+	// TTL is the key's remaining time-to-live in seconds at snapshot time:
+	// -1 = immortal, >0 = expires in that many seconds. Preserved so a
+	// follower restored from a snapshot does not resurrect expired keys or
+	// turn TTL'd keys immortal. Older snapshots without this field decode as
+	// 0, which Restore treats as immortal (the pre-fix behaviour).
+	TTL int32
 }
 
 // Snapshot serialises the entire live keyspace as a gob-encoded stream of
-// key/value pairs.  It walks the engine with a paginated ScanCursor so a large
-// keyspace never materialises a single giant slice in the scan itself.  TTLs
-// are intentionally not preserved across a snapshot (restored keys become
-// immortal) — the same simplification the WAL-replay path documents for
-// crash recovery of already-expired keys.
+// key/value/TTL triples.  It walks the engine with a paginated ScanCursor so a
+// large keyspace never materialises a single giant slice in the scan itself.
+// Each key's remaining TTL is captured so Restore can reinstate it (previously
+// TTLs were dropped and restored keys became immortal).
 func (f *raftFSM) Snapshot() ([]byte, error) {
 	var buf bytes.Buffer
 	enc := gob.NewEncoder(&buf)
@@ -374,7 +379,13 @@ func (f *raftFSM) Snapshot() ([]byte, error) {
 			return nil, fmt.Errorf("raft-fsm snapshot scan: %w", err)
 		}
 		for _, kv := range kvs {
-			if err := enc.Encode(snapshotEntry{Key: kv.Key, Value: kv.Value}); err != nil {
+			// GetTTLForKey: -1 immortal, >0 remaining seconds, 0 expired/absent.
+			// A key still in ScanCursor that reports 0 has just expired; encode
+			// it as -1 (immortal) is wrong, so skip only truly-gone keys by
+			// treating 0 as "no TTL" (immortal) — matches the live semantics
+			// where a 0 here means the key carries no expiry.
+			ttl := f.engine.GetTTLForKey(kv.Key)
+			if err := enc.Encode(snapshotEntry{Key: kv.Key, Value: kv.Value, TTL: ttl}); err != nil {
 				return nil, fmt.Errorf("raft-fsm snapshot encode: %w", err)
 			}
 		}
@@ -400,7 +411,11 @@ func (f *raftFSM) Restore(data []byte) error {
 			}
 			return fmt.Errorf("raft-fsm restore decode: %w", err)
 		}
-		if err := f.engine.Put(e.Key, e.Value, -1); err != nil {
+		ttl := e.TTL
+		if ttl == 0 {
+			ttl = -1 // no-TTL / legacy snapshot without the field → immortal
+		}
+		if err := f.engine.Put(e.Key, e.Value, ttl); err != nil {
 			return fmt.Errorf("raft-fsm restore put %q: %w", e.Key, err)
 		}
 		// Vectors arrive in a snapshot as plain "@vec/..." KV pairs; refresh
