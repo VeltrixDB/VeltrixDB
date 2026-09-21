@@ -129,6 +129,13 @@ if [[ -n "${RAW_VLOGS}" ]]; then
   server_args+=(--raw-vlogs "${RAW_VLOGS}")
   say "raw VLog mode: ${RAW_VLOGS}"
 fi
+# EXTRA_SERVER_FLAGS lets a run A/B a server option without editing this
+# script, e.g. EXTRA_SERVER_FLAGS="--disable-ordered-index" ./scripts/bench.sh
+if [[ -n "${EXTRA_SERVER_FLAGS:-}" ]]; then
+  # shellcheck disable=SC2206 — deliberate word-splitting into separate flags
+  server_args+=(${EXTRA_SERVER_FLAGS})
+  say "extra server flags: ${EXTRA_SERVER_FLAGS}"
+fi
 
 say "starting server: ${SERVER_BIN} ${server_args[*]}"
 "${SERVER_BIN}" "${server_args[@]}" > "${SERVER_LOG}" 2>&1 &

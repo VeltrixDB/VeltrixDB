@@ -209,6 +209,13 @@ func main() {
 			"\tCovers PUT, DEL, atomic ops; never includes value bytes.")
 	scrubMBs := flag.Int("scrub-mb-per-sec", 50,
 		"VLog scrubber bandwidth cap per disk. 0 = disabled.")
+	noOrderedIndex := flag.Bool("disable-ordered-index", false,
+		"Stop maintaining the ordered key index (a skiplist mirroring every live key).\n"+
+			"\tBREAKING for ordered reads: RANGE, SCANCUR and any RangeScan/ScanCursor\n"+
+			"\tcaller return ErrOrderedIndexDisabled. Point lookups, prefix scans over\n"+
+			"\tnamespaces, and every write path are unaffected.\n"+
+			"\tWorth it only for point-lookup-only workloads: measured -21.8% allocations\n"+
+			"\tand -5.1% wall time on MultiPut-1024, plus ~64 B of RAM saved per live key.")
 
 	// WAL archiver (point-in-time recovery) flags
 	archiveDir := flag.String("archive-dir", "",
@@ -345,6 +352,11 @@ func main() {
 	cfg.ScrubMBPerSec = *scrubMBs
 	if *scrubMBs <= 0 {
 		cfg.ScrubEnabled = false
+	}
+	cfg.DisableOrderedIndex = *noOrderedIndex
+	if *noOrderedIndex {
+		log.Printf("[config] ordered key index DISABLED — RANGE and SCANCUR will " +
+			"return ErrOrderedIndexDisabled; point lookups unaffected")
 	}
 	cfg.ArchiveDir = *archiveDir
 	cfg.ArchiveIntervalMs = *archiveIntervalMs

@@ -47,8 +47,15 @@ func init() {
 // allocation behaviour of each path. Those are what these measure.
 
 func benchEngine(b *testing.B, cacheMB uint32) *StorageEngine {
+	return benchEngineCfg(b, cacheMB, false)
+}
+
+// benchEngineCfg builds an engine with the ordered key index optionally
+// disabled, so the cost it adds to the write path can be measured directly.
+func benchEngineCfg(b *testing.B, cacheMB uint32, disableOrdered bool) *StorageEngine {
 	b.Helper()
 	cfg := DefaultStorageConfig()
+	cfg.DisableOrderedIndex = disableOrdered
 	cfg.DataDirPath = b.TempDir()
 	cfg.DataDirPaths = nil
 	cfg.CacheMaxSizeMB = cacheMB
@@ -249,3 +256,50 @@ func BenchmarkMultiPut_1024(b *testing.B) {
 		}
 	}
 }
+
+// ── Ordered-index cost ───────────────────────────────────────────────────────
+//
+// Every Put maintains the RangeScan/ScanCursor skiplist, whether or not the
+// workload ever range-scans. These pairs measure what that costs so the
+// DisableOrderedIndex trade can be made on numbers.
+
+func benchMultiPutOrdered(b *testing.B, disableOrdered bool) {
+	se := benchEngineCfg(b, 256, disableOrdered)
+	val := make([]byte, 128)
+	reqs := make([]MultiPutRequest, 1024)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		for j := range reqs {
+			reqs[j] = MultiPutRequest{Key: fmt.Sprintf("oi:%d:%d", i, j), Value: val, TTL: -1}
+		}
+		for _, err := range se.MultiPut(reqs) {
+			if err != nil {
+				b.Fatal(err)
+			}
+		}
+	}
+}
+
+func BenchmarkMultiPut_OrderedIndexOn(b *testing.B)  { benchMultiPutOrdered(b, false) }
+func BenchmarkMultiPut_OrderedIndexOff(b *testing.B) { benchMultiPutOrdered(b, true) }
+
+func benchPutOrdered(b *testing.B, disableOrdered bool) {
+	se := benchEngineCfg(b, 256, disableOrdered)
+	val := make([]byte, 128)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		rng := rand.New(rand.NewSource(rand.Int63()))
+		for pb.Next() {
+			if err := se.Put(fmt.Sprintf("oi1:%d", rng.Int63()), val, -1); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+}
+
+func BenchmarkPut_OrderedIndexOn(b *testing.B)  { benchPutOrdered(b, false) }
+func BenchmarkPut_OrderedIndexOff(b *testing.B) { benchPutOrdered(b, true) }
