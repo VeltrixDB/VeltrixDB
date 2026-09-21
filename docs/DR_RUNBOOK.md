@@ -125,6 +125,67 @@ Online rotation is not supported. Use the offline sequence:
 
 ---
 
+## 7. Value-transform metadata damage from a pre-fix build (SEV-1)
+
+**Symptom.** Reads return wrong bytes, or fail with `vlog CRC32C mismatch`.
+Affects nodes that ran a build predating the value-transform WAL fix, with
+compression enabled (zstd is the **default**) or `--encrypt-at-rest`, and that
+have restarted since writing.
+
+Two distinct presentations, depending on how the node last shut down:
+
+| Last shutdown | Presentation |
+|---------------|--------------|
+| **Clean** | Reads **succeed** and silently return the raw compressed or encrypted blob. No error, no metric, no alert. A 1040-byte value comes back as ~51 bytes starting `02 28 b5 2f fd` (zstd magic). |
+| **Crash** | Reads **fail** with `vlog CRC32C mismatch`. |
+
+The clean-shutdown case is the dangerous one — nothing surfaces it. If a value
+over 256 bytes ever came back looking like binary garbage, this is why.
+
+**Upgrading does not fix it.** The metadata was never written to the WAL, so a
+new binary reconstructs the same wrong index. The data itself is fine: only
+the metadata describing it was lost, which is why this repairs in place rather
+than needing re-ingestion.
+
+### Step 1 — assess (read-only, safe)
+
+```bash
+# whole fleet, one line per node
+./scripts/repair-scan-fleet.sh --hosts hosts.txt --data-dirs /mnt/nvme0,/mnt/nvme1
+
+# encrypted deployments need the key, or those records report as unresolved
+VELTRIXDB_ENCRYPTION_KEY=... ./scripts/repair-scan-fleet.sh \
+    --hosts hosts.txt --data-dirs /mnt/nvme0 --encrypt
+```
+
+Changes nothing. Exits non-zero if any node needs attention, so it can gate a
+pipeline. It refuses to scan a host whose server is still listening.
+
+### Step 2 — repair, per node, server STOPPED
+
+```bash
+kubectl scale statefulset veltrixdb --replicas=0     # or stop the unit
+veltrix-repair --data-dirs /mnt/nvme0,/mnt/nvme1 --repair
+```
+
+Each `wal.log` is copied to `wal.log.prerepair.<timestamp>` before anything is
+written. The repair is exact, not heuristic: `IndexEntry.CRC32C` is the CRC of
+the **plaintext** and survived the bug, so the tool tries the four possible
+interpretations of each on-disk blob and accepts only the one reproducing that
+CRC. Anything else is reported and left untouched. It is idempotent.
+
+### Step 3 — verify
+
+Restart and read back several values **larger than 256 bytes** (smaller ones
+were never compressed and are unaffected). Re-run the scan; it should report
+all healthy.
+
+### If entries come back UNRESOLVED
+
+No interpretation matched the stored CRC. Either the scan ran without the
+encryption key — re-run with `--encrypt` and the correct key — or those
+records are genuinely corrupt and need §5 restore-from-backup.
+
 ## Contact
 
 - On-call: `@veltrixdb-oncall` in PagerDuty
