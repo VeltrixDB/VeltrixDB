@@ -455,7 +455,7 @@ type StorageConfig struct {
 	// Ordered key index for RangeScan / ScanCursor (ordered_index.go).
 	//
 	// Enabled by default (zero value): every live key is mirrored into a
-	// concurrent keys-only skiplist (~64 B/key) so ordered range scans run
+	// concurrent keys-only skiplist (measured 90.7 B/key — ~85 GB at 1 B keys) so ordered range scans run
 	// in O(log N + limit) instead of an O(N) walk over all shards.  Set
 	// true to reclaim the memory on point-lookup-only deployments;
 	// RangeScan / ScanCursor then return ErrOrderedIndexDisabled.

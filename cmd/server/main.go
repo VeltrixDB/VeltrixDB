@@ -214,8 +214,10 @@ func main() {
 			"\tBREAKING for ordered reads: RANGE, SCANCUR and any RangeScan/ScanCursor\n"+
 			"\tcaller return ErrOrderedIndexDisabled. Point lookups, prefix scans over\n"+
 			"\tnamespaces, and every write path are unaffected.\n"+
-			"\tWorth it only for point-lookup-only workloads: measured -21.8% allocations\n"+
-			"\tand -5.1% wall time on MultiPut-1024, plus ~64 B of RAM saved per live key.")
+			"\tWorth it only for point-lookup-only workloads. Measured: -21.8% allocations\n"+
+			"\tand -5.1% wall time on MultiPut-1024, and 90.7 B of RAM freed per live\n"+
+			"\tkey (~85 GB at 1B keys) — reallocate that to --cache, where it is worth\n"+
+			"\tfar more: a cache hit is ~90 ns against ~80 us for an NVMe miss.")
 
 	// WAL archiver (point-in-time recovery) flags
 	archiveDir := flag.String("archive-dir", "",
