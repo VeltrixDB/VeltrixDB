@@ -453,10 +453,24 @@ type StorageConfig struct {
 	// lock, saving ~500 ns per negative read at 1 M entries/shard.
 	//
 	// BloomFilterShardBits: bits per shard (rounded up to next power of 2).
-	// Default 0 = disabled. 1<<22 (4 M bits = 512 KB/shard, ~512 MB total)
-	// gives ~1% FP rate at 400 K keys/shard.
+	// Default 0 = disabled.
+	//
+	// TOTAL MEMORY = BloomFilterShardBits / 8 * numShards, and numShards is
+	// 8192. This is allocated eagerly at startup, before a single key is
+	// stored, so the number matters:
+	//
+	//     1<<19 (64 KB/shard)  ->  512 MB   <- default
+	//     1<<22 (512 KB/shard) ->   4 GB
+	//
+	// Scale it to your key count, not to a fixed number. Bits per key is what
+	// sets the false-positive rate; at the 512 MB default that is ~34 bits/key
+	// at 100 M keys (negligible FP) but only ~4 bits/key at 1 B keys (~15% FP,
+	// which mostly defeats the point). A 1 B-key deployment should raise this
+	// to 1<<22 and budget the 4 GB deliberately.
 	//
 	// BloomFilterHashes: probe count k. 0 = use 7 (optimal for ~10 bits/key).
+	// If you drop bits/key well below 10, lower k to match or the FP rate gets
+	// worse, not better.
 	BloomFilterShardBits uint64
 	BloomFilterHashes    uint8
 
@@ -598,9 +612,18 @@ func DefaultStorageConfig() *StorageConfig {
 		KeyValueSeparation:    true, // Enable this for better compaction efficiency
 
 		// Per-shard Bloom filter for negative-lookup acceleration.
-		// 4 M bits/shard × 1024 shards = 512 MB. ~1% FP rate at 400 K keys/shard.
-		// Disable on memory-constrained nodes by setting BloomFilterShardBits=0.
-		BloomFilterShardBits: 1 << 22,
+		//
+		// 64 KB/shard × 8192 shards = 512 MB, allocated eagerly at startup.
+		//
+		// This used to be 1<<22, whose comment read "4 M bits/shard × 1024
+		// shards = 512 MB" — sized when numShards was 1024. numShards is 8192,
+		// so it was really allocating 4 GB before storing a single key, on
+		// every engine including the documented dev quickstart and the Docker
+		// image. Restored to the 512 MB that was always intended.
+		//
+		// Raise to 1<<22 for 1 B-key deployments (see the field comment for the
+		// bits-per-key maths); set 0 to disable on memory-constrained nodes.
+		BloomFilterShardBits: 1 << 19,
 		BloomFilterHashes:    7,
 
 		// Background scrubber: 50 MB/s per disk, ~2 hour full pass on 375 GB.

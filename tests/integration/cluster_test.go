@@ -373,6 +373,10 @@ func TestCluster_NodeAddition(t *testing.T) {
 	}
 
 	cfg3 := storage.DefaultStorageConfig()
+	// 4 K bits/shard x 8192 shards = 4 MB. The 512 MB production
+	// default is eagerly allocated per engine and the suite builds
+	// many; tests do not need a production false-positive rate.
+	cfg3.BloomFilterShardBits = 1 << 12
 	cfg3.DataDirPath = dir3
 	cfg3.CacheMaxSizeMB = 16
 	cfg3.WALFlushWindowMs = 1

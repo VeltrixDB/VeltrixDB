@@ -9,6 +9,10 @@ import (
 func newListTestEngine(t *testing.T) *StorageEngine {
 	t.Helper()
 	cfg := DefaultStorageConfig()
+	// 4 K bits/shard x 8192 shards = 4 MB. The 512 MB production
+	// default is eagerly allocated per engine and the suite builds
+	// many; tests do not need a production false-positive rate.
+	cfg.BloomFilterShardBits = 1 << 12
 	cfg.DataDirPath = t.TempDir()
 	cfg.WALFlushWindowMs = 2
 	cfg.VLogFlushWindowMs = 2
@@ -96,6 +100,10 @@ func TestList_RangeNegativeIndices(t *testing.T) {
 
 func TestList_SurvivesRestart(t *testing.T) {
 	cfg := DefaultStorageConfig()
+	// 4 K bits/shard x 8192 shards = 4 MB. The 512 MB production
+	// default is eagerly allocated per engine and the suite builds
+	// many; tests do not need a production false-positive rate.
+	cfg.BloomFilterShardBits = 1 << 12
 	cfg.DataDirPath = t.TempDir()
 	cfg.WALFlushWindowMs = 2
 	cfg.VLogFlushWindowMs = 2

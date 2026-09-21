@@ -20,6 +20,10 @@ import (
 func newTestEngineInDir(t *testing.T, dir string) *storage.StorageEngine {
 	t.Helper()
 	cfg := storage.DefaultStorageConfig()
+	// 4 K bits/shard x 8192 shards = 4 MB. The 512 MB production
+	// default is eagerly allocated per engine and the suite builds
+	// many; tests do not need a production false-positive rate.
+	cfg.BloomFilterShardBits = 1 << 12
 	cfg.DataDirPath = dir
 	cfg.DataDirPaths = nil
 	cfg.CacheMaxSizeMB = 16

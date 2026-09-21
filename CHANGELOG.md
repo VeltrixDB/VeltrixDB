@@ -11,6 +11,25 @@ Types: `Added`, `Changed`, `Fixed`, `Performance`, `Breaking`
 
 ### Fixed
 
+- **The default bloom-filter budget allocated 4 GB per engine, 8× its
+  documented intent.** `BloomFilterShardBits: 1 << 22` carried the comment
+  "4 M bits/shard × 1024 shards = 512 MB" — it was sized when `numShards` was
+  1024. `numShards` is 8192, so it really allocated **4 GB eagerly at
+  startup**, before a single key was stored, on every engine including the
+  documented dev quickstart and the published Docker image. Same
+  1024-vs-8192 staleness as the vestigial `NumShards` field and the
+  `shards-per-disk` log line.
+
+  Restored to `1 << 19` = 512 MB, the figure always intended. Measured
+  per-engine footprint: **4101 MB → 517 MB**. The field comment now gives the
+  bits-per-key maths so 1 B-key deployments raise it back to `1 << 22`
+  deliberately. 13 test sites that inherited the production default now use
+  `1 << 12` (4 MB).
+
+  Side effect: the `-race` suite got ~2.5× faster locally (storage 38s →
+  15.6s) purely from reduced allocation pressure — the same pressure that was
+  timing out CI on a 2-core runner.
+
 - **At-rest encryption and compression were skipped on every batched write
   path.** `MaybeCompress` / `Encrypt` were called only from
   `StorageEngine.Put`; `multiPutKVSep` — which backs `MPUT`, the
