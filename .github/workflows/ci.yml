@@ -205,14 +205,37 @@ jobs:
             --branch "${{ github.ref_name }}"
 
   # ── Node 5: race detector ─────────────────────────────────────────────────
-  # The whole suite under -race. Nothing else in CI runs with it, so concurrency
-  # bugs (shutdown races between a flusher goroutine and close(), unsynchronised
-  # test-harness fields) shipped undetected for a long time. -race slows tests
-  # ~3x, hence the longer timeouts and a job of its own.
+  # -race REQUIRES cgo, and enabling cgo silently switches the storage engine
+  # onto the C++ path: every NewStorageEngine would build an io_uring bridge
+  # with SQPOLL (a busy-polling kernel thread per ring) plus NumCPU() C++
+  # worker threads. A test suite constructs dozens of engines, and on a 2-core
+  # runner that starved the job into a 30-minute timeout (SIGTERM, exit 143).
+  #
+  # So: cgo ON (for -race), C++ engine OFF (via VELTRIXDB_DISABLE_CGO_ENGINE).
+  # This job is here to find data races in the Go logic; node-6-cpp is what
+  # exercises the C++ layer.
+  #
+  # Split into a matrix so each group gets its own timeout budget and they run
+  # in parallel — -race is roughly 5-10x slower on a 2-core runner.
   node-5-race:
-    name: "Node 5 — race detector"
+    name: "Node 5 — race (${{ matrix.group }})"
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - group: storage
+            pkgs: "./storage/..."
+          - group: server
+            pkgs: "./cmd/server/..."
+          - group: cluster
+            pkgs: "./consensus/... ./cluster/... ./replication/..."
+          - group: rest
+            pkgs: "./adminapi/... ./client/... ./security/... ./tracing/..."
+    env:
+      CGO_ENABLED: "1"
+      VELTRIXDB_DISABLE_CGO_ENGINE: "1"
     steps:
       - uses: actions/checkout@v4
 
@@ -225,24 +248,15 @@ jobs:
           go-version: "1.21"
           cache: true
 
-      # -race REQUIRES cgo ("go: -race requires cgo; enable cgo by setting
-      # CGO_ENABLED=1" on linux/amd64), and with cgo on Linux the storage
-      # package compiles its C++ shims, which need liburing. Hence the install
-      # step and CGO_ENABLED=1 throughout this job — unlike every other job,
-      # which is deliberately CGO_ENABLED=0.
-      - name: install liburing (required once cgo is on)
+      # cgo on Linux compiles the storage package's C++ shims, which include
+      # liburing headers even though the engine itself is disabled above.
+      - name: install liburing
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends liburing-dev
 
-      - name: storage + server under -race
-        run: CGO_ENABLED=1 go test -race -timeout 600s -count=1 ./storage/... ./cmd/server/...
-
-      - name: consensus + cluster + replication under -race
-        run: CGO_ENABLED=1 go test -race -timeout 600s -count=1 ./consensus/... ./cluster/... ./replication/...
-
-      - name: remaining packages under -race
-        run: CGO_ENABLED=1 go test -race -timeout 600s -count=1 ./adminapi/... ./client/... ./security/... ./tracing/...
+      - name: "${{ matrix.group }} under -race"
+        run: go test -race -timeout 2400s -count=1 ${{ matrix.pkgs }}
 
       - name: push CI metrics
         if: always()
@@ -250,7 +264,7 @@ jobs:
           PUSH_GW_URL: ${{ secrets.PUSH_GW_URL }}
         run: |
           bash scripts/push-ci-metrics.sh \
-            --job    "node-5-race" \
+            --job    "node-5-race-${{ matrix.group }}" \
             --start  "${{ steps.t0.outputs.ts }}" \
             --status "${{ job.status }}" \
             --run-id "${{ github.run_id }}" \

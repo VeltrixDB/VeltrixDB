@@ -70,6 +70,21 @@ boundary or do not cross it.
 So: measure the Go path first, and only reach for C++ where a benchmark shows
 Go cannot get there.
 
+## Turning it off
+
+`VELTRIXDB_DISABLE_CGO_ENGINE=1` skips constructing the io_uring bridge and
+the C++ batch engine, leaving the pure-Go paths in place. No effect on a
+`CGO_ENABLED=0` build, where both are already stubs.
+
+Both used to be unconditional: with cgo compiled in, every
+`NewStorageEngine` created an io_uring bridge with SQPOLL (a busy-polling
+kernel thread per ring) and `runtime.NumCPU()` C++ worker threads, with no
+opt-out short of rebuilding. Fine for a long-lived server on dedicated
+hardware; harmful anywhere that builds many short-lived engines on a small
+box. CI proved the point — the `-race` job needs cgo, which silently switched
+the engine onto the C++ path, and the SQPOLL rings starved a 2-core runner
+into a 30-minute timeout.
+
 ## Build and CI
 
 - `scripts/build.sh` (Linux, without `--go-only`) builds the CMake target and

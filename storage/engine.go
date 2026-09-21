@@ -364,7 +364,7 @@ func NewStorageEngine(cfg *StorageConfig) (*StorageEngine, error) {
 	// writes through the bridge (1 io_uring_submit per batch) instead of N
 	// separate pwrite syscalls.  nil on macOS dev / CGO_ENABLED=0.
 	var storageBridge *cgoStorageBridge
-	if cfg.KeyValueSeparation && len(vlogs) > 0 {
+	if cfg.KeyValueSeparation && len(vlogs) > 0 && !cgoEngineDisabled() {
 		storageBridge = newCGOStorageBridge(len(vlogs), true /*sqPoll*/)
 		if storageBridge != nil {
 			for _, vl := range vlogs {
@@ -394,7 +394,10 @@ func NewStorageEngine(cfg *StorageConfig) (*StorageEngine, error) {
 	if numCGOThreads > numShards {
 		numCGOThreads = numShards
 	}
-	cgoBatch := newCGOBatchEngine(numCGOThreads)
+	var cgoBatch *cgoBatchEngine
+	if !cgoEngineDisabled() {
+		cgoBatch = newCGOBatchEngine(numCGOThreads)
+	}
 
 	se := &StorageEngine{
 		config:           cfg,
