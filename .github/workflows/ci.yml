@@ -255,8 +255,19 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends liburing-dev
 
+      # -timeout is deliberately WELL BELOW timeout-minutes.
+      #
+      # Previously it was 2400s against a 45-minute job budget, so the runner
+      # SIGTERMed the job (exit 143) before Go's own timeout could fire — which
+      # meant no diagnostics at all, just "exit code 143". Go's timeout, by
+      # contrast, panics and dumps every goroutine's stack, which names the
+      # thing that is stuck.
+      #
+      # These groups take 18-30s locally on 2 cores under -race, so 600s is
+      # ~20x headroom. If a group exceeds it, we want the stack dump, not a
+      # silent kill. -v so the last "=== RUN" identifies the offending test.
       - name: "${{ matrix.group }} under -race"
-        run: go test -race -timeout 2400s -count=1 ${{ matrix.pkgs }}
+        run: go test -race -v -timeout 600s -count=1 ${{ matrix.pkgs }}
 
       - name: push CI metrics
         if: always()
