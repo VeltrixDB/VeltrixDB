@@ -2,6 +2,7 @@ package storage
 
 import (
 	"fmt"
+	"log"
 	"sort"
 	"sync"
 )
@@ -326,4 +327,105 @@ func (si *shardedIndex) repairTransformMetadata(
 	entry.Flags &^= FlagCompressed | FlagEncrypted
 	entry.Flags |= xflags
 	return true
+}
+
+// ── Startup health check ─────────────────────────────────────────────────────
+
+// transformHealthSampleSize bounds the startup check. Large enough to catch a
+// systemically damaged index with near-certainty (damage from the pre-fix bug
+// affects every transformed record, not a scattered few), small enough that
+// the I/O is irrelevant next to WAL replay.
+const transformHealthSampleSize = 512
+
+// CheckTransformMetadataHealth samples live entries and reports how many carry
+// transform metadata that disagrees with their on-disk bytes.
+//
+// This exists because upgrading does NOT repair data damaged by the pre-fix
+// build: the flags were never written to the WAL, so a fixed binary rebuilds
+// the same wrong index and goes on silently returning compressed or encrypted
+// blobs to clients. Nothing in the read path can notice — a blob whose length
+// matches its header passes every CRC check there is.
+//
+// So the engine checks itself at startup and says so, loudly, rather than
+// waiting for someone to notice their values look like binary garbage.
+//
+// Sampled and bounded: reads at most transformHealthSampleSize records. The
+// damage is systemic when present, so a sample is enough to raise the alarm;
+// veltrix-repair --scan is the exhaustive answer.
+func (se *StorageEngine) CheckTransformMetadataHealth() (checked, damaged int) {
+	if !se.config.KeyValueSeparation || len(se.vlogs) == 0 {
+		return 0, 0
+	}
+
+	for i := range se.index.shards {
+		if checked >= transformHealthSampleSize {
+			break
+		}
+		shard := &se.index.shards[i]
+
+		shard.mu.RLock()
+		var keys []string
+		for k, e := range shard.entries {
+			if e.IsTombstone() || e.DiskOffset == 0 || e.Flags&FlagTiered != 0 {
+				continue
+			}
+			keys = append(keys, k)
+			if len(keys) >= 8 { // a few per shard, spread across the keyspace
+				break
+			}
+		}
+		shard.mu.RUnlock()
+
+		for _, key := range keys {
+			if checked >= transformHealthSampleSize {
+				break
+			}
+			entry, _, ok := se.index.get(key)
+			if !ok || entry.IsTombstone() || entry.DiskOffset == 0 {
+				continue
+			}
+			vl := se.vlogs[int(entry.SegmentID)%len(se.vlogs)]
+			blob, storedCRC, err := vl.readRecordAtOffset(int64(entry.DiskOffset))
+			if err != nil || computeCRC32C(blob) != storedCRC {
+				// Unreadable or genuinely corrupt — the scrubber's business,
+				// not this check's. Don't inflate the damage count with it.
+				continue
+			}
+			checked++
+			cand, resolved := resolveBlob(blob, entry.CRC32C)
+			if !resolved {
+				continue // unresolvable; reported by veltrix-repair --scan
+			}
+			if cand.flags != entry.Flags&(FlagCompressed|FlagEncrypted) ||
+				entry.ValueSize != uint32(len(blob)) {
+				damaged++
+			}
+		}
+	}
+	return checked, damaged
+}
+
+// reportTransformHealth runs the startup check and escalates if it finds
+// anything. Called once after WAL replay.
+func (se *StorageEngine) reportTransformHealth() {
+	checked, damaged := se.CheckTransformMetadataHealth()
+	if checked == 0 {
+		return
+	}
+	se.metrics.TransformMetadataDamaged.Store(uint64(damaged))
+	if damaged == 0 {
+		return
+	}
+	log.Printf("[repair] ****** VALUE-TRANSFORM METADATA DAMAGE DETECTED ******")
+	log.Printf("[repair] %d of %d sampled records carry transform metadata that "+
+		"disagrees with their on-disk bytes.", damaged, checked)
+	log.Printf("[repair] This node is very likely returning raw compressed or " +
+		"encrypted blobs to clients for affected keys, WITHOUT any error.")
+	log.Printf("[repair] Cause: written by a build predating the value-transform " +
+		"WAL fix. Upgrading does not repair it — the metadata was never stored.")
+	log.Printf("[repair] Fix: stop this node and run")
+	log.Printf("[repair]     veltrix-repair --data-dirs <dirs> --scan     # assess")
+	log.Printf("[repair]     veltrix-repair --data-dirs <dirs> --repair   # fix")
+	log.Printf("[repair] Metric: veltrixdb_storage_transform_metadata_damaged")
+	log.Printf("[repair] ********************************************************")
 }

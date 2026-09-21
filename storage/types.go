@@ -262,6 +262,13 @@ type StorageMetrics struct {
 	// GC throughput — investigate disk IOPS or lower the workload.
 	VLogGCEmergencyRuns *atomic.Uint64
 
+	// TransformMetadataDamaged is the count of sampled records found at
+	// startup whose compression/encryption metadata disagrees with their
+	// on-disk bytes — i.e. written by a build predating the value-transform
+	// WAL fix. ANY non-zero value means this node is silently returning
+	// compressed or encrypted blobs to clients. See CheckTransformMetadataHealth.
+	TransformMetadataDamaged *atomic.Uint64
+
 	// VLogBlkDiscardErrors counts BLKDISCARD ioctl failures in punchDeadHead.
 	// A non-zero rate means the process lacks CAP_SYS_RAWIO — NVMe TRIM is
 	// silently skipped so the raw VLog head will grow without being reclaimed.
@@ -360,14 +367,15 @@ func newStorageMetrics() *StorageMetrics {
 		VLogGCRuns:  &atomic.Uint64{},
 		VLogGCBytes: &atomic.Uint64{},
 
-		VLogGCSkippedRatio:   &atomic.Uint64{},
-		VLogGCSkippedPaused:  &atomic.Uint64{},
-		VLogGCSkippedEmpty:   &atomic.Uint64{},
-		VLogGCReadErrors:     &atomic.Uint64{},
-		VLogGCCASFails:       &atomic.Uint64{},
-		VLogGCCandidates:     &atomic.Uint64{},
-		VLogGCEmergencyRuns:  &atomic.Uint64{},
-		VLogBlkDiscardErrors: &atomic.Uint64{},
+		VLogGCSkippedRatio:       &atomic.Uint64{},
+		VLogGCSkippedPaused:      &atomic.Uint64{},
+		VLogGCSkippedEmpty:       &atomic.Uint64{},
+		VLogGCReadErrors:         &atomic.Uint64{},
+		VLogGCCASFails:           &atomic.Uint64{},
+		VLogGCCandidates:         &atomic.Uint64{},
+		VLogGCEmergencyRuns:      &atomic.Uint64{},
+		TransformMetadataDamaged: &atomic.Uint64{},
+		VLogBlkDiscardErrors:     &atomic.Uint64{},
 
 		ScrubRecords:    &atomic.Uint64{},
 		ScrubCorruption: &atomic.Uint64{},

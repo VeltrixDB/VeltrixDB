@@ -228,14 +228,28 @@ func (wal *WriteAheadLog) serialize(entry *WALEntry) []byte {
 	} else {
 		buf = append(buf, '0')
 	}
-	buf = append(buf, '|')
+	// Fields 9-10 are emitted ONLY when they carry information, i.e. when a
+	// transform actually applied. An untransformed record has
+	// diskLen == valueLen and xflags == 0, which is exactly what the parser
+	// defaults to for a shorter record, so omitting them is lossless.
+	//
+	// This is deliberate rollback insurance. The 10-field form cannot be read
+	// correctly by a pre-fix binary, so emitting it unconditionally would make
+	// every record written after an upgrade un-rollback-able. Emitting it only
+	// for transformed records shrinks that blast radius to exactly the records
+	// an older binary would mishandle anyway (it is the bug being fixed), and
+	// leaves deployments with compression and encryption off fully
+	// rollback-compatible.
 	diskLen := entry.DiskValueLen
 	if diskLen == 0 {
 		diskLen = entry.ValueLen // no transform applied — on-disk == plaintext
 	}
-	buf = strconv.AppendUint(buf, uint64(diskLen), 10)
-	buf = append(buf, '|')
-	buf = strconv.AppendUint(buf, uint64(entry.XformFlags), 16)
+	if entry.XformFlags != 0 || diskLen != entry.ValueLen {
+		buf = append(buf, '|')
+		buf = strconv.AppendUint(buf, uint64(diskLen), 10)
+		buf = append(buf, '|')
+		buf = strconv.AppendUint(buf, uint64(entry.XformFlags), 16)
+	}
 	buf = append(buf, '\n')
 
 	var result []byte

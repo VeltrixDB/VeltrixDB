@@ -134,10 +134,11 @@ type VeltrixCollector struct {
 	bloomSkipped *prometheus.Desc // counter: negative Gets shortcut by the bloom
 
 	// ── Scrubber ────────────────────────────────────────────────────────────
-	scrubRecords    *prometheus.Desc // counter: VLog records inspected
-	scrubCorruption *prometheus.Desc // counter: CRC32C/magic mismatches
-	scrubBytes      *prometheus.Desc // counter: bytes read by the scrubber
-	scrubReadErrors *prometheus.Desc // counter: pread errors during scrub
+	scrubRecords             *prometheus.Desc // counter: VLog records inspected
+	scrubCorruption          *prometheus.Desc // counter: CRC32C/magic mismatches
+	transformMetadataDamaged *prometheus.Desc // gauge: records with lost compress/encrypt metadata
+	scrubBytes               *prometheus.Desc // counter: bytes read by the scrubber
+	scrubReadErrors          *prometheus.Desc // counter: pread errors during scrub
 
 	// ── Atomic ops ──────────────────────────────────────────────────────────
 	atomicOps *prometheus.Desc // counter: CAS+INCR+DECR+SETNX successful operations
@@ -333,10 +334,11 @@ func NewVeltrixCollector(
 		bloomSkipped: desc("storage", "bloom_filter_skipped_total", "Negative Get operations short-circuited by the per-shard Bloom filter (no shard lock taken, no map lookup).  A high value means the filter is paying for itself; combined with bloom_false_positives_total it gives the practical FP rate."),
 
 		// scrubber
-		scrubRecords:    desc("scrub", "records_total", "VLog records inspected by the background scrubber across all disks."),
-		scrubCorruption: desc("scrub", "corruption_total", "CRC32C or magic-mismatch detections by the background scrubber. ANY non-zero rate indicates silent disk corruption — investigate immediately."),
-		scrubBytes:      desc("scrub", "bytes_total", "VLog bytes read by the background scrubber."),
-		scrubReadErrors: desc("scrub", "read_errors_total", "Transient pread failures during scrubbing."),
+		scrubRecords:             desc("scrub", "records_total", "VLog records inspected by the background scrubber across all disks."),
+		scrubCorruption:          desc("scrub", "corruption_total", "CRC32C or magic-mismatch detections by the background scrubber. ANY non-zero rate indicates silent disk corruption — investigate immediately."),
+		transformMetadataDamaged: desc("storage", "transform_metadata_damaged", "Sampled records whose compression/encryption metadata disagrees with their on-disk bytes (written by a build predating the value-transform WAL fix). ANY non-zero value means this node is silently returning compressed or encrypted blobs to clients — run veltrix-repair. Sampled at startup."),
+		scrubBytes:               desc("scrub", "bytes_total", "VLog bytes read by the background scrubber."),
+		scrubReadErrors:          desc("scrub", "read_errors_total", "Transient pread failures during scrubbing."),
 
 		// atomic ops
 		atomicOps: desc("storage", "atomic_ops_total", "Successful atomic operations (CAS, INCR, DECR, SETNX) committed to durable storage."),
@@ -393,6 +395,7 @@ func (c *VeltrixCollector) Describe(ch chan<- *prometheus.Desc) {
 		c.vlogDiskWriteLatencyEWMA, c.vlogDiskReadLatencyEWMA, c.vlogDiskSlow,
 		c.bloomSkipped,
 		c.scrubRecords, c.scrubCorruption, c.scrubBytes, c.scrubReadErrors,
+		c.transformMetadataDamaged,
 		c.atomicOps,
 	}
 	for _, d := range descs {
@@ -549,6 +552,8 @@ func (c *VeltrixCollector) Collect(ch chan<- prometheus.Metric) {
 	counter(c.bloomSkipped, m.BloomFilterSkipped.Load())
 	counter(c.scrubRecords, m.ScrubRecords.Load())
 	counter(c.scrubCorruption, m.ScrubCorruption.Load())
+	// Gauge, not counter: it is a current-state sample, not an accumulating total.
+	gauge(c.transformMetadataDamaged, float64(m.TransformMetadataDamaged.Load()))
 	counter(c.scrubBytes, m.ScrubBytes.Load())
 	counter(c.scrubReadErrors, m.ScrubReadErrors.Load())
 	counter(c.atomicOps, m.AtomicOps.Load())

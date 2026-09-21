@@ -490,6 +490,11 @@ func NewStorageEngine(cfg *StorageConfig) (*StorageEngine, error) {
 				}
 			}
 
+			// Damage from a pre-fix build is invisible to every read-path
+			// check, so the engine looks for it once and says so rather than
+			// silently serving blobs. Sampled and bounded.
+			se.reportTransformHealth()
+
 			close(replayDone)
 		}()
 	}

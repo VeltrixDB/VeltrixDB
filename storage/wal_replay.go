@@ -403,10 +403,16 @@ func writeWALCheckpoint(walPath string, index *shardedIndex, diskIdx, numDisks i
 				} else {
 					buf = append(buf, '0')
 				}
-				buf = append(buf, '|')
-				buf = strconv.AppendUint(buf, uint64(entry.ValueSize), 10)
-				buf = append(buf, '|')
-				buf = strconv.AppendUint(buf, uint64(entry.Flags&(FlagCompressed|FlagEncrypted)), 16)
+				// Same rollback insurance as wal.serialize: only emit the
+				// transform fields when they carry information, so an
+				// untransformed checkpoint stays readable by a pre-fix binary.
+				xf := entry.Flags & (FlagCompressed | FlagEncrypted)
+				if xf != 0 || entry.ValueSize != plainLen {
+					buf = append(buf, '|')
+					buf = strconv.AppendUint(buf, uint64(entry.ValueSize), 10)
+					buf = append(buf, '|')
+					buf = strconv.AppendUint(buf, uint64(xf), 16)
+				}
 				buf = append(buf, '\n')
 				_, writeErr = bw.Write(buf)
 			} else {

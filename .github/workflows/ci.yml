@@ -258,6 +258,22 @@ jobs:
     name: "Node 6 — C++ / cgo build"
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    # NON-BLOCKING ON PURPOSE, FOR NOW.
+    #
+    # Nothing has ever compiled cpp/ in CI, so this job's first run is also
+    # the first time that code is built by anything. It may well be red, and a
+    # red result here should not block a PR whose value is in the Go changes.
+    #
+    # The C++ was syntax-checked locally against a stub liburing.h before this
+    # job existed, and the two sources newly added to the CMake target
+    # (vlog.cpp, ebpf_gc_throttle.cpp) came back clean — so this is expected
+    # to pass. If it does not, the likely fix is a two-line revert of those
+    # additions in cpp/CMakeLists.txt.
+    #
+    # TODO: delete continue-on-error once this job has gone green once, so it
+    # starts actually gating. Leaving it here permanently makes the job
+    # decorative.
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
 

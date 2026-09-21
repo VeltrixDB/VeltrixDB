@@ -389,3 +389,48 @@ func TestResolveBlob_AllFourInterpretations(t *testing.T) {
 		}
 	})
 }
+
+// The startup detector is the only thing standing between a pre-fix node and
+// silently serving blobs, so it has to fire on damage and stay quiet without.
+func TestCheckTransformMetadataHealth(t *testing.T) {
+	dir := t.TempDir()
+	se := transformTestEngine(t, dir)
+	t.Cleanup(func() { se.Close() })
+
+	keys := make([]string, 0, 40)
+	for i := 0; i < 40; i++ {
+		k := fmt.Sprintf("health-%d", i)
+		if err := se.Put(k, compressibleValue(fmt.Sprintf("h%d", i)), -1); err != nil {
+			t.Fatalf("Put: %v", err)
+		}
+		keys = append(keys, k)
+	}
+
+	checked, damaged := se.CheckTransformMetadataHealth()
+	if checked == 0 {
+		t.Fatal("checked 0 records — the sampler found nothing to look at")
+	}
+	if damaged != 0 {
+		t.Fatalf("reported %d/%d damaged on healthy data — false positive",
+			damaged, checked)
+	}
+
+	// Now inflict the exact damage a pre-fix build left behind.
+	for _, k := range keys {
+		damageCleanShutdown(t, se, k)
+	}
+	checked2, damaged2 := se.CheckTransformMetadataHealth()
+	if damaged2 == 0 {
+		t.Fatalf("reported 0/%d damaged after damaging every record — "+
+			"the detector would let a corrupt node start silently", checked2)
+	}
+	t.Logf("detector: %d/%d flagged after damage", damaged2, checked2)
+
+	// And it must clear once repaired.
+	if _, err := se.RepairTransformMetadata(false); err != nil {
+		t.Fatalf("repair: %v", err)
+	}
+	if _, damaged3 := se.CheckTransformMetadataHealth(); damaged3 != 0 {
+		t.Errorf("still reports %d damaged after repair", damaged3)
+	}
+}
