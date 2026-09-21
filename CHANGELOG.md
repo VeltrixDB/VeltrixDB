@@ -90,6 +90,28 @@ Types: `Added`, `Changed`, `Fixed`, `Performance`, `Breaking`
   performance hot path. Both wrap their body in `#ifdef __linux__`. Note this
   gives them compile coverage only — neither has a Go call site.
 
+### Performance
+
+- **Cache-hit reads are 6.3x faster and the miss path is zero-allocation.**
+  Profile-driven; benchstat count=8, all p=0.000. The LIRS cache had one
+  global mutex (21.7% of total CPU, 98.98% of it `LIRSCache.Get`) and is now
+  sharded up to 256 ways; unsampled tracing spans no longer allocate;
+  `MultiGet` no longer builds an 8192-entry map per call; `shardedIndex.get`
+  no longer forces its snapshot onto the heap; and the not-found path uses
+  sentinel errors instead of `fmt.Errorf`.
+
+  | | baseline | optimized | delta |
+  |---|---|---|---|
+  | `Get_CacheHit` | 711.0 ns | 112.9 ns | **-84.1%** |
+  | `Get_Miss_NotFound` | 397.4 ns | 128.9 ns | **-67.6%** |
+  | `MultiGet_256` | 280.9 us | 53.2 us | **-81.1%** |
+  | `IndexGet` | 19.38 ns | 8.61 ns | **-55.6%** |
+  | geomean | 1.114 us | 285.8 ns | **-74.3%** |
+
+  Measured on darwin/arm64 (18 cores). These are CPU-bound paths so the
+  ranking should carry to Linux, but the absolute numbers will not. The write
+  path is fsync-bound on macOS and was NOT tuned — it needs measuring on NVMe.
+
 ### Added
 
 - **`cmd/veltrix-repair`** — offline repair for value-transform metadata lost

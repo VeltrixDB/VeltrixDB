@@ -236,6 +236,12 @@ curl http://localhost:2112/readyz
 
 ---
 
+36. **The LIRS cache is SHARDED — never reintroduce a single cache-wide mutex.** `LIRSCache.Get` must take its lock exclusively (a read mutates the LIRS state machine via `access()`), so one global mutex serialises every read in the engine and negates the 8192-way index sharding. Profiling measured that lock at 21.7% of total CPU, 98.98% of it in `LIRSCache.Get`; sharding it took a cache hit from 711 ns to 113 ns. `NewShardedLIRSCache` splits the budget across up to 256 `LIRSCache` instances (`maxCacheShards`), each with its own mutex, chosen by the **high** bits of `fnv64a(key)` — the index uses the low 13 bits, so high bits keep the two placements independent. Budgets below 2 MB fall back to a single cache (`cacheShardCountFor`). The cost is that per-shard budgets are not a global budget: skewed keys can evict from a hot shard while a cold one has room. That is the accepted trade.
+
+37. **Hot paths must not pay for disabled tracing.** `tracing.Start` returns a single shared `noopSpan` for unsampled spans — at the server's `RateSampler(0.01)` that is 99% of every Get and Put, and allocating a span there was among the largest allocation sources on the read path. `span.End()` checks `s.noop` **before** taking its mutex, because the shared instance would otherwise become a global contention point. Guard every hot-path `SetAttribute` with `if span.IsRecording()`: the `value any` parameter boxes its argument at the **call site**, so the allocation happens even when the span discards it.
+
+38. **`StorageEngine.Get` returns `ErrKeyNotFound` / `ErrKeyExpired` sentinels, not `fmt.Errorf`.** Formatting the key allocated on every negative lookup, which dominated the bloom-accelerated miss path. Match with `errors.Is`; the miss path is now zero-allocation. Never reintroduce a formatted error here.
+
 ## Performance Hotspots
 
 | Hotspot | File:Line | What matters |
@@ -246,6 +252,7 @@ curl http://localhost:2112/readyz
 | SQE submission | `cpp/src/scheduler.cpp:submit_batch` | Write batch window: 32 ops or 1ms |
 | ART lookup TLB | `cpp/include/art.hpp` | `ArtSlabAllocator` uses 2MB hugepages |
 | NVMe read priority | `cpp/src/scheduler.cpp:fill_sqe` | `sqe->ioprio = RT class` for reads |
+| Cache hit | `storage/cache_sharded.go:shardFor` | One hash + one per-shard mutex. NEVER collapse to a single cache-wide lock — see invariant 36 |
 | Pipeline coalescing | `cmd/server/main.go:tryCoalescePuts` | Opportunistic batching of buffered PUT/GET frames into MultiPut/MultiGet; cap=256; one Flush() per batch |
 | WriteBatcher flush | `storage/batcher.go:flush` | 2 MB **or 4096-entry** threshold + 5 ms timer; batchBufPool pre-sized 4096; channel depth 65536 |
 | CGO batch dispatch | `storage/cgo_bridge_pinner.go:batchPutViaCGO` | `runtime.Pinner` zero-copy; 1024-entry CGO call groups 1024 entries across 8192 shards on thread pool |
@@ -326,7 +333,7 @@ When reading load test output or Prometheus metrics, keep these in mind:
 
 **Read-heavy P99 < 5 ms at 2 M ops/sec on n2-highmem-64.** Achievable with the `--read-heavy` preset + correct hardware setup. Key facts:
 
-- **Cache hit (>95% of reads at the right size)**: ~200 ns LIRS lookup. At 200 ns/op the per-core ceiling is ~5 M ops/sec; 64 cores → ~320 M ops/sec theoretical → 2 M is well within budget.
+- **Cache hit (>95% of reads at the right size)**: ~110 ns sharded-LIRS lookup (measured 112.9 ns on darwin/arm64 18-core; was 711 ns before the cache was sharded). At 200 ns/op the per-core ceiling is ~5 M ops/sec; 64 cores → ~320 M ops/sec theoretical → 2 M is well within budget.
 - **Cache miss (≤5% with 400 GB cache for ~1.5 B small keys)**: 1 NVMe random read via the C++ `UringReader` with SQPOLL — ~80 µs P99 on n2-highmem-64 local SSD. 5% × 80 µs + 95% × 200 ns ≈ 4.2 µs blended P99 — order of magnitude under the 5 ms target.
 - **The hot-path bottleneck at 2 M ops/sec was the EWMA CAS-loop in `Get()`** — every read CAS'd the same `ReadLatencyEWMANs` atomic, so 64 cores ping-ponged a single cache line. Fixed: the CAS now runs only every 64th read (`readEWMASampleEvery=64`). Admission-control lag is ≤ 32 µs at 2 M/s — negligible vs the 10–20 ms admission thresholds.
 - **What still hurts P99**: GC bandwidth competing with reads (mitigated by 3-tier I/O priority + the 60→200 MB/s tiered cap), a single hot key crossing CPU NUMA nodes (mitigated by the NUMA-aware CGO bridge, automatic on Linux CGO builds), or running without hugepages (TLB misses on the index hash map).
