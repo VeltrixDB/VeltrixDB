@@ -127,11 +127,37 @@ jobs:
       - name: build backup binary
         run: CGO_ENABLED=0 go build -o /tmp/veltrixdb-backup ./cmd/backup
 
+      # Output is teed to a file and uploaded on failure. A -v run is long
+      # enough that the interesting "--- FAIL:" line scrolls far above the
+      # tail, which is all anyone reads from a failed job; without the
+      # artifact the actual assertion is effectively unrecoverable.
       - name: integration tests (starts 3 in-process server nodes)
-        run: CGO_ENABLED=0 go test -v -timeout 300s -count=1 ./tests/integration/...
+        run: |
+          set -o pipefail
+          CGO_ENABLED=0 go test -v -timeout 300s -count=1 ./tests/integration/... \
+            2>&1 | tee /tmp/integration-test-output.txt
         env:
           VELTRIX_SERVER_BIN: /tmp/veltrixdb
           VELTRIX_BACKUP_BIN: /tmp/veltrixdb-backup
+
+      # Re-print just the failures at the very end of the log, so the job
+      # summary shows what broke without downloading anything.
+      - name: summarise failures
+        if: failure()
+        run: |
+          echo "───────── FAILED TESTS ─────────"
+          grep -E '^--- FAIL|^\s+--- FAIL|^    .*_test\.go:[0-9]+:' \
+            /tmp/integration-test-output.txt | head -60 || echo "(no --- FAIL lines found)"
+          echo "────────────────────────────────"
+
+      - name: upload full test output
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-test-output
+          path: /tmp/integration-test-output.txt
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: upload server logs on failure
         if: failure()
@@ -267,7 +293,32 @@ jobs:
       # ~20x headroom. If a group exceeds it, we want the stack dump, not a
       # silent kill. -v so the last "=== RUN" identifies the offending test.
       - name: "${{ matrix.group }} under -race"
-        run: go test -race -v -timeout 600s -count=1 ${{ matrix.pkgs }}
+        run: |
+          set -o pipefail
+          go test -race -v -timeout 600s -count=1 ${{ matrix.pkgs }} \
+            2>&1 | tee /tmp/race-${{ matrix.group }}.txt
+
+      # On a hang, Go's timeout panic dumps every goroutine; on a failure, the
+      # assertion is buried mid-log. Surface both at the end of the job.
+      - name: summarise failures
+        if: failure()
+        run: |
+          echo "───────── FAILED TESTS ─────────"
+          grep -E '^--- FAIL|^\s+--- FAIL' /tmp/race-${{ matrix.group }}.txt | head -40 \
+            || echo "(none — likely a timeout/panic, see below)"
+          echo "───────── PANIC / TIMEOUT ──────"
+          grep -A40 -E '^panic:|test timed out' /tmp/race-${{ matrix.group }}.txt | head -80 \
+            || echo "(no panic)"
+          echo "────────────────────────────────"
+
+      - name: upload full test output
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: race-output-${{ matrix.group }}
+          path: /tmp/race-${{ matrix.group }}.txt
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: push CI metrics
         if: always()
