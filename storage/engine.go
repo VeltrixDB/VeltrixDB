@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"hash/crc32"
 	"log"
@@ -186,7 +187,9 @@ func NewStorageEngine(cfg *StorageConfig) (*StorageEngine, error) {
 		return nil, err
 	}
 
-	cache := NewLIRSCache(cfg.CacheMaxSizeMB, lirRatio)
+	// Sharded: a single LIRSCache mutex serialises every read across all 8192
+	// index shards. Profiling put 21.7% of CPU in that one lock.
+	cache := NewShardedLIRSCache(cfg.CacheMaxSizeMB, lirRatio)
 	index := newShardedIndex()
 	if cfg.DisableOrderedIndex {
 		// Drop the ordered key view: the shard-lock hooks become no-ops and
@@ -587,8 +590,12 @@ func (se *StorageEngine) transformForWrite(value []byte) ([]byte, uint8, error) 
 func (se *StorageEngine) Put(key string, value []byte, ttl int32) error {
 	_, span := tracing.Start(context.Background(), "engine.Put")
 	defer span.End()
-	span.SetAttribute("key.size", len(key))
-	span.SetAttribute("value.size", len(value))
+	// Guarded: passing an int as `any` boxes it at the call site, which
+	// allocates even though an unsampled span throws the attribute away.
+	if span.IsRecording() {
+		span.SetAttribute("key.size", len(key))
+		span.SetAttribute("value.size", len(value))
+	}
 
 	se.applyBackPressure()
 
@@ -750,6 +757,19 @@ func (se *StorageEngine) Put(key string, value []byte, ttl int32) error {
 	return nil
 }
 
+// ErrKeyNotFound is returned by Get for a key that is absent, tombstoned, or
+// whose shard bloom reports a definitive miss.
+//
+// A sentinel rather than fmt.Errorf("key not found: %s", key): the formatted
+// version allocated the error and its message on every negative lookup, which
+// on a bloom-accelerated miss path was most of the remaining per-op cost.
+// Callers that need the key already have it. Match with errors.Is.
+var ErrKeyNotFound = errors.New("key not found")
+
+// ErrKeyExpired is returned when a key is found but its TTL has elapsed.
+// Distinct from ErrKeyNotFound so callers can tell expiry from absence.
+var ErrKeyExpired = errors.New("key expired")
+
 // ── Read path ─────────────────────────────────────────────────────────────────
 
 // Get retrieves the value for key.
@@ -762,7 +782,9 @@ func (se *StorageEngine) Put(key string, value []byte, ttl int32) error {
 func (se *StorageEngine) Get(key string) ([]byte, error) {
 	_, span := tracing.Start(context.Background(), "engine.Get")
 	defer span.End()
-	span.SetAttribute("key.size", len(key))
+	if span.IsRecording() {
+		span.SetAttribute("key.size", len(key))
+	}
 
 	start := time.Now()
 	se.metrics.Reads.Add(1)
@@ -825,17 +847,17 @@ func (se *StorageEngine) Get(key string) ([]byte, error) {
 				se.metrics.BloomFilterSkipped.Add(1)
 			}
 		}
-		return nil, fmt.Errorf("key not found: %s", key)
+		return nil, ErrKeyNotFound
 	}
 	if entry.IsTombstone() {
-		return nil, fmt.Errorf("key not found: %s", key)
+		return nil, ErrKeyNotFound
 	}
 
 	nowUs := time.Now().UnixMicro()
 	if entry.IsExpired(nowUs) {
 		se.index.markTombstone(key, nowUs)
 		se.cache.Evict(key)
-		return nil, fmt.Errorf("key expired: %s", key)
+		return nil, ErrKeyExpired
 	}
 
 	// Step 3: Dirty value in RAM (pre-flush).
@@ -898,7 +920,7 @@ func (se *StorageEngine) Get(key string) ([]byte, error) {
 		}
 	}
 
-	return nil, fmt.Errorf("key not found: %s", key)
+	return nil, ErrKeyNotFound
 }
 
 // ── Delete path ───────────────────────────────────────────────────────────────

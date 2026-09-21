@@ -91,19 +91,19 @@ func (si *shardedIndex) shardFor(key string) (*indexShard, uint16) {
 // lookup is O(1) but cache-miss-heavy (~500 ns); the bloom check is ~50 ns
 // pointer-chase-free. For workloads with many negative lookups this is a 10×
 // reduction in the read floor.
-func (si *shardedIndex) get(key string) (*IndexEntry, []byte, bool) {
+func (si *shardedIndex) get(key string) (IndexEntry, []byte, bool) {
 	shard, _ := si.shardFor(key)
 	if b := shard.bloom; b != nil && !b.MayContain(fnv64a(key)) {
-		return nil, nil, false
+		return IndexEntry{}, nil, false
 	}
 	shard.mu.RLock()
 	defer shard.mu.RUnlock()
 
 	entry, ok := shard.entries[key]
 	if !ok {
-		return nil, nil, false
+		return IndexEntry{}, nil, false
 	}
-	// Return a copy taken under the RLock, not the shared pointer. Callers read
+	// Return a copy taken under the RLock, never the shared pointer. Callers read
 	// entry fields (IsTombstone/Flags/DiskOffset/...) after get() returns and the
 	// lock is released; the in-place mutators (markTombstone, markTiered, defrag
 	// relocation) write those same fields under the write lock. Handing back the
@@ -112,9 +112,13 @@ func (si *shardedIndex) get(key string) (*IndexEntry, []byte, bool) {
 	// immutable once stored (replaced wholesale, never mutated), so sharing it is
 	// safe. IndexEntry is 64 bytes and this path is cache-miss-only, so the copy
 	// is negligible next to the NVMe read that follows.
-	snap := *entry
+	//
+	// Returned BY VALUE, not as *IndexEntry. The previous `snap := *entry;
+	// return &snap` forced the snapshot to escape to the heap, making this
+	// the single largest source of allocated objects on the read path (36% in
+	// an alloc profile). A value return leaves the copy in the caller's frame.
 	val := shard.dirtyValues[key]
-	return &snap, val, true
+	return *entry, val, true
 }
 
 // put writes or overwrites the IndexEntry and its dirty value for key.

@@ -2,6 +2,7 @@ package storage
 
 import (
 	"fmt"
+	"runtime"
 	"sync"
 	"time"
 )
@@ -299,40 +300,72 @@ func (se *StorageEngine) multiPutKVSep(reqs []MultiPutRequest, errs []error) []e
 	return errs
 }
 
-// MultiGet executes all reads concurrently, grouped by shard.
+// multiGetParallelThreshold is the batch size below which MultiGet stays on
+// the calling goroutine. Below it, goroutine scheduling costs more than the
+// per-key work it parallelises.
+const multiGetParallelThreshold = 16
+
+// MultiGet reads many keys concurrently.
 //
-// Keys in the same shard are read sequentially under a single RLock, while
-// different shards are read in parallel.  Returns one result per key in the
-// same order as the input slice.
+// Work is split into GOMAXPROCS contiguous chunks rather than grouped by index
+// shard. The previous implementation built a map[uint16][]int preallocated for
+// `numShards` (8192) entries on every call and launched one goroutine per
+// distinct shard. Both were costly and neither bought anything:
+//
+//   - The 8192-entry map dominated the allocation profile: a 256-key batch
+//     spent ~573 KB and ~1046 allocations to produce 256 results.
+//   - Up to one goroutine per key was spawned, each performing a single Get.
+//   - The grouping was meant to amortise a shard lock across same-shard keys,
+//     but the body calls se.Get(), which takes and releases the shard lock
+//     itself per key. Same-shard keys shared nothing, so grouping was pure
+//     overhead.
+//
+// Chunking gives the same parallelism with a bounded, CPU-proportional
+// goroutine count and no intermediate map. Result ordering is unchanged: each
+// worker writes only its own disjoint index range, so no synchronisation is
+// needed on `results`.
 func (se *StorageEngine) MultiGet(keys []string) []MultiGetResult {
 	results := make([]MultiGetResult, len(keys))
 	if len(keys) == 0 {
 		return results
 	}
 
-	groups := make(map[uint16][]int, numShards)
-	for i, key := range keys {
-		sid := uint16(fnv64a(key) & (numShards - 1))
-		groups[sid] = append(groups[sid], i)
+	read := func(i int) {
+		val, err := se.Get(keys[i])
+		results[i] = MultiGetResult{
+			Key:   keys[i],
+			Value: val,
+			Found: err == nil && val != nil,
+			Err:   err,
+		}
 	}
 
+	workers := runtime.GOMAXPROCS(0)
+	if workers > len(keys) {
+		workers = len(keys)
+	}
+	// Small batches are not worth the scheduling round-trip.
+	if workers <= 1 || len(keys) < multiGetParallelThreshold {
+		for i := range keys {
+			read(i)
+		}
+		return results
+	}
+
+	chunk := (len(keys) + workers - 1) / workers
 	var wg sync.WaitGroup
-	wg.Add(len(groups))
-	for sid, idxs := range groups {
-		sid, idxs := sid, idxs
-		go func() {
+	for start := 0; start < len(keys); start += chunk {
+		end := start + chunk
+		if end > len(keys) {
+			end = len(keys)
+		}
+		wg.Add(1)
+		go func(lo, hi int) {
 			defer wg.Done()
-			_ = sid
-			for _, i := range idxs {
-				val, err := se.Get(keys[i])
-				results[i] = MultiGetResult{
-					Key:   keys[i],
-					Value: val,
-					Found: err == nil && val != nil,
-					Err:   err,
-				}
+			for i := lo; i < hi; i++ {
+				read(i)
 			}
-		}()
+		}(start, end)
 	}
 	wg.Wait()
 	return results
