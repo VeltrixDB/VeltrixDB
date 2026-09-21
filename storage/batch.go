@@ -207,21 +207,26 @@ func (se *StorageEngine) multiPutKVSep(reqs []MultiPutRequest, errs []error) []e
 					diskLen: uint32(len(writeBytes)),
 					xflags:  xflags,
 				})
-				walEntries = append(walEntries, &WALEntry{
-					Timestamp: nowNs,
-					Key:       r.Key,
-					KeyLen:    uint32(len(r.Key)),
-					// ValueLen is the plaintext length; DiskValueLen is what
-					// actually landed in the VLog. Replay needs both.
-					ValueLen:     uint32(len(r.Value)),
-					Value:        nil, // value lives in VLog after Flush
-					Checksum:     prep[j].crc,
-					Version:      se.version.Add(1),
-					VLogOffset:   offset,
-					Packed:       isPacked,
-					DiskValueLen: uint32(len(writeBytes)),
-					XformFlags:   xflags,
-				})
+				// Pooled, as the single-key Put path already does: these
+				// die once appendAll has serialized them, and allocating one
+				// per key cost 1024 allocations per 1024-entry batch.
+				we := walEntryPool.Get().(*WALEntry)
+				we.Timestamp = nowNs
+				we.Key = r.Key
+				we.KeyLen = uint32(len(r.Key))
+				// ValueLen is the plaintext length; DiskValueLen is what
+				// actually landed in the VLog. Replay needs both.
+				we.ValueLen = uint32(len(r.Value))
+				we.Value = nil // value lives in VLog after Flush
+				we.Checksum = prep[j].crc
+				we.ReplicationID = 0
+				we.IsTombstone = false
+				we.Version = se.version.Add(1)
+				we.VLogOffset = offset
+				we.Packed = isPacked
+				we.DiskValueLen = uint32(len(writeBytes))
+				we.XformFlags = xflags
+				walEntries = append(walEntries, we)
 				walEntryIdx = append(walEntryIdx, i)
 			}
 
@@ -243,6 +248,13 @@ func (se *StorageEngine) multiPutKVSep(reqs []MultiPutRequest, errs []error) []e
 					vlogFlushErr = batcher.Flush()
 				}()
 				phase2Wg.Wait()
+
+				// appendAll has serialized every entry, so the envelopes can
+				// go back. Done here rather than after phase 4 because
+				// nothing below reads them.
+				for _, we := range walEntries {
+					walEntryPool.Put(we)
+				}
 			}
 
 			// Phase 3: apply errors. VLog Flush failure poisons every staged

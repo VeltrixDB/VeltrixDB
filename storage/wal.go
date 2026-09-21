@@ -74,6 +74,12 @@ type walItem struct {
 	resp chan error
 }
 
+// walItemPool reuses the per-entry envelope. One walItem was allocated for
+// every entry in every batch; at 1024-entry MultiPut that is 1024 allocations
+// per call for objects that die as soon as the flusher answers their waiter.
+// The flusher returns them after the response send, which is the last read.
+var walItemPool = &sync.Pool{New: func() any { return &walItem{} }}
+
 // newWriteAheadLog opens (or creates) the WAL file in walDir and starts the
 // flusher goroutine. flushWindow controls the group-commit window duration;
 // 0 means flush immediately after draining available channel entries.
@@ -134,7 +140,10 @@ func (wal *WriteAheadLog) append(entry *WALEntry) error {
 func (wal *WriteAheadLog) beginAppend(entry *WALEntry) *chan error {
 	data := wal.serialize(entry)
 	rp := walRespPool.Get().(*chan error)
-	wal.appendCh <- &walItem{data: data, resp: *rp}
+	item := walItemPool.Get().(*walItem)
+	item.data = data
+	item.resp = *rp
+	wal.appendCh <- item
 	return rp
 }
 
@@ -156,7 +165,10 @@ func (wal *WriteAheadLog) appendAll(entries []*WALEntry) []error {
 	for i, e := range entries {
 		rp := walRespPool.Get().(*chan error)
 		ps[i] = pending{respPtr: rp}
-		wal.appendCh <- &walItem{data: wal.serialize(e), resp: *rp}
+		item := walItemPool.Get().(*walItem)
+		item.data = wal.serialize(e)
+		item.resp = *rp
+		wal.appendCh <- item
 	}
 	errs := make([]error, len(entries))
 	for i, p := range ps {
@@ -294,6 +306,11 @@ func (wal *WriteAheadLog) flusher() {
 		}
 		for _, item := range pending {
 			item.resp <- writeErr
+			// Last read of item — the waiter only takes the value from the
+			// channel, never the envelope. Safe to recycle.
+			item.data = nil
+			item.resp = nil
+			walItemPool.Put(item)
 		}
 		pending = pending[:0]
 	}
