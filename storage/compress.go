@@ -244,3 +244,42 @@ func Decompress(blob []byte, expectedSize uint32) ([]byte, error) {
 		return nil, fmt.Errorf("decompress: unknown algorithm 0x%02x", algo)
 	}
 }
+
+// DecompressUnknownSize decompresses a blob whose original plaintext length is
+// not known ahead of time, dispatching on the algorithm-prefix byte.
+//
+// Decompress() requires the caller to pass the expected output size and treats
+// a mismatch as an error — correct on the read path, where IndexEntry carries
+// UncompressedSize. The repair tool (repair.go) is reconstructing exactly that
+// field, so it has no size to check against and needs this variant.
+//
+// Returns ok=false rather than an error for any input that is not a
+// well-formed compressed blob: callers use it as a probe, and "this wasn't
+// compressed after all" is an expected outcome, not a failure.
+func DecompressUnknownSize(blob []byte) ([]byte, bool) {
+	if len(blob) < 2 {
+		return nil, false
+	}
+	switch blob[0] {
+	case compAlgoFlate:
+		r := flate.NewReader(bytes.NewReader(blob[1:]))
+		defer r.Close()
+		var buf bytes.Buffer
+		if _, err := io.Copy(&buf, r); err != nil {
+			return nil, false
+		}
+		return buf.Bytes(), true
+	case compAlgoZstd:
+		dec, err := sharedZstdDecoder()
+		if err != nil {
+			return nil, false
+		}
+		out, err := dec.DecodeAll(blob[1:], nil)
+		if err != nil {
+			return nil, false
+		}
+		return out, true
+	default:
+		return nil, false
+	}
+}
