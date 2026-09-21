@@ -2,6 +2,7 @@ package storage
 
 import (
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -420,7 +421,15 @@ func (wal *WriteAheadLog) GetStats() (bytesWritten, entriesWritten uint64) {
 
 func (wal *WriteAheadLog) close() error {
 	close(wal.doneCh)
-	<-wal.flusherDone // final batch must land before the fd goes away
+	// Bounded for the same reason as VLog.close — see closeFlusherGrace.
+	// Unbounded, a flusher stuck writing to a full response channel would
+	// deadlock shutdown permanently.
+	select {
+	case <-wal.flusherDone: // final batch written and fdatasync'd
+	case <-time.After(closeFlusherGrace):
+		log.Printf("[wal] disk=%d flusher did not exit within %v — closing fd anyway; "+
+			"the final batch may be lost", wal.diskIdx, closeFlusherGrace)
+	}
 	return wal.file.Close()
 }
 

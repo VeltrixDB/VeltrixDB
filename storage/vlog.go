@@ -36,6 +36,7 @@ package storage
 import (
 	"encoding/binary"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"sync"
@@ -618,9 +619,25 @@ func (vl *VLog) SetEndAtLeast(minEnd int64) {
 // DiskPath returns the directory path for this disk's VLog.
 func (vl *VLog) DiskPath() string { return vl.diskPath }
 
+// closeFlusherGrace bounds how long close() waits for a flusher goroutine to
+// finish its last batch.
+//
+// Waiting is correct — the flusher's shutdown path runs one final fdatasync
+// on vl.file, so closing the fd first is a race. Waiting UNBOUNDED is not: a
+// flusher blocked sending on a full response channel would never return, and
+// close() would hang forever, taking the whole process with it. A bounded
+// wait gets the ordering guarantee in every normal case and degrades to a
+// logged warning instead of a deadlock in the pathological one.
+const closeFlusherGrace = 30 * time.Second
+
 func (vl *VLog) close() error {
 	close(vl.doneCh)
-	<-vl.flusherDone // final flush must finish before the fd goes away
+	select {
+	case <-vl.flusherDone: // final flush completed — safe to drop the fd
+	case <-time.After(closeFlusherGrace):
+		log.Printf("[vlog] disk=%d flusher did not exit within %v — closing fd anyway; "+
+			"a pending fdatasync may be lost", vl.diskIdx, closeFlusherGrace)
+	}
 	vl.mu.Lock()
 	defer vl.mu.Unlock()
 	return vl.file.Close()
