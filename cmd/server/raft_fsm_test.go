@@ -13,6 +13,8 @@ import (
 func newFSMTestEngine(t *testing.T) *storage.StorageEngine {
 	t.Helper()
 	cfg := storage.DefaultStorageConfig()
+	// Background scrubber does real disk I/O per VLog; tests do not need it.
+	cfg.ScrubEnabled = false
 	// 4 K bits/shard x 8192 shards = 4 MB. The 512 MB production
 	// default is eagerly allocated per engine and the suite builds
 	// many; tests do not need a production false-positive rate.

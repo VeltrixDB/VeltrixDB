@@ -44,8 +44,28 @@ jobs:
       - name: vet
         run: CGO_ENABLED=0 go vet ./...
 
+      # Put test scratch on tmpfs.
+      #
+      # THIS is why the storage suite took 45+ minutes on a runner and 18
+      # seconds on a developer laptop, and no timeout tuning was ever going to
+      # close that gap. Every Put fdatasyncs twice (WAL and VLog). On macOS
+      # syscall.Fsync is plain fsync(2), which on Darwin returns as soon as the
+      # write reaches the drive cache — effectively free. On Linux,
+      # syscall.Fdatasync against a runner's network-backed disk is a real
+      # round trip, and the suite performs thousands of them across tests that
+      # run in parallel and contend for the same device.
+      #
+      # t.TempDir() honours TMPDIR, so pointing it at tmpfs makes those syncs
+      # memory-speed. Durability semantics are unchanged — the code still
+      # calls fdatasync, it just lands on a RAM-backed filesystem.
+      - name: mount tmpfs for test scratch
+        run: |
+          sudo mkdir -p /mnt/veltrix-tmp
+          sudo mount -t tmpfs -o size=6G,mode=1777 tmpfs /mnt/veltrix-tmp
+          df -h /mnt/veltrix-tmp
+
       - name: storage + adminapi tests
-        run: CGO_ENABLED=0 go test -timeout 120s -count=1 ./storage/... ./adminapi/...
+        run: CGO_ENABLED=0 TMPDIR=/mnt/veltrix-tmp go test -timeout 300s -count=1 ./storage/... ./adminapi/...
 
       - name: client + security + tracing tests
         run: CGO_ENABLED=0 go test -timeout 60s -count=1 ./client/... ./security/... ./tracing/...
@@ -121,6 +141,26 @@ jobs:
           go-version: "1.21"
           cache: true
 
+      # Put test scratch on tmpfs.
+      #
+      # THIS is why the storage suite took 45+ minutes on a runner and 18
+      # seconds on a developer laptop, and no timeout tuning was ever going to
+      # close that gap. Every Put fdatasyncs twice (WAL and VLog). On macOS
+      # syscall.Fsync is plain fsync(2), which on Darwin returns as soon as the
+      # write reaches the drive cache — effectively free. On Linux,
+      # syscall.Fdatasync against a runner's network-backed disk is a real
+      # round trip, and the suite performs thousands of them across tests that
+      # run in parallel and contend for the same device.
+      #
+      # t.TempDir() honours TMPDIR, so pointing it at tmpfs makes those syncs
+      # memory-speed. Durability semantics are unchanged — the code still
+      # calls fdatasync, it just lands on a RAM-backed filesystem.
+      - name: mount tmpfs for test scratch
+        run: |
+          sudo mkdir -p /mnt/veltrix-tmp
+          sudo mount -t tmpfs -o size=6G,mode=1777 tmpfs /mnt/veltrix-tmp
+          df -h /mnt/veltrix-tmp
+
       - name: build server binary
         run: CGO_ENABLED=0 go build -o /tmp/veltrixdb ./cmd/server
 
@@ -139,6 +179,7 @@ jobs:
         env:
           VELTRIX_SERVER_BIN: /tmp/veltrixdb
           VELTRIX_BACKUP_BIN: /tmp/veltrixdb-backup
+          TMPDIR: /mnt/veltrix-tmp
 
       # Re-print just the failures at the very end of the log, so the job
       # summary shows what broke without downloading anything.
@@ -262,6 +303,7 @@ jobs:
     env:
       CGO_ENABLED: "1"
       VELTRIXDB_DISABLE_CGO_ENGINE: "1"
+      TMPDIR: /mnt/veltrix-tmp
     steps:
       - uses: actions/checkout@v4
 
@@ -273,6 +315,26 @@ jobs:
         with:
           go-version: "1.21"
           cache: true
+
+      # Put test scratch on tmpfs.
+      #
+      # THIS is why the storage suite took 45+ minutes on a runner and 18
+      # seconds on a developer laptop, and no timeout tuning was ever going to
+      # close that gap. Every Put fdatasyncs twice (WAL and VLog). On macOS
+      # syscall.Fsync is plain fsync(2), which on Darwin returns as soon as the
+      # write reaches the drive cache — effectively free. On Linux,
+      # syscall.Fdatasync against a runner's network-backed disk is a real
+      # round trip, and the suite performs thousands of them across tests that
+      # run in parallel and contend for the same device.
+      #
+      # t.TempDir() honours TMPDIR, so pointing it at tmpfs makes those syncs
+      # memory-speed. Durability semantics are unchanged — the code still
+      # calls fdatasync, it just lands on a RAM-backed filesystem.
+      - name: mount tmpfs for test scratch
+        run: |
+          sudo mkdir -p /mnt/veltrix-tmp
+          sudo mount -t tmpfs -o size=6G,mode=1777 tmpfs /mnt/veltrix-tmp
+          df -h /mnt/veltrix-tmp
 
       # cgo on Linux compiles the storage package's C++ shims, which include
       # liburing headers even though the engine itself is disabled above.
