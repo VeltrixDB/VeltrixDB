@@ -225,14 +225,24 @@ jobs:
           go-version: "1.21"
           cache: true
 
+      # -race REQUIRES cgo ("go: -race requires cgo; enable cgo by setting
+      # CGO_ENABLED=1" on linux/amd64), and with cgo on Linux the storage
+      # package compiles its C++ shims, which need liburing. Hence the install
+      # step and CGO_ENABLED=1 throughout this job — unlike every other job,
+      # which is deliberately CGO_ENABLED=0.
+      - name: install liburing (required once cgo is on)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends liburing-dev
+
       - name: storage + server under -race
-        run: CGO_ENABLED=0 go test -race -timeout 600s -count=1 ./storage/... ./cmd/server/...
+        run: CGO_ENABLED=1 go test -race -timeout 600s -count=1 ./storage/... ./cmd/server/...
 
       - name: consensus + cluster + replication under -race
-        run: CGO_ENABLED=0 go test -race -timeout 600s -count=1 ./consensus/... ./cluster/... ./replication/...
+        run: CGO_ENABLED=1 go test -race -timeout 600s -count=1 ./consensus/... ./cluster/... ./replication/...
 
       - name: remaining packages under -race
-        run: CGO_ENABLED=0 go test -race -timeout 600s -count=1 ./adminapi/... ./client/... ./security/... ./tracing/...
+        run: CGO_ENABLED=1 go test -race -timeout 600s -count=1 ./adminapi/... ./client/... ./security/... ./tracing/...
 
       - name: push CI metrics
         if: always()

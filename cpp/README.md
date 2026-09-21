@@ -18,9 +18,16 @@ C++ layer, as far as any running binary is concerned.
 | `src/numa_topology.cpp` | `NumaTopology`, `pin_thread_to_node` | cgo shim `storage/cgo_numa_linux.cpp` |
 | `src/storage_bridge.cpp` | `veltrix_bridge_*` (`include/storage_bridge_capi.h`) | `storage/cgo_bridge_storage_bridge_linux.go` |
 
-The first three are compiled **into the Go package** by the cgo shims in
+**All four** are compiled **into the Go package** by the cgo shims in
 `storage/cgo_*_linux.cpp`. They must NOT also be listed in `CMakeLists.txt` —
-that would define their symbols twice at link time.
+that would define their symbols twice when `scripts/build.sh` links the
+archive alongside the cgo objects.
+
+`storage_bridge.cpp` was the exception until CI caught it: it was in
+`CMakeLists.txt` with no shim, so its `veltrix_bridge_*` symbols existed only
+in the static archive. Anything that did not link that archive — including a
+plain `CGO_ENABLED=1 go build ./storage/...`, and `go test -race`, which
+requires cgo — failed with `undefined reference to 'veltrix_bridge_create'`.
 
 ## Not reachable from Go (~5,400 lines)
 
