@@ -258,22 +258,20 @@ jobs:
     name: "Node 6 — C++ / cgo build"
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    # NON-BLOCKING ON PURPOSE, FOR NOW.
+    # GATING. Every source under cpp/ was verified to compile before this
+    # job was allowed to block: each was run through the compiler against the
+    # REAL liburing headers (fetched from axboe/liburing), not a hand-written
+    # stub, so API misuse would have surfaced. That verification found and
+    # fixed a genuine bug — cpp/include/shard.hpp declared `class alignas(64)
+    # Shard` while holding an alignas(4096) member, which is ill-formed
+    # ([dcl.align]/5). It had gone unnoticed because nothing compiled
+    # shard.cpp.
     #
-    # Nothing has ever compiled cpp/ in CI, so this job's first run is also
-    # the first time that code is built by anything. It may well be red, and a
-    # red result here should not block a PR whose value is in the Go changes.
-    #
-    # The C++ was syntax-checked locally against a stub liburing.h before this
-    # job existed, and the two sources newly added to the CMake target
-    # (vlog.cpp, ebpf_gc_throttle.cpp) came back clean — so this is expected
-    # to pass. If it does not, the likely fix is a two-line revert of those
-    # additions in cpp/CMakeLists.txt.
-    #
-    # TODO: delete continue-on-error once this job has gone green once, so it
-    # starts actually gating. Leaving it here permanently makes the job
-    # decorative.
-    continue-on-error: true
+    # Residual risk this job exists to cover: the local check used clang, CI
+    # uses g++, and -fsyntax-only does not link. The one clang/GCC divergence
+    # this codebase documents (CWG 1497, invariant 12) was checked by hand —
+    # Defragmenter::Config is the only nested config struct and already uses a
+    # constructor initializer list.
     steps:
       - uses: actions/checkout@v4
 

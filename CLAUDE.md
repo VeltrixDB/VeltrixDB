@@ -173,6 +173,8 @@ curl http://localhost:2112/readyz
 
 11. **`fd.SetLocalNode(nodeID)` must be called before `fd.Start()`.** The local node never heartbeats itself via gossip, so its `nodeHeartbeats` entry is zero. Without `SetLocalNode`, `checkNodeHealth()` computes `timeSinceHeartbeat = now - 0 = epoch_ns`, which always exceeds the 10s failure threshold → constant FAILED/Recovering cycles (~2–3 false events/s in single-node mode).
 
+12b. **A class must never declare weaker alignment than its most-aligned member.** `cpp/include/shard.hpp` had `class alignas(64) Shard` while holding `alignas(4096) uint8_t write_buf_` (O_DIRECT). That is ill-formed — [dcl.align]/5 — and the compiler rejects it with "requested alignment is less than minimum alignment of 4096". It survived for a long time because nothing compiled `shard.cpp` until CI job `node-6-cpp` was added. `Shard` is now `alignas(4096)`, which also satisfies the original false-sharing intent. When adding an over-aligned member, raise the enclosing class to match.
+
 12. **`Defragmenter::Config` must not use non-static data member initializers (NSDMIs).** GCC rejects `Config cfg = {}` as a default argument when the nested `Config` struct has NSDMIs (CWG 1497 — NSDMIs require the enclosing class to be complete, but default-argument evaluation happens before the class is complete). Use a constructor initializer list instead: `Config() : field(value), … {}`. This applies to any nested struct used as a default argument inside a class body.
 
 13. **`scripts/build.sh` uses `(cd REPO_ROOT && go build …)` subshell, not `go build -C`.** The `-C` flag was added in Go 1.21; we target Go 1.19+. Never revert to `-C` without a minimum-version gate.
