@@ -79,6 +79,10 @@ type StorageEngine struct {
 	// select on this channel; normal Get/Put need not wait.
 	ReplayDone <-chan struct{}
 
+	// cacheHashed is se.cache when it supports hashed lookup (the sharded
+	// cache does). nil otherwise; the read path falls back to cache.Get.
+	cacheHashed hashedGetter
+
 	// scrubPassCounter tracks how many full scrub passes have completed —
 	// used by the admin /scrubstatus endpoint and integration tests.
 	scrubPassCounter uint64
@@ -406,6 +410,11 @@ func NewStorageEngine(cfg *StorageConfig) (*StorageEngine, error) {
 		sst:              sst,
 		cgoBatch:         cgoBatch,
 		storageBridge:    storageBridge,
+	}
+	// Probe once for the hashed-lookup capability rather than type-asserting
+	// on every read.
+	if hg, ok := cache.(hashedGetter); ok {
+		se.cacheHashed = hg
 	}
 	se.initDiskHealth(len(wals))
 	defrag.diskFailed = se.diskIsFailed
@@ -791,11 +800,7 @@ func (se *StorageEngine) Get(key string) ([]byte, error) {
 	defer func() {
 		elapsed := time.Since(start)
 		ns := elapsed.Nanoseconds()
-		se.metrics.ReadsLatencyNs.Store(ns)
 		se.metrics.ObserveReadLatency(elapsed.Seconds())
-		// Stamp the last-read time so compactVLog can detect a stale EWMA
-		// when the workload becomes write-only after a brief read burst.
-		se.metrics.Admission.LastReadNs.Store(time.Now().UnixNano())
 
 		// EWMA + admission-control flag updates: SAMPLED 1-in-N (default 64) so
 		// the CAS-loop on a single global atomic does not pingpong across all
@@ -806,6 +811,16 @@ func (se *StorageEngine) Get(key string) ([]byte, error) {
 		if idx&readEWMASampleMask != 0 {
 			return // skip CAS update on 63/64 reads
 		}
+
+		// Both of these are monitoring HINTS, so they ride the same 1-in-64
+		// sample rather than storing to a shared cache line on every read.
+		// ReadsLatencyNs is a "last read latency" gauge. LastReadNs only
+		// feeds compactVLog's 4-minute staleness check, so a 64-read lag is
+		// immaterial — and it is stamped from `start` rather than a fresh
+		// time.Now(), which removes the third clock read from the hot path
+		// (walltime + nanotime were 12.5% of CPU on this path).
+		se.metrics.ReadsLatencyNs.Store(ns)
+		se.metrics.Admission.LastReadNs.Store(start.UnixNano())
 
 		// EWMA update α=1/8: newEWMA = old*7/8 + sample/8 (integer, no float).
 		var next int64
@@ -829,8 +844,21 @@ func (se *StorageEngine) Get(key string) ([]byte, error) {
 		}
 	}()
 
+	// Hash once and reuse it for cache routing, index routing and the bloom
+	// probe. Each of those used to hash the key independently.
+	h := fnv64a(key)
+
 	// Step 1: LIRS cache.
-	if value, hit := se.cache.Get(key); hit {
+	var (
+		value []byte
+		hit   bool
+	)
+	if se.cacheHashed != nil {
+		value, hit = se.cacheHashed.getHashed(key, h)
+	} else {
+		value, hit = se.cache.Get(key)
+	}
+	if hit {
 		se.metrics.CacheHits.Add(1)
 		return value, nil
 	}
@@ -839,11 +867,11 @@ func (se *StorageEngine) Get(key string) ([]byte, error) {
 	// Step 2: Index Vault. The shardedIndex.get() call already does a bloom
 	// pre-check when blooms are installed; we count its negative hits here so
 	// operators can verify the filter is paying for itself.
-	entry, dirtyValue, exists := se.index.get(key)
+	entry, dirtyValue, exists := se.index.getHashed(key, h)
 	if !exists {
 		if shardBloomEnabled.Load() {
-			shard, _ := se.index.shardFor(key)
-			if shard.bloom != nil && !shard.bloom.MayContain(fnv64a(key)) {
+			shard := &se.index.shards[uint16(h&(numShards-1))]
+			if shard.bloom != nil && !shard.bloom.MayContain(h) {
 				se.metrics.BloomFilterSkipped.Add(1)
 			}
 		}

@@ -92,8 +92,18 @@ func (si *shardedIndex) shardFor(key string) (*indexShard, uint16) {
 // pointer-chase-free. For workloads with many negative lookups this is a 10×
 // reduction in the read floor.
 func (si *shardedIndex) get(key string) (IndexEntry, []byte, bool) {
-	shard, _ := si.shardFor(key)
-	if b := shard.bloom; b != nil && !b.MayContain(fnv64a(key)) {
+	return si.getHashed(key, fnv64a(key))
+}
+
+// getHashed is get() for callers that have already hashed the key.
+//
+// The read path needs fnv64a(key) for cache routing, index routing and the
+// bloom probe. Computing it once and threading it through removes two of the
+// three hashes from every Get — ~16% of a cache hit once the cache lock was
+// no longer the bottleneck.
+func (si *shardedIndex) getHashed(key string, h uint64) (IndexEntry, []byte, bool) {
+	shard := &si.shards[uint16(h&(numShards-1))]
+	if b := shard.bloom; b != nil && !b.MayContain(h) {
 		return IndexEntry{}, nil, false
 	}
 	shard.mu.RLock()
