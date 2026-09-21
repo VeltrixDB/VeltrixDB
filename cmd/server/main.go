@@ -12,9 +12,9 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"strconv"
 	"strings"
-	"runtime/debug"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -291,7 +291,6 @@ func main() {
 			cfg.DataDirPath = *dataDir
 			cfg.DataDirPaths = diskPaths
 			cfg.CacheMaxSizeMB = uint32(*cacheMB)
-			cfg.NumShards = 1024
 		} else {
 			log.Printf("[hardware] detected  RAM=%dMB  CPUs=%d  disks=%d",
 				profile.TotalRAMMB, profile.CPUCores, len(profile.Disks))
@@ -304,8 +303,10 @@ func main() {
 				cfg.DataDirPath = *dataDir
 			}
 
-			log.Printf("[hardware] auto-config  cache=%dMB  memtable=%dMB  shards=%d  compaction-threads=%d  sstable-max=%dMB",
-				cfg.CacheMaxSizeMB, cfg.MaxMemorySizeMB, cfg.NumShards,
+			// Shard count is a compile-time constant (8192), not part of
+			// auto-config — don't report it as if hardware detection chose it.
+			log.Printf("[hardware] auto-config  cache=%dMB  memtable=%dMB  compaction-threads=%d  sstable-max=%dMB",
+				cfg.CacheMaxSizeMB, cfg.MaxMemorySizeMB,
 				cfg.CompactionThreads, cfg.SSTableMaxSizeMB)
 
 			// Apply OS-level tuning; log warnings for non-fatal errors.
@@ -322,7 +323,6 @@ func main() {
 		if *cacheMB != 256 {
 			cfg.CacheMaxSizeMB = uint32(*cacheMB)
 		}
-		cfg.NumShards = 1024
 		log.Printf("[config] read-heavy preset enabled  cache=%dMB  LIRRatio=%.2f  defrag=%s  ttl-scan=%s",
 			cfg.CacheMaxSizeMB, cfg.LIRRatio, cfg.DefragInterval, cfg.TTLCheckInterval)
 	} else {
@@ -330,7 +330,6 @@ func main() {
 		cfg.DataDirPath = *dataDir
 		cfg.DataDirPaths = diskPaths
 		cfg.CacheMaxSizeMB = uint32(*cacheMB)
-		cfg.NumShards = 1024
 	}
 
 	// Apply post-preset overrides for newly-introduced config knobs so they
@@ -423,8 +422,9 @@ func main() {
 	}()
 
 	if len(diskPaths) > 0 {
+		// 8192 is storage.numShards (compile-time); cfg.NumShards is vestigial.
 		log.Printf("[storage] engine started  disks=%d  shards-per-disk=%d  cache=%dMB",
-			len(diskPaths), 1024/len(diskPaths), cfg.CacheMaxSizeMB)
+			len(diskPaths), 8192/len(diskPaths), cfg.CacheMaxSizeMB)
 		for i, p := range diskPaths {
 			log.Printf("[storage]   disk[%d] → %s", i, p)
 		}
@@ -736,6 +736,7 @@ func main() {
 // Binary response format:
 //
 //	[1B] status  [4B] payloadLen LE  [payloadLen]payload
+//
 // metricsConn wraps a net.Conn and accumulates byte-level I/O counters into
 // StorageMetrics so the Prometheus collector can report network throughput
 // without any per-request overhead beyond two atomic adds.

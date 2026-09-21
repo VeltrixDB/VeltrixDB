@@ -23,7 +23,6 @@ func newTestEngineInDir(t *testing.T, dir string) *storage.StorageEngine {
 	cfg.DataDirPath = dir
 	cfg.DataDirPaths = nil
 	cfg.CacheMaxSizeMB = 16
-	cfg.NumShards = 1024
 	cfg.WALFlushWindowMs = 1
 	cfg.VLogFlushWindowMs = 1
 	cfg.ScrubEnabled = false

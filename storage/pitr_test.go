@@ -17,7 +17,6 @@ func newPITRTestEngine(t *testing.T, dir, archiveDir string) (*StorageEngine, *W
 	cfg.DataDirPath = dir
 	cfg.DataDirPaths = nil
 	cfg.CacheMaxSizeMB = 16
-	cfg.NumShards = 1024
 	cfg.WALFlushWindowMs = 1
 	cfg.VLogFlushWindowMs = 1
 	cfg.ScrubEnabled = false

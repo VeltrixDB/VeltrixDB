@@ -42,7 +42,6 @@ func newTestEngine(t *testing.T) *StorageEngine {
 	cfg.DataDirPath = dir
 	cfg.DataDirPaths = nil
 	cfg.CacheMaxSizeMB = 16
-	cfg.NumShards = 1024
 	// Tighten group-commit windows so per-test latency is bearable.
 	cfg.WALFlushWindowMs = 1
 	cfg.VLogFlushWindowMs = 1

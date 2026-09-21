@@ -35,7 +35,6 @@ func newTestEngine2Disks(t *testing.T) *StorageEngine {
 	cfg.DataDirPath = ""
 	cfg.DataDirPaths = []string{dir0, dir1}
 	cfg.CacheMaxSizeMB = 16
-	cfg.NumShards = 1024
 	cfg.WALFlushWindowMs = 1
 	cfg.VLogFlushWindowMs = 1
 	cfg.ScrubEnabled = false
@@ -288,7 +287,6 @@ func TestEngine_CrashRecovery(t *testing.T) {
 	cfg.DataDirPath = dir
 	cfg.DataDirPaths = nil
 	cfg.CacheMaxSizeMB = 16
-	cfg.NumShards = 1024
 	cfg.WALFlushWindowMs = 1
 	cfg.VLogFlushWindowMs = 1
 	cfg.ScrubEnabled = false

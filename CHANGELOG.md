@@ -7,6 +7,136 @@ Types: `Added`, `Changed`, `Fixed`, `Performance`, `Breaking`
 
 ---
 
+## [Unreleased]
+
+### Fixed
+
+- **At-rest encryption and compression were skipped on every batched write
+  path.** `MaybeCompress` / `Encrypt` were called only from
+  `StorageEngine.Put`; `multiPutKVSep` — which backs `MPUT`, the
+  `WriteBatcher`, and the server's PUT coalescing — wrote raw plaintext to the
+  VLog. With `--encrypt-at-rest` on, the paths the docs recommend for
+  throughput were the unencrypted ones, and the failure was silent because
+  `FlagEncrypted` is per-record so reads never attempted to decrypt. Both
+  transforms now go through a single chokepoint, `transformForWrite`, used by
+  `Put`, `multiPutKVSep`, and legacy-WAL re-append alike.
+
+- **Compressed and encrypted values were unreadable after a restart.** The WAL
+  recorded only the plaintext length and no transform flags, so replay rebuilt
+  `IndexEntry.ValueSize` from the plaintext length while the VLog held a blob
+  of a different size — `ReadValue` then pulled the wrong byte count and
+  failed CRC. Where the lengths happened to match, the missing flags meant
+  `Get` returned raw ciphertext. Compression is enabled by default
+  (`Compression: "zstd"`), so this affected default deployments for every
+  value over the 256-byte threshold; it went unnoticed because every existing
+  crash-recovery test used values far below it. The WAL record gained two
+  fields (`diskLen|xflags`, now 10 total) and `writeWALCheckpoint` — which had
+  the same defect on the clean-shutdown path, plus dropped `FlagPacked` —
+  emits them too. Records in the older 6/7/8-field formats still parse.
+
+- **Raw block-device VLog could overwrite live data on restart.** WAL replay is
+  asynchronous and the server accepts writes as soon as `NewStorageEngine`
+  returns, but `vl.end` was seeded from the rebuilt index only *after* replay
+  finished. In raw mode `Stat().Size()` is 0, so until then the cursor sat at
+  offset 4096 and any write arriving during warmup reserved offsets on top of
+  live records. The cursor is now pre-seeded synchronously from the parsed WAL
+  entries (`maxVLogEndFromWAL`) before the engine is handed out; the
+  post-replay index-derived seed remains as a safety net.
+
+- **Shutdown race in `VLog.close()` and `WriteAheadLog.close()`.** Both closed
+  the file descriptor while the flusher goroutine could still be running its
+  final `fdatasync` / `Write` — a data race on `*os.File` and, for the WAL, a
+  path where the last batch could fail with "file already closed". Both now
+  wait for the flusher to exit before closing. Surfaced by the race detector,
+  which no CI job was running.
+
+- **Data race in the `client` package test harness.** `newTextServer` started
+  its accept loop before the test assigned `authRequired` / `authUser` /
+  `authPass`, so handler goroutines read those fields unsynchronised. Replaced
+  by `newTextServerAuth`, which installs credentials before the goroutine
+  starts.
+
+- **VLog GC mislabelled oversized relocations as packed.** `compactVLog`
+  hardcoded `newPacked: true`, but `VLogBatcher.Stage` falls back to an
+  unpacked span for records larger than a 4 KB block. `MarkDead` then
+  subtracted header+value instead of the full aligned span, inflating
+  `liveBytes` permanently and making `GCRatio` under-report garbage so GC
+  fired late. `Stage` now returns whether it packed, and both call sites
+  propagate that value.
+
+### Changed
+
+- **WAL record format is now 10 fields**:
+  `timestamp|tombstone|key|valueLen|crc32hex|version|vlogOffset|packed|diskLen|xflags`.
+  `valueLen` remains the plaintext length; `diskLen` is the on-disk blob length
+  after compression and encryption; `xflags` (hex) carries
+  `FlagCompressed|FlagEncrypted`. Forward-compatible: 6-, 7- and 8-field
+  records still replay, defaulting `diskLen` to `valueLen` and `xflags` to 0.
+- `VLogBatcher.Stage` returns `(offset int64, packed bool, err error)`.
+  Callers must propagate `packed` to `FlagPacked` verbatim rather than
+  recomputing or assuming it.
+
+- **`StorageConfig.NumShards` is now marked deprecated and warns when set.**
+  It had no effect — the index shard count is the compile-time `numShards`
+  (8192) — but `hardware/config.go` computed it from CPU count and callers set
+  it to 1024, all of which read as working tuning. The dead computation and the
+  no-op assignments are gone, `NewStorageEngine` logs a warning if the field is
+  set to anything other than 8192, and the auto-config log line no longer
+  reports a shard count it did not choose.
+
+- **`cpp/src/vlog.cpp` and `cpp/src/ebpf_gc_throttle.cpp` are now in the CMake
+  build.** They were absent from `cpp/CMakeLists.txt` and from every cgo shim,
+  so they were compiled by nothing while the docs advertised `vlog.cpp` as a
+  performance hot path. Both wrap their body in `#ifdef __linux__`. Note this
+  gives them compile coverage only — neither has a Go call site.
+
+### Added
+
+- **`cmd/veltrix-repair`** — offline repair for value-transform metadata lost
+  by pre-fix builds. `--scan` is read-only and reports what is affected;
+  `--repair` corrects the index and writes a corrected checkpoint, after
+  backing up each `wal.log`. The repair is exact rather than heuristic:
+  `IndexEntry.CRC32C` is the CRC of the *plaintext* and survived the bug, so
+  the tool enumerates the four possible interpretations of each on-disk blob
+  and accepts only the one that reproduces that CRC. Anything else is reported
+  and left untouched. Idempotent; safe to re-run.
+
+### CI
+
+- **Added `node-5-race`**: the full test suite under `-race`. No job ran the
+  race detector before, which is why the two races above went unnoticed.
+- **Added `node-6-cpp`**: builds the CMake static library, the cgo shims
+  (`CGO_ENABLED=1`), the storage tests with cgo, and `scripts/build.sh` end to
+  end on a runner with `liburing-dev`. Nothing compiled `cpp/` before, so any
+  change under it was completely unverified.
+- **Added a `gofmt` gate** to `node-1-storage`; the tree is now gofmt-clean
+  (39 files were not).
+
+### Documentation
+
+- **Removed three flags from the docs that do not exist.** The "operator
+  checklist" for the 2M reads/s target told operators to pass
+  `--cgo-batch-engine=true --numa-aware=true --sqpoll-reader=true`. No such
+  flags are defined, and `flag.Parse()` is `ExitOnError`, so following the
+  checklist made the server exit with "flag provided but not defined". All
+  three behaviours are unconditional in a Linux CGO build and cannot be
+  toggled at runtime.
+
+- Corrected admission-control and flush-window constants in `CLAUDE.md` and
+  `ARCHITECTURE.md`, which had drifted from the code: admission throttle is
+  20 ms (not 4 ms), resume 10 ms (not 2 ms), GC bandwidth threshold 15 ms (not
+  3 ms), and the default WAL/VLog flush windows are 15 ms (not 10 ms).
+- Documented which C++ sources are actually compiled and reachable from Go.
+  `cpp/src/vlog.cpp` and `cpp/src/ebpf_gc_throttle.cpp` are built by nothing;
+  `art.cpp` and `scheduler.cpp` compile into the CMake static lib but have no
+  Go call site. The published Docker image and all CI jobs are
+  `CGO_ENABLED=0`, so they contain no C++ at all.
+- Noted that `StorageConfig.NumShards` is vestigial — the index always uses the
+  compile-time `numShards = 8192`. Fixed the startup log line that derived
+  shards-per-disk from 1024.
+
+---
+
 ## [1.1.0] — 2026-07-18
 
 Distributed-completeness release: everything that previously applied

@@ -28,6 +28,16 @@ jobs:
           go-version: "1.21"
           cache: true
 
+      - name: gofmt
+        run: |
+          unformatted="$(gofmt -l $(find . -name '*.go' -not -path './dist/*'))"
+          if [ -n "$unformatted" ]; then
+            echo "::error::these files are not gofmt-clean:"
+            echo "$unformatted"
+            gofmt -d $(echo "$unformatted")
+            exit 1
+          fi
+
       - name: build
         run: CGO_ENABLED=0 go build ./...
 
@@ -188,6 +198,110 @@ jobs:
         run: |
           bash scripts/push-ci-metrics.sh \
             --job    "node-4-paper-changes" \
+            --start  "${{ steps.t0.outputs.ts }}" \
+            --status "${{ job.status }}" \
+            --run-id "${{ github.run_id }}" \
+            --sha    "${{ github.sha }}" \
+            --branch "${{ github.ref_name }}"
+
+  # ── Node 5: race detector ─────────────────────────────────────────────────
+  # The whole suite under -race. Nothing else in CI runs with it, so concurrency
+  # bugs (shutdown races between a flusher goroutine and close(), unsynchronised
+  # test-harness fields) shipped undetected for a long time. -race slows tests
+  # ~3x, hence the longer timeouts and a job of its own.
+  node-5-race:
+    name: "Node 5 — race detector"
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: record start time
+        id: t0
+        run: echo "ts=$(date +%s)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.21"
+          cache: true
+
+      - name: storage + server under -race
+        run: CGO_ENABLED=0 go test -race -timeout 600s -count=1 ./storage/... ./cmd/server/...
+
+      - name: consensus + cluster + replication under -race
+        run: CGO_ENABLED=0 go test -race -timeout 600s -count=1 ./consensus/... ./cluster/... ./replication/...
+
+      - name: remaining packages under -race
+        run: CGO_ENABLED=0 go test -race -timeout 600s -count=1 ./adminapi/... ./client/... ./security/... ./tracing/...
+
+      - name: push CI metrics
+        if: always()
+        env:
+          PUSH_GW_URL: ${{ secrets.PUSH_GW_URL }}
+        run: |
+          bash scripts/push-ci-metrics.sh \
+            --job    "node-5-race" \
+            --start  "${{ steps.t0.outputs.ts }}" \
+            --status "${{ job.status }}" \
+            --run-id "${{ github.run_id }}" \
+            --sha    "${{ github.sha }}" \
+            --branch "${{ github.ref_name }}"
+
+  # ── Node 6: C++ layer ─────────────────────────────────────────────────────
+  # No other job compiles cpp/ at all: every Go job is CGO_ENABLED=0, and the
+  # published Docker image is too. A change under cpp/ was therefore completely
+  # unverified. This builds both halves of the C++ story:
+  #   1. the CMake static lib (libveltrixdb_engine.a)
+  #   2. the cgo shims in storage/, which compile batch_engine.cpp,
+  #      uring_reader.cpp and numa_topology.cpp into the Go package
+  node-6-cpp:
+    name: "Node 6 — C++ / cgo build"
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: record start time
+        id: t0
+        run: echo "ts=$(date +%s)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.21"
+          cache: true
+
+      - name: install liburing + cmake
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends liburing-dev cmake g++
+
+      - name: cmake configure + build
+        run: |
+          cmake -S cpp -B cpp/build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_COMPILER=g++ \
+            -DBUILD_SHARED_LIBS=OFF
+          cmake --build cpp/build --parallel "$(nproc)"
+
+      - name: cgo build (compiles the storage/ C++ shims)
+        run: CGO_ENABLED=1 go build ./storage/... ./cmd/server/...
+
+      - name: cgo vet
+        run: CGO_ENABLED=1 go vet ./storage/...
+
+      - name: storage tests with cgo enabled
+        run: CGO_ENABLED=1 go test -timeout 300s -count=1 ./storage/...
+
+      - name: full build via scripts/build.sh
+        run: VERSION=ci ./scripts/build.sh --output /tmp/dist
+
+      - name: push CI metrics
+        if: always()
+        env:
+          PUSH_GW_URL: ${{ secrets.PUSH_GW_URL }}
+        run: |
+          bash scripts/push-ci-metrics.sh \
+            --job    "node-6-cpp" \
             --start  "${{ steps.t0.outputs.ts }}" \
             --status "${{ job.status }}" \
             --run-id "${{ github.run_id }}" \

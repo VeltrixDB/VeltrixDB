@@ -135,7 +135,6 @@ func setupCluster(t *testing.T, nodeCount int) ([]*clusterNode, func()) {
 		cfg := storage.DefaultStorageConfig()
 		cfg.DataDirPath = dir
 		cfg.CacheMaxSizeMB = 16
-		cfg.NumShards = 1024
 		cfg.WALFlushWindowMs = 1
 		cfg.VLogFlushWindowMs = 1
 		cfg.ScrubEnabled = false
@@ -376,7 +375,6 @@ func TestCluster_NodeAddition(t *testing.T) {
 	cfg3 := storage.DefaultStorageConfig()
 	cfg3.DataDirPath = dir3
 	cfg3.CacheMaxSizeMB = 16
-	cfg3.NumShards = 1024
 	cfg3.WALFlushWindowMs = 1
 	cfg3.VLogFlushWindowMs = 1
 	cfg3.ScrubEnabled = false
