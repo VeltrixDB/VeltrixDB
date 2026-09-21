@@ -22,6 +22,13 @@ type walReplayEntry struct {
 	valueLen    uint32
 	vlogOffset  int64 // >0: value lives in VLog at this offset; 0: value bytes in WAL
 	packed      bool  // 8-field format only: VLog record at vlogOffset is part of a packed 4 KB block
+	// diskLen is the on-disk blob length (post-compression, post-encryption).
+	// Equals valueLen for untransformed records and for pre-10-field WALs.
+	diskLen uint32
+	// xflags carries FlagCompressed|FlagEncrypted so replay can restore them
+	// onto the rebuilt IndexEntry; without them the read path would hand back
+	// ciphertext. Zero for pre-10-field WALs.
+	xflags uint8
 }
 
 // replayWAL reads the WAL file at walPath and returns all valid, fully-written
@@ -38,10 +45,18 @@ type walReplayEntry struct {
 //	7-field (legacy KV-sep): timestamp|tombstone|key|valueLen|crc32hex|version|vlogOffset\n
 //	                         [raw value bytes]\n  ← present only when vlogOffset==0 && !tombstone && valueLen>0
 //
-//	8-field (current): timestamp|tombstone|key|valueLen|crc32hex|version|vlogOffset|packed\n
-//	                   [raw value bytes]\n  ← present only when vlogOffset==0 && !tombstone && valueLen>0
-//	The trailing 'packed' field ('0' or '1') restores FlagPacked onto the
-//	rebuilt IndexEntry so MarkDead later subtracts the correct footprint.
+//	8-field (legacy): timestamp|tombstone|key|valueLen|crc32hex|version|vlogOffset|packed\n
+//	                  [raw value bytes]\n  ← present only when vlogOffset==0 && !tombstone && valueLen>0
+//	The 'packed' field ('0' or '1') restores FlagPacked onto the rebuilt
+//	IndexEntry so MarkDead later subtracts the correct footprint.
+//
+//	10-field (current): ...|vlogOffset|packed|diskLen|xflags\n
+//	                    [raw value bytes]\n  ← same condition as above
+//	'diskLen' is the on-disk blob length after compression + encryption and
+//	'xflags' (hex) carries FlagCompressed|FlagEncrypted. valueLen remains the
+//	PLAINTEXT length. Shorter records parse with diskLen=valueLen and
+//	xflags=0 — correct for them, since those builds wrote values
+//	untransformed through this path.
 func replayWAL(walPath string) ([]walReplayEntry, error) {
 	f, err := os.Open(walPath)
 	if os.IsNotExist(err) {
@@ -66,9 +81,9 @@ func replayWAL(walPath string) ([]walReplayEntry, error) {
 			continue
 		}
 
-		// SplitN with n=8 handles 6-field, 7-field, and 8-field formats:
+		// SplitN with n=10 handles the 6-, 7-, 8- and 10-field formats:
 		// shorter lines just leave the higher indices unset.
-		parts := strings.SplitN(line, "|", 8)
+		parts := strings.SplitN(line, "|", 10)
 		if len(parts) < 6 {
 			break // malformed header — stop, treat remainder as corrupt tail
 		}
@@ -101,16 +116,30 @@ func replayWAL(walPath string) ([]walReplayEntry, error) {
 			vlogOffset = off
 		}
 		var packed bool
-		if len(parts) == 8 {
-			// 8th field is "0" or "1"; anything else is a parse failure.
-			switch parts[7] {
-			case "0":
-				packed = false
-			case "1":
-				packed = true
-			default:
+		if len(parts) >= 8 {
+			// 8th field is "0" or "1"; anything else leaves packed=false.
+			packed = parts[7] == "1"
+		}
+
+		// Fields 9 and 10 (diskLen, xflags) describe the value transform.
+		// Absent in older WALs: default diskLen to the plaintext length and
+		// xflags to 0, which is exactly right for records written before the
+		// batched/replay paths applied transforms.
+		diskLen := uint32(valueLen)
+		var xflags uint8
+		if len(parts) >= 10 {
+			dl, err := strconv.ParseUint(parts[8], 10, 32)
+			if err != nil {
 				break
 			}
+			xf, err := strconv.ParseUint(parts[9], 16, 8)
+			if err != nil {
+				break
+			}
+			if dl > 0 {
+				diskLen = uint32(dl)
+			}
+			xflags = uint8(xf)
 		}
 
 		var value []byte
@@ -142,6 +171,8 @@ func replayWAL(walPath string) ([]walReplayEntry, error) {
 			valueLen:    uint32(valueLen),
 			vlogOffset:  vlogOffset,
 			packed:      packed,
+			diskLen:     diskLen,
+			xflags:      xflags,
 		})
 	}
 
@@ -177,6 +208,11 @@ type vlogReplayPending struct {
 //
 // Returns the maximum version seen; the caller stores this in se.version so
 // new writes start from a strictly higher version than any replayed entry.
+// transform is the engine's compress→encrypt pipeline (se.transformForWrite).
+// It is only consulted on the legacy inline-value path, where plaintext bytes
+// come out of the WAL and have to be written into the VLog fresh: without it a
+// legacy WAL replayed onto a node running --encrypt-at-rest would land
+// plaintext on disk. May be nil (tests, non-transforming configs).
 func applyWALReplay(
 	entries []walReplayEntry,
 	index *shardedIndex,
@@ -184,6 +220,7 @@ func applyWALReplay(
 	diskIdx int,
 	numDisks int,
 	kvSep bool,
+	transform func([]byte) ([]byte, uint8, error),
 ) uint64 {
 	var maxVersion uint64
 
@@ -209,8 +246,14 @@ func applyWALReplay(
 		}
 
 		entry := &IndexEntry{
-			KeyHash:          fnv64a(e.key),
-			ValueSize:        e.valueLen,
+			KeyHash: fnv64a(e.key),
+			// ValueSize is the ON-DISK blob length — the byte count ReadValue
+			// must pull from the VLog. UncompressedSize is the plaintext
+			// length the read path decompresses back to. They differ whenever
+			// compression or encryption applied, which is why the WAL carries
+			// both; conflating them made every transformed record fail its
+			// CRC check after a crash restart.
+			ValueSize:        e.diskLen,
 			UncompressedSize: e.valueLen,
 			KeySize:          uint32(len(e.key)),
 			WriteTimestampUs: nowUs,
@@ -221,6 +264,9 @@ func applyWALReplay(
 		if e.packed {
 			entry.Flags |= FlagPacked
 		}
+		// Restore the transform bits so Get() decrypts/decompresses this
+		// record exactly as it would have before the restart.
+		entry.Flags |= e.xflags & (FlagCompressed | FlagEncrypted)
 
 		switch {
 		case kvSep && vl != nil && e.vlogOffset > 0:
@@ -234,7 +280,23 @@ func applyWALReplay(
 			// (beginAppend does WriteAt + enqueues an fdatasync request) and
 			// record the response channel for collection below.  Old VLog content
 			// below the replay watermark is orphaned GC garbage.
-			offset, rp, err := vl.beginAppend(e.value)
+			//
+			// The WAL bytes are plaintext, so they go through the same
+			// compress→encrypt pipeline a live Put would use before landing in
+			// the VLog — otherwise replaying a legacy WAL on an encrypted node
+			// would silently write plaintext to disk.
+			writeBytes := e.value
+			if transform != nil {
+				tb, xf, terr := transform(e.value)
+				if terr != nil {
+					continue // cannot seal the value; key absent after restart
+				}
+				writeBytes = tb
+				entry.Flags |= xf
+			}
+			entry.ValueSize = uint32(len(writeBytes))
+			entry.UncompressedSize = uint32(len(e.value))
+			offset, rp, err := vl.beginAppend(writeBytes)
 			if err != nil {
 				continue // disk error; key absent from index after restart
 			}
@@ -272,7 +334,7 @@ func walPathForDir(dir string) string {
 // live key assigned to diskIdx.  It is called by Close() instead of truncating
 // the WAL to zero, so keys are never lost across clean restarts.
 //
-// Format is identical to the normal 7-field WAL so replayWAL/applyWALReplay
+// Format is identical to the normal 10-field WAL so replayWAL/applyWALReplay
 // can parse it without any changes.  For KV-sep entries the vlogOffset field
 // is set (no value bytes written); for non-KV-sep entries value bytes follow.
 //
@@ -305,14 +367,27 @@ func writeWALCheckpoint(walPath string, index *shardedIndex, diskIdx, numDisks i
 				ts = now
 			}
 
-			// Serialise in the same 7-field pipe-delimited format as wal.serialize():
-			// timestamp|0|key|valueLen|crcHex|version|vlogOffset\n
+			// Serialise in the same 10-field pipe-delimited format as
+			// wal.serialize():
+			//   timestamp|0|key|valueLen|crcHex|version|vlogOffset|packed|diskLen|xflags\n
+			//
+			// valueLen is the PLAINTEXT length (UncompressedSize) and diskLen
+			// the on-disk blob (ValueSize); they differ under compression or
+			// encryption. Emitting ValueSize as valueLen and dropping the
+			// packed/compressed/encrypted flags — as this did while it wrote
+			// 7 fields — meant a clean shutdown produced a checkpoint that
+			// replayed into entries with the wrong read length and no
+			// transform bits, i.e. unreadable values and a distorted GCRatio.
+			plainLen := entry.UncompressedSize
+			if plainLen == 0 {
+				plainLen = entry.ValueSize
+			}
 			buf = buf[:0]
 			buf = strconv.AppendInt(buf, ts, 10)
 			buf = append(buf, '|', '0', '|')
 			buf = append(buf, key...)
 			buf = append(buf, '|')
-			buf = strconv.AppendUint(buf, uint64(entry.ValueSize), 10)
+			buf = strconv.AppendUint(buf, uint64(plainLen), 10)
 			buf = append(buf, '|')
 			buf = strconv.AppendUint(buf, uint64(entry.CRC32C), 16)
 			buf = append(buf, '|')
@@ -322,6 +397,16 @@ func writeWALCheckpoint(walPath string, index *shardedIndex, diskIdx, numDisks i
 			if kvSep && entry.DiskOffset > 0 {
 				// Value is durable in VLog — header-only record, no value bytes.
 				buf = strconv.AppendInt(buf, int64(entry.DiskOffset), 10)
+				buf = append(buf, '|')
+				if entry.IsPacked() {
+					buf = append(buf, '1')
+				} else {
+					buf = append(buf, '0')
+				}
+				buf = append(buf, '|')
+				buf = strconv.AppendUint(buf, uint64(entry.ValueSize), 10)
+				buf = append(buf, '|')
+				buf = strconv.AppendUint(buf, uint64(entry.Flags&(FlagCompressed|FlagEncrypted)), 16)
 				buf = append(buf, '\n')
 				_, writeErr = bw.Write(buf)
 			} else {
@@ -332,7 +417,23 @@ func writeWALCheckpoint(walPath string, index *shardedIndex, diskIdx, numDisks i
 				if len(dirtyVal) == 0 {
 					continue
 				}
-				buf = append(buf, '0', '\n') // vlogOffset=0 → value bytes follow
+				// Dirty values are held in RAM as plaintext, so this record is
+				// untransformed regardless of what the IndexEntry says: rewrite
+				// the length field to match the bytes that actually follow.
+				buf = buf[:0]
+				buf = strconv.AppendInt(buf, ts, 10)
+				buf = append(buf, '|', '0', '|')
+				buf = append(buf, key...)
+				buf = append(buf, '|')
+				buf = strconv.AppendUint(buf, uint64(len(dirtyVal)), 10)
+				buf = append(buf, '|')
+				buf = strconv.AppendUint(buf, uint64(computeCRC32C(dirtyVal)), 16)
+				buf = append(buf, '|')
+				buf = strconv.AppendUint(buf, version, 10)
+				// vlogOffset=0 → value bytes follow; unpacked, untransformed.
+				buf = append(buf, '|', '0', '|', '0', '|')
+				buf = strconv.AppendUint(buf, uint64(len(dirtyVal)), 10)
+				buf = append(buf, '|', '0', '\n')
 				if _, writeErr = bw.Write(buf); writeErr == nil {
 					if _, writeErr = bw.Write(dirtyVal); writeErr == nil {
 						writeErr = bw.WriteByte('\n')
@@ -358,4 +459,49 @@ func writeWALCheckpoint(walPath string, index *shardedIndex, diskIdx, numDisks i
 	// Rename leaves walPath+".ckpt" on disk; the next startup finds it, ignores
 	// it (not named wal.log), and replays the old WAL intact.
 	return os.Rename(tmpPath, walPath)
+}
+
+// maxVLogEndFromWAL returns one byte past the highest VLog position referenced
+// by any parsed WAL entry belonging to diskIdx, or 0 when none do.
+//
+// This exists to close a restart race in raw block-device mode. A block device
+// reports Stat().Size()==0, so newVLog cannot infer where prior writes ended
+// and provisionally sets vl.end to vlogStart (4096). The authoritative seed is
+// index.maxVLogEndOffset(), but the index is only rebuilt by the BACKGROUND
+// replay goroutine — and the server starts accepting writes the moment
+// NewStorageEngine returns. Any Put landing in that window reserves offsets
+// from 4096 and overwrites live records the index still points at.
+//
+// Computing the seed straight from the parsed WAL entries needs no index, so
+// it can run synchronously before the engine is handed out. The post-replay
+// index-derived seed still runs afterwards; SetEndAtLeast is monotonic, so the
+// two are complementary rather than conflicting.
+//
+// The alignment arithmetic mirrors shardedIndex.maxVLogEndOffset exactly:
+// packed records round their end up to the enclosing 4 KB block; unpacked
+// records own a whole aligned span. When in doubt this rounds UP — reserving
+// too much VLog costs a little space, reserving too little corrupts data.
+func maxVLogEndFromWAL(entries []walReplayEntry, diskIdx, numDisks int) uint64 {
+	var maxEnd uint64
+	for _, e := range entries {
+		if e.vlogOffset <= 0 {
+			continue // tombstone, or legacy inline value with no VLog position yet
+		}
+		shardID := uint16(fnv64a(e.key) & (numShards - 1))
+		if diskForShard(shardID, numDisks) != diskIdx {
+			continue
+		}
+		rawLen := uint64(vlogHeaderBytes) + uint64(e.diskLen)
+		end := uint64(e.vlogOffset) + rawLen
+		if e.packed {
+			end = (end + uint64(vlogBlockSize) - 1) &^ uint64(vlogBlockSize-1)
+		} else {
+			alignedLen := (rawLen + uint64(vlogBlockSize) - 1) &^ uint64(vlogBlockSize-1)
+			end = uint64(e.vlogOffset) + alignedLen
+		}
+		if end > maxEnd {
+			maxEnd = end
+		}
+	}
+	return maxEnd
 }

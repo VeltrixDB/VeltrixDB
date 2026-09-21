@@ -46,7 +46,7 @@ func computeCRC32C(data []byte) uint32 {
 type StorageEngine struct {
 	config   *StorageConfig
 	index    *shardedIndex
-	wals     []*WriteAheadLog  // one per disk; wals[i] lives on dirs[i]
+	wals     []*WriteAheadLog // one per disk; wals[i] lives on dirs[i]
 	cache    Cache
 	segments []*SegmentWriter // one per disk; len == numDisks
 	vlogs    []*VLog          // one per disk; non-nil when KeyValueSeparation=true
@@ -126,8 +126,13 @@ func NewStorageEngine(cfg *StorageConfig) (*StorageEngine, error) {
 	if cfg == nil {
 		cfg = DefaultStorageConfig()
 	}
-	if cfg.NumShards == 0 {
-		cfg.NumShards = 256
+	// NumShards is vestigial — the index always uses the numShards constant.
+	// Warn rather than silently ignoring, so an operator who "tuned" it finds
+	// out instead of believing it took effect.
+	if cfg.NumShards != 0 && cfg.NumShards != numShards {
+		log.Printf("[config] WARNING: StorageConfig.NumShards=%d is ignored — "+
+			"the index shard count is fixed at %d (compile-time). Remove the setting.",
+			cfg.NumShards, numShards)
 	}
 
 	// Resolve disk paths: DataDirPaths wins; fall back to single DataDirPath.
@@ -310,6 +315,42 @@ func NewStorageEngine(cfg *StorageConfig) (*StorageEngine, error) {
 		}
 	}
 
+	// Phase 2b (fast, in-memory): seed each VLog's write cursor past the
+	// highest position any WAL entry references, BEFORE the engine is handed
+	// out and starts serving.
+	//
+	// This is load-bearing for raw block-device mode. A block device reports
+	// Stat().Size()==0, so newVLog provisionally parked vl.end at vlogStart
+	// (4096). The index-derived seed below (after replay) is authoritative,
+	// but replay runs in the BACKGROUND and the server accepts writes the
+	// instant NewStorageEngine returns — so a Put arriving during warmup would
+	// reserve offsets from 4096 and overwrite live records the rebuilt index
+	// still points at. Deriving the seed from the parsed WAL entries needs no
+	// index, so it can run here, synchronously, closing that window.
+	//
+	// On file-backed VLogs vl.end already equals the file size, which is >=
+	// any recorded offset, and SetEndAtLeast never retreats — so this is a
+	// no-op there.
+	if cfg.KeyValueSeparation {
+		for diskIdx, vl := range vlogs {
+			if diskIdx >= len(allEntries) {
+				break
+			}
+			if maxEnd := maxVLogEndFromWAL(allEntries[diskIdx], diskIdx, len(dirs)); maxEnd > 0 {
+				before := vl.end.Load()
+				vl.SetEndAtLeast(int64(maxEnd))
+				if after := vl.end.Load(); after > before {
+					mode := "file"
+					if vl.rawDevicePath != "" {
+						mode = "raw"
+					}
+					log.Printf("[vlog] disk=%d %s mode end pre-seeded to %d from WAL before serving (was %d)",
+						diskIdx, mode, after, before)
+				}
+			}
+		}
+	}
+
 	// Create the io_uring storage bridge and wire it into every VLog.
 	// The bridge owns 8 SQPOLL rings (one per NVMe disk) and fixed-buffer
 	// pools registered once with the kernel.  VLogBatcher.Flush will route
@@ -403,7 +444,7 @@ func NewStorageEngine(cfg *StorageConfig) (*StorageEngine, error) {
 				}
 				go func() {
 					defer rwg.Done()
-					applyWALReplay(entries, index, vl, diskIdx, len(dirs), cfg.KeyValueSeparation)
+					applyWALReplay(entries, index, vl, diskIdx, len(dirs), cfg.KeyValueSeparation, se.transformForWrite)
 				}()
 			}
 			rwg.Wait()
@@ -483,6 +524,48 @@ func NewStorageEngine(cfg *StorageConfig) (*StorageEngine, error) {
 }
 
 // ── Write path ────────────────────────────────────────────────────────────────
+
+// transformForWrite applies the on-disk value pipeline — compress, then
+// encrypt — and returns the blob to store plus the IndexEntry flags that
+// describe it.
+//
+// Order is not arbitrary. Compression MUST run before encryption: ciphertext
+// is high-entropy and therefore incompressible, so compressing afterwards
+// burns CPU for nothing. Get() reverses this exactly: decrypt → decompress →
+// migrate-on-read.
+//
+// len(out) is the value's on-disk footprint and belongs in IndexEntry.ValueSize;
+// the caller keeps len(value) as UncompressedSize so the read path can size its
+// output buffer. The returned flags must reach BOTH the IndexEntry and the WAL
+// record, or a crash restart loses them.
+//
+// EVERY path that writes a value into the VLog must call this — single Put,
+// the batched MultiPut path, and legacy-WAL re-append alike. A path that skips
+// it stores plaintext even when --encrypt-at-rest is on, and does so silently,
+// because FlagEncrypted is per-record and the read path simply won't decrypt
+// what was never marked encrypted.
+func (se *StorageEngine) transformForWrite(value []byte) ([]byte, uint8, error) {
+	out := value
+	var flags uint8
+
+	if se.config.Compression == "zstd" || se.config.Compression == "flate" {
+		if cb, ok := MaybeCompress(out, se.config.CompressionLevel); ok {
+			out = cb
+			flags |= FlagCompressed
+		}
+	}
+	if EncryptionEnabled() {
+		ct, sealed, err := Encrypt(out)
+		if err != nil {
+			return nil, 0, fmt.Errorf("encrypt: %w", err)
+		}
+		if sealed {
+			out = ct
+			flags |= FlagEncrypted
+		}
+	}
+	return out, flags, nil
+}
 
 // Put stores key → value with an optional TTL (seconds; -1 = immortal).
 //
@@ -582,32 +665,15 @@ func (se *StorageEngine) Put(key string, value []byte, ttl int32) error {
 			se.vlogs[int(old.SegmentID)%len(se.vlogs)].MarkDead(old.ValueSize, old.IsPacked())
 		}
 
-		// Compression: try flate when the value crosses the 256-byte threshold.
-		// On wins we keep UncompressedSize=len(value) for the read path and store
-		// FlagCompressed on the IndexEntry; ValueSize becomes the compressed
-		// blob length (1B algo prefix + compressed bytes).
-		writeBytes := value
-		if se.config.Compression == "zstd" || se.config.Compression == "flate" {
-			if cb, ok := MaybeCompress(value, se.config.CompressionLevel); ok {
-				writeBytes = cb
-				entry.Flags |= FlagCompressed
-				entry.ValueSize = uint32(len(cb))
-			}
+		// Value transform: compress, then encrypt. See transformForWrite for
+		// why the order is fixed. UncompressedSize keeps the plaintext length
+		// for the read path; ValueSize becomes the on-disk blob length.
+		writeBytes, xflags, xerr := se.transformForWrite(value)
+		if xerr != nil {
+			return xerr
 		}
-		// Encryption: applied AFTER compression (encrypted data is incompressible)
-		// and only when a key is loaded. Adds 12 B nonce + 16 B AEAD tag = 28 B
-		// overhead per record. ValueSize tracks the post-encryption blob length.
-		if EncryptionEnabled() {
-			ct, sealed, encErr := Encrypt(writeBytes)
-			if encErr != nil {
-				return fmt.Errorf("encrypt: %w", encErr)
-			}
-			if sealed {
-				writeBytes = ct
-				entry.Flags |= FlagEncrypted
-				entry.ValueSize = uint32(len(ct))
-			}
-		}
+		entry.Flags |= xflags
+		entry.ValueSize = uint32(len(writeBytes))
 
 		// Reserve the VLog offset atomically (non-blocking) so we can record it
 		// in the WAL entry before submitting to the WAL flusher. Both fdatasyncs
@@ -623,6 +689,13 @@ func (se *StorageEngine) Put(key string, value []byte, ttl int32) error {
 		// value is already durable in the VLog after its fdatasync completes.
 		walEntry.VLogOffset = vlogOffset
 		walEntry.Value = nil // value bytes not needed in WAL when VLogOffset is set
+		// Persist the on-disk length and transform flags. Without these the
+		// replayed IndexEntry would carry the PLAINTEXT length as ValueSize
+		// and no transform bits, so ReadValue would pull the wrong byte count
+		// and fail CRC — every compressed or encrypted key unreadable after a
+		// crash restart.
+		walEntry.DiskValueLen = uint32(len(writeBytes))
+		walEntry.XformFlags = xflags
 		walRp := se.wals[diskIdx].beginAppend(walEntry)
 		walEntryPool.Put(walEntry) // safe: serialize() consumed all fields above
 
@@ -1366,10 +1439,10 @@ func (se *StorageEngine) GetDiskStats() []DiskStat {
 	stats := make([]DiskStat, len(se.segments))
 	for i, sw := range se.segments {
 		stats[i] = DiskStat{
-			DiskIdx:       i,
-			Path:          sw.DiskPath(),
-			SegmentBytes:  sw.DiskSize(),
-			ShardsOnDisk:  numShards / len(se.segments),
+			DiskIdx:      i,
+			Path:         sw.DiskPath(),
+			SegmentBytes: sw.DiskSize(),
+			ShardsOnDisk: numShards / len(se.segments),
 		}
 	}
 	return stats

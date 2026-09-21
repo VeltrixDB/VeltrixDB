@@ -171,6 +171,8 @@ func (se *StorageEngine) multiPutKVSep(reqs []MultiPutRequest, errs []error) []e
 				shardID uint16
 				crc     uint32
 				packed  bool
+				diskLen uint32 // on-disk blob length (post compress/encrypt)
+				xflags  uint8  // FlagCompressed | FlagEncrypted
 			}
 			committed := make([]stagedEntry, 0, len(idxs))
 			walEntries := make([]*WALEntry, 0, len(idxs))
@@ -180,29 +182,44 @@ func (se *StorageEngine) multiPutKVSep(reqs []MultiPutRequest, errs []error) []e
 				if old, _, exists := se.index.get(r.Key); exists && !old.IsTombstone() && old.DiskOffset > 0 {
 					vl.MarkDead(old.ValueSize, old.IsPacked())
 				}
-				offset, err := batcher.Stage(r.Value)
+				// Same compress→encrypt pipeline as the single-key Put path.
+				// Skipping it here used to mean every batched write (MPUT, the
+				// WriteBatcher, the server's PUT coalescing) stored plaintext
+				// on disk even with --encrypt-at-rest on — silently, because
+				// FlagEncrypted is per-record so reads simply never decrypted.
+				writeBytes, xflags, xerr := se.transformForWrite(r.Value)
+				if xerr != nil {
+					errs[i] = xerr
+					continue
+				}
+				offset, isPacked, err := batcher.Stage(writeBytes)
 				if err != nil {
 					errs[i] = fmt.Errorf("vlog stage: %w", err)
 					continue
 				}
-				isPacked := vlogHeaderBytes+len(r.Value) <= vlogBlockSize
 				committed = append(committed, stagedEntry{
 					reqIdx:  i,
 					offset:  offset,
 					shardID: prep[j].shardID,
 					crc:     prep[j].crc,
 					packed:  isPacked,
+					diskLen: uint32(len(writeBytes)),
+					xflags:  xflags,
 				})
 				walEntries = append(walEntries, &WALEntry{
-					Timestamp:  nowNs,
-					Key:        r.Key,
-					KeyLen:     uint32(len(r.Key)),
-					ValueLen:   uint32(len(r.Value)),
-					Value:      nil, // value lives in VLog after Flush
-					Checksum:   prep[j].crc,
-					Version:    se.version.Add(1),
-					VLogOffset: offset,
-					Packed:     isPacked,
+					Timestamp: nowNs,
+					Key:       r.Key,
+					KeyLen:    uint32(len(r.Key)),
+					// ValueLen is the plaintext length; DiskValueLen is what
+					// actually landed in the VLog. Replay needs both.
+					ValueLen:     uint32(len(r.Value)),
+					Value:        nil, // value lives in VLog after Flush
+					Checksum:     prep[j].crc,
+					Version:      se.version.Add(1),
+					VLogOffset:   offset,
+					Packed:       isPacked,
+					DiskValueLen: uint32(len(writeBytes)),
+					XformFlags:   xflags,
 				})
 				walEntryIdx = append(walEntryIdx, i)
 			}
@@ -210,9 +227,9 @@ func (se *StorageEngine) multiPutKVSep(reqs []MultiPutRequest, errs []error) []e
 			// Phase 2: WAL appendAll and VLog Flush run concurrently.
 			// Effective fsync wait = max(WAL_fsync, VLog_fsync), not the sum.
 			var (
-				walErrs       []error
-				vlogFlushErr  error
-				phase2Wg      sync.WaitGroup
+				walErrs      []error
+				vlogFlushErr error
+				phase2Wg     sync.WaitGroup
 			)
 			if len(walEntries) > 0 {
 				phase2Wg.Add(2)
@@ -249,10 +266,12 @@ func (se *StorageEngine) multiPutKVSep(reqs []MultiPutRequest, errs []error) []e
 				}
 				r := reqs[s.reqIdx]
 				entry := &IndexEntry{
-					KeyHash:          fnv64a(r.Key),
-					DiskOffset:       uint64(s.offset),
-					SegmentID:        uint32(d),
-					ValueSize:        uint32(len(r.Value)),
+					KeyHash:    fnv64a(r.Key),
+					DiskOffset: uint64(s.offset),
+					SegmentID:  uint32(d),
+					// ValueSize is the on-disk blob (what ReadValue pulls);
+					// UncompressedSize is the plaintext the read path restores.
+					ValueSize:        s.diskLen,
 					UncompressedSize: uint32(len(r.Value)),
 					KeySize:          uint32(len(r.Key)),
 					WriteTimestampUs: nowUs,
@@ -263,6 +282,7 @@ func (se *StorageEngine) multiPutKVSep(reqs []MultiPutRequest, errs []error) []e
 				if s.packed {
 					entry.Flags |= FlagPacked
 				}
+				entry.Flags |= s.xflags
 				if r.TTL > 0 {
 					entry.Flags |= FlagHasTTL
 					entry.TTLExpiryUs = nowUs + int64(r.TTL)*1_000_000

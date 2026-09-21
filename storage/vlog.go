@@ -43,11 +43,16 @@ import (
 	"time"
 )
 
+// maxVLogRecordBytes bounds a single record's payload when the length is read
+// from an on-disk header (repair path). A header whose ValLen exceeds this is
+// treated as corruption rather than trusted into an allocation.
+const maxVLogRecordBytes = 64 << 20 // 64 MB
+
 // vhdrOff* are byte offsets within a VLog record header.
 const (
-	vhdrOffMagic   = 0
-	vhdrOffValLen  = 4
-	vhdrOffCRC     = 8
+	vhdrOffMagic  = 0
+	vhdrOffValLen = 4
+	vhdrOffCRC    = 8
 	// offset 12: Reserved (4 B)
 	vhdrOffWriteUs = 16
 )
@@ -77,7 +82,7 @@ func updateLatencyEWMA(slot *atomic.Int64, sampleNs int64) {
 type vlogFlushReq struct {
 	offset     int64      // byte offset reserved for this record (already written)
 	alignedLen int        // bytes written (for totalBytes/liveBytes accounting)
-	resp       chan error  // flusher writes the fdatasync result here
+	resp       chan error // flusher writes the fdatasync result here
 }
 
 // vlogRespPool reuses resp channels to avoid make(chan error,1) on every Append.
@@ -100,11 +105,11 @@ var vlogRespPool = sync.Pool{New: func() any { ch := make(chan error, 1); return
 // reclaim uses BLKDISCARD; everything else (offsets, alignment, magic) is
 // identical so engine code is backing-agnostic.
 type VLog struct {
-	diskIdx        int
-	diskPath       string
-	rawDevicePath  string // empty when running on a regular file backing
+	diskIdx       int
+	diskPath      string
+	rawDevicePath string // empty when running on a regular file backing
 
-	mu   sync.Mutex   // serialises WriteAt + end advance only (not fdatasync)
+	mu   sync.Mutex // serialises WriteAt + end advance only (not fdatasync)
 	file *os.File
 	end  atomic.Int64 // next free byte offset (always sector-aligned)
 
@@ -142,6 +147,12 @@ type VLog struct {
 	// requests, calls one fdatasync, and replies to all waiters.
 	flushCh chan *vlogFlushReq
 	doneCh  chan struct{}
+	// flusherDone is closed by the flusher goroutine as it returns. close()
+	// waits on it before closing the file: the flusher's shutdown branch runs
+	// one last flush() that calls fdatasync(vl.file.Fd()), so tearing the fd
+	// down first is a race on *os.File (caught by -race) and can lose or
+	// misdirect the final fdatasync.
+	flusherDone chan struct{}
 }
 
 // newVLog opens (or creates) the VLog file for a single NVMe disk.
@@ -251,6 +262,7 @@ func newVLog(diskIdx int, diskPath, rawDevicePath string, flushWindow time.Durat
 		file:          file,
 		flushCh:       make(chan *vlogFlushReq, 65536),
 		doneCh:        make(chan struct{}),
+		flusherDone:   make(chan struct{}),
 	}
 	vl.end.Store(startOffset)
 	vl.totalBytes.Store(startOffset)
@@ -476,8 +488,9 @@ func saveVLogWatermark(diskPath string, offset int64) {
 //
 // On a regular file: fallocate PUNCH_HOLE.
 // On a raw block device (rawDevicePath set): BLKDISCARD over the watermark
-//   range. Skipped entirely if rawDevicePath is set and we cannot grab
-//   exclusive ownership before newVLog runs — newVLog itself will reapply.
+//
+//	range. Skipped entirely if rawDevicePath is set and we cannot grab
+//	exclusive ownership before newVLog runs — newVLog itself will reapply.
 //
 // This is a best-effort operation: errors are silently ignored so a missing
 // VLog or an unsupported filesystem never blocks engine startup.
@@ -607,6 +620,7 @@ func (vl *VLog) DiskPath() string { return vl.diskPath }
 
 func (vl *VLog) close() error {
 	close(vl.doneCh)
+	<-vl.flusherDone // final flush must finish before the fd goes away
 	vl.mu.Lock()
 	defer vl.mu.Unlock()
 	return vl.file.Close()
@@ -618,6 +632,7 @@ func (vl *VLog) close() error {
 // fdatasync, then reply to every waiter.  window is the maximum time to
 // wait for more requests to arrive before flushing (matches WALFlushWindowMs).
 func (vl *VLog) flusher(window time.Duration) {
+	defer close(vl.flusherDone)
 	pending := make([]*vlogFlushReq, 0, 4096)
 
 	flush := func() {
@@ -708,9 +723,9 @@ func (vl *VLog) flusher(window time.Duration) {
 //
 // Layout of a packed 4 KB block, 26 × 152 B records:
 //
-//   [hdr|val][hdr|val][hdr|val]...[hdr|val][72 B internal pad]
-//    24+128   24+128   24+128      24+128
-//      pos 0     152      304        3800
+//	[hdr|val][hdr|val][hdr|val]...[hdr|val][72 B internal pad]
+//	 24+128   24+128   24+128      24+128
+//	   pos 0     152      304        3800
 //
 // The IndexEntry.DiskOffset for each packed record is `blockOffset + pos`
 // (NOT 4 KB-aligned). ReadValue already rounds DOWN to 4 KB and extracts at
@@ -729,9 +744,9 @@ func (vl *VLog) flusher(window time.Duration) {
 // Usage:
 //
 //	b := vl.NewBatcher()
-//	off1, _ := b.Stage(val1)   // → e.g. blockOff + 0
-//	off2, _ := b.Stage(val2)   // → e.g. blockOff + 152
-//	off3, _ := b.Stage(val3)   // → e.g. blockOff + 304
+//	off1, packed1, _ := b.Stage(val1)   // → e.g. blockOff + 0
+//	off2, packed2, _ := b.Stage(val2)   // → e.g. blockOff + 152
+//	off3, packed3, _ := b.Stage(val3)   // → e.g. blockOff + 304
 //	b.Flush()                  // single fdatasync covers all 3
 type VLogBatcher struct {
 	vl     *VLog
@@ -774,20 +789,21 @@ func (vl *VLog) NewBatcher() *VLogBatcher {
 // Stage assembles a record into the current packed block (or starts a new
 // block if it doesn't fit) but does NOT write to disk yet. Returns the offset
 // the record WILL occupy after Flush() — this offset is intra-block (not
-// 4 KB-aligned) when the block is shared with other records.
+// 4 KB-aligned) when the block is shared with other records — and whether the
+// record was in fact packed.
 //
-// Callers MUST set IndexEntry.Flags |= FlagPacked on entries built from these
-// offsets — without that flag, MarkDead later subtracts a full 4 KB instead
-// of just header+value bytes (corrupting GCRatio accounting).
-//
-// Records larger than vlogBlockSize fall back to the unpacked path: their own
-// 4 KB-aligned block sized to fit. The caller in that case should NOT set
-// FlagPacked. Today this never happens because every key fits comfortably
-// (header 24 B + value ≤ 4 K - 24 = 4072 B ⇒ values up to ~4 KB pack fine).
-func (b *VLogBatcher) Stage(value []byte) (int64, error) {
+// Callers MUST propagate the returned packed bool to IndexEntry.Flags
+// (FlagPacked) verbatim. Do not recompute it: a record larger than
+// vlogBlockSize silently falls back to the unpacked path, and labelling such a
+// record packed makes MarkDead subtract header+value instead of the full
+// aligned block, permanently inflating liveBytes and making GCRatio
+// under-report garbage. Do not infer it from offset alignment either — the
+// first packed record in a block sits at a 4 KB-aligned offset.
+func (b *VLogBatcher) Stage(value []byte) (offset int64, packed bool, err error) {
 	rawLen := vlogHeaderBytes + len(value)
 	if rawLen > vlogBlockSize {
-		return b.stageOversized(value)
+		off, serr := b.stageOversized(value)
+		return off, false, serr
 	}
 
 	// Try to fit into the last (open) block.
@@ -821,7 +837,7 @@ func (b *VLogBatcher) Stage(value []byte) (int64, error) {
 	copy(blk.buf[pos+vlogHeaderBytes:], value)
 	blk.used += rawLen
 	b.rawLive += int64(rawLen)
-	return blk.offset + int64(pos), nil
+	return blk.offset + int64(pos), true, nil
 }
 
 // stageOversized handles a record whose raw size exceeds vlogBlockSize. It
@@ -907,4 +923,67 @@ func (b *VLogBatcher) release() {
 	}
 	b.blocks = b.blocks[:0]
 	b.rawLive = 0
+}
+
+// readRecordAtOffset reads the VLog record at offset, taking the payload
+// length from the record header rather than from the caller.
+//
+// ReadValue takes the length from IndexEntry.ValueSize, which is precisely the
+// field the repair tool cannot trust — a record whose metadata lost its
+// transform info has a ValueSize that disagrees with what is on disk. The
+// header's own ValLen is authoritative, so this is the read the repair path
+// must use.
+//
+// Returns the payload bytes (a copy) and the CRC32C stored in the header. The
+// caller is responsible for validating the CRC; this does not, because a
+// mismatch is diagnostic information the repair tool wants to report rather
+// than an error to abort on.
+func (vl *VLog) readRecordAtOffset(offset int64) (payload []byte, storedCRC uint32, err error) {
+	alignedOffset := offset &^ (int64(vlogBlockSize) - 1)
+	intraBlock := int(offset - alignedOffset)
+
+	// Phase 1: pull one block and parse the header. A packed record always
+	// fits entirely inside its 4 KB block, so the 24-byte header can never
+	// straddle the boundary — one block is always enough to read it.
+	hdrBuf := vlogIOPool.get(vlogBlockSize)
+	if _, rerr := vl.file.ReadAt(hdrBuf[:vlogBlockSize], alignedOffset); rerr != nil {
+		vlogIOPool.put(hdrBuf)
+		return nil, 0, fmt.Errorf("disk %d vlog header read at %d: %w", vl.diskIdx, offset, rerr)
+	}
+	if intraBlock+vlogHeaderBytes > vlogBlockSize {
+		vlogIOPool.put(hdrBuf)
+		return nil, 0, fmt.Errorf("disk %d: vlog header straddles block boundary at offset %d", vl.diskIdx, offset)
+	}
+	hdr := hdrBuf[intraBlock:]
+	if magic := binary.LittleEndian.Uint32(hdr[vhdrOffMagic:]); magic != vlogMagic {
+		vlogIOPool.put(hdrBuf)
+		return nil, 0, fmt.Errorf("disk %d: vlog bad magic 0x%08x at offset %d", vl.diskIdx, magic, offset)
+	}
+	valLen := int(binary.LittleEndian.Uint32(hdr[vhdrOffValLen:]))
+	storedCRC = binary.LittleEndian.Uint32(hdr[vhdrOffCRC:])
+	if valLen < 0 || valLen > maxVLogRecordBytes {
+		vlogIOPool.put(hdrBuf)
+		return nil, 0, fmt.Errorf("disk %d: implausible vlog valLen=%d at offset %d", vl.diskIdx, valLen, offset)
+	}
+
+	// Phase 2: if the payload fits in the block we already read, copy it out.
+	end := intraBlock + vlogHeaderBytes + valLen
+	if end <= vlogBlockSize {
+		out := make([]byte, valLen)
+		copy(out, hdrBuf[intraBlock+vlogHeaderBytes:end])
+		vlogIOPool.put(hdrBuf)
+		return out, storedCRC, nil
+	}
+	vlogIOPool.put(hdrBuf)
+
+	// Oversized record: re-read the full aligned span.
+	readSize := (end + vlogBlockSize - 1) &^ (vlogBlockSize - 1)
+	buf := vlogIOPool.get(readSize)
+	defer vlogIOPool.put(buf)
+	if _, rerr := vl.file.ReadAt(buf[:readSize], alignedOffset); rerr != nil {
+		return nil, 0, fmt.Errorf("disk %d vlog payload read at %d: %w", vl.diskIdx, offset, rerr)
+	}
+	out := make([]byte, valLen)
+	copy(out, buf[intraBlock+vlogHeaderBytes:end])
+	return out, storedCRC, nil
 }

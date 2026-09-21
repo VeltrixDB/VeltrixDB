@@ -45,10 +45,15 @@ var walRespPool = sync.Pool{
 //	per window period — measured P99 drops from ~122 ms to ~10 ms at low
 //	concurrency and sub-5 ms at ≥8 concurrent writers.
 type WriteAheadLog struct {
-	file           *os.File
-	walPath        string        // absolute path to wal.log (used for truncation on clean close)
-	appendCh       chan *walItem
-	doneCh         chan struct{}
+	file     *os.File
+	walPath  string // absolute path to wal.log (used for truncation on clean close)
+	appendCh chan *walItem
+	doneCh   chan struct{}
+	// flusherDone is closed by the flusher goroutine as it returns. close()
+	// waits on it before closing the file: the flusher's shutdown branch
+	// writes and fdatasyncs one final batch, so closing the fd first races
+	// with it and would fail those writes with "file already closed".
+	flusherDone    chan struct{}
 	walFlushes     *atomic.Uint64 // pointer into StorageMetrics
 	bytesWritten   atomic.Uint64
 	entriesWritten atomic.Uint64
@@ -59,9 +64,9 @@ type WriteAheadLog struct {
 	// existing file size at open (pre-existing content is durable by
 	// definition) and advanced by the flusher AFTER each successful fdatasync.
 	durableBytes atomic.Int64
-	flushWindow    time.Duration // 0 = flush immediately after channel drain
-	maxBatch       int           // max entries per flush (safety cap)
-	diskIdx        int           // for log prefixes
+	flushWindow  time.Duration // 0 = flush immediately after channel drain
+	maxBatch     int           // max entries per flush (safety cap)
+	diskIdx      int           // for log prefixes
 }
 
 type walItem struct {
@@ -97,6 +102,7 @@ func newWriteAheadLog(
 		walPath:     walPath,
 		appendCh:    make(chan *walItem, 4096),
 		doneCh:      make(chan struct{}),
+		flusherDone: make(chan struct{}),
 		walFlushes:  walFlushes,
 		flushWindow: flushWindow,
 		maxBatch:    maxBatch,
@@ -169,8 +175,8 @@ func (wal *WriteAheadLog) serialize(entry *WALEntry) []byte {
 	bufPtr := serializeBufPool.Get().(*[]byte)
 	buf := (*bufPtr)[:0]
 
-	// Header: timestamp|tombstone|key|valueLen|crc32hex|version|vlogOffset|packed\n
-	// 8-field format. vlogOffset=0 means value bytes follow on the next line
+	// Header: timestamp|tombstone|key|valueLen|crc32hex|version|vlogOffset|packed|diskLen|xflags\n
+	// 10-field format. vlogOffset=0 means value bytes follow on the next line
 	// (non-KV-sep mode or old-format compatibility). vlogOffset>0 means the
 	// value is already durable in the VLog at that offset — no value bytes here.
 	// packed='1' means the VLog record at vlogOffset shares its 4 KB block
@@ -178,6 +184,15 @@ func (wal *WriteAheadLog) serialize(entry *WALEntry) []byte {
 	// 4 KB block (legacy unpacked layout). Replay restores FlagPacked from
 	// this field. Old 7-field WAL records are still parsed (packed defaults
 	// to false).
+	//
+	// diskLen is the on-disk blob length (post-compression, post-encryption)
+	// and xflags (hex) carries FlagCompressed|FlagEncrypted. valueLen stays
+	// the PLAINTEXT length. Replay needs all three to rebuild an IndexEntry
+	// whose ValueSize matches what ReadValue must pull off disk and whose
+	// flags tell the read path to decrypt/decompress. Records written before
+	// these fields existed parse with diskLen=valueLen and xflags=0, which is
+	// correct for them: they were written by a build that stored values
+	// untransformed on this path.
 	buf = strconv.AppendInt(buf, entry.Timestamp, 10)
 	buf = append(buf, '|')
 	if entry.IsTombstone {
@@ -201,6 +216,14 @@ func (wal *WriteAheadLog) serialize(entry *WALEntry) []byte {
 	} else {
 		buf = append(buf, '0')
 	}
+	buf = append(buf, '|')
+	diskLen := entry.DiskValueLen
+	if diskLen == 0 {
+		diskLen = entry.ValueLen // no transform applied — on-disk == plaintext
+	}
+	buf = strconv.AppendUint(buf, uint64(diskLen), 10)
+	buf = append(buf, '|')
+	buf = strconv.AppendUint(buf, uint64(entry.XformFlags), 16)
 	buf = append(buf, '\n')
 
 	var result []byte
@@ -233,6 +256,7 @@ func (wal *WriteAheadLog) serialize(entry *WALEntry) []byte {
 //   - Same drain-then-flush as the original implementation.
 //   - Still batches concurrent writers; just no deliberate wait.
 func (wal *WriteAheadLog) flusher() {
+	defer close(wal.flusherDone)
 	pending := make([]*walItem, 0, 1024)
 
 	flush := func() {
@@ -365,6 +389,7 @@ func (wal *WriteAheadLog) GetStats() (bytesWritten, entriesWritten uint64) {
 
 func (wal *WriteAheadLog) close() error {
 	close(wal.doneCh)
+	<-wal.flusherDone // final batch must land before the fd goes away
 	return wal.file.Close()
 }
 
