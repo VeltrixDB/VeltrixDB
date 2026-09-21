@@ -99,15 +99,15 @@ func Configure(c Configuration) {
 
 // completedSpan is the on-record-buffer struct.
 type completedSpan struct {
-	Service        string         `json:"service"`
-	Name           string         `json:"name"`
-	TraceID        string         `json:"trace_id"`
-	SpanID         string         `json:"span_id"`
-	ParentSpanID   string         `json:"parent_span_id,omitempty"`
-	StartUnixNano  int64          `json:"start_unix_ns"`
-	DurationNs     int64          `json:"duration_ns"`
-	StatusError    string         `json:"error,omitempty"`
-	Attributes     map[string]any `json:"attrs,omitempty"`
+	Service       string         `json:"service"`
+	Name          string         `json:"name"`
+	TraceID       string         `json:"trace_id"`
+	SpanID        string         `json:"span_id"`
+	ParentSpanID  string         `json:"parent_span_id,omitempty"`
+	StartUnixNano int64          `json:"start_unix_ns"`
+	DurationNs    int64          `json:"duration_ns"`
+	StatusError   string         `json:"error,omitempty"`
+	Attributes    map[string]any `json:"attrs,omitempty"`
 }
 
 // span is the concrete in-flight implementation.

@@ -37,8 +37,8 @@ type mockEngine struct {
 
 func newMockEngine() *mockEngine {
 	m := &mockEngine{
-		indexSize: 42,
-		metrics:   &storage.StorageMetrics{},
+		indexSize:   42,
+		metrics:     &storage.StorageMetrics{},
 		subscribeCh: make(chan storage.CDCEvent, 4),
 	}
 	// Initialise all atomic fields so nil-pointer panics can't happen.
@@ -50,17 +50,17 @@ func newMockEngine() *mockEngine {
 	return m
 }
 
-func (me *mockEngine) GetIndexSize() int                     { return me.indexSize }
-func (me *mockEngine) GetCacheStats() storage.CacheStats     { return me.cacheStats }
-func (me *mockEngine) GetVLogStats() []storage.VLogStats     { return me.vlogStats }
-func (me *mockEngine) GetMetrics() *storage.StorageMetrics   { return me.metrics }
-func (me *mockEngine) GetWALTotals() (uint64, uint64)        { return me.walBytes, me.walEntries }
-func (me *mockEngine) Checkpoint() error                     { return me.checkpointErr }
-func (me *mockEngine) ListNamespaces() []storage.NSInfo      { return me.namespaces }
-func (me *mockEngine) QuotaStats() []storage.QuotaSnapshot   { return me.quotaSnapshots }
+func (me *mockEngine) GetIndexSize() int                                     { return me.indexSize }
+func (me *mockEngine) GetCacheStats() storage.CacheStats                     { return me.cacheStats }
+func (me *mockEngine) GetVLogStats() []storage.VLogStats                     { return me.vlogStats }
+func (me *mockEngine) GetMetrics() *storage.StorageMetrics                   { return me.metrics }
+func (me *mockEngine) GetWALTotals() (uint64, uint64)                        { return me.walBytes, me.walEntries }
+func (me *mockEngine) Checkpoint() error                                     { return me.checkpointErr }
+func (me *mockEngine) ListNamespaces() []storage.NSInfo                      { return me.namespaces }
+func (me *mockEngine) QuotaStats() []storage.QuotaSnapshot                   { return me.quotaSnapshots }
 func (me *mockEngine) SetNamespaceLimit(ns string, limit storage.QuotaLimit) {}
-func (me *mockEngine) MigrateAll() (int, int)                { return me.migratedCount, me.migrateErrCnt }
-func (me *mockEngine) CDCStats() (uint64, uint64, int)       { return me.cdcTotal, me.cdcDropped, me.cdcSubs }
+func (me *mockEngine) MigrateAll() (int, int)                                { return me.migratedCount, me.migrateErrCnt }
+func (me *mockEngine) CDCStats() (uint64, uint64, int)                       { return me.cdcTotal, me.cdcDropped, me.cdcSubs }
 func (me *mockEngine) ChangesSince(since int64, limit int) storage.ChangesSinceResult {
 	return storage.ChangesSinceResult{Cursor: since}
 }
@@ -181,10 +181,10 @@ func TestQuotas_GET(t *testing.T) {
 
 func TestQuotas_POST(t *testing.T) {
 	form := url.Values{
-		"ns":            []string{"myns"},
+		"ns":             []string{"myns"},
 		"writes_per_sec": []string{"50"},
-		"burst":         []string{"100"},
-		"max_keys":      []string{"1000"},
+		"burst":          []string{"100"},
+		"max_keys":       []string{"1000"},
 	}
 	rec := do(t, newRouter(newMockEngine()), http.MethodPost, "/admin/quotas", form.Encode())
 	if rec.Code != http.StatusOK {

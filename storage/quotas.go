@@ -46,16 +46,16 @@ type QuotaLimit struct {
 // counts (rebuilt by the WAL replay walking the index).
 type QuotaManager struct {
 	mu     sync.RWMutex
-	limits map[string]*QuotaLimit  // ns → limit
-	state  map[string]*quotaState  // ns → live state
+	limits map[string]*QuotaLimit // ns → limit
+	state  map[string]*quotaState // ns → live state
 }
 
 type quotaState struct {
 	keyCount atomic.Int64
 
-	bktMu     sync.Mutex
-	tokens    float64
-	lastFill  time.Time
+	bktMu    sync.Mutex
+	tokens   float64
+	lastFill time.Time
 }
 
 // NewQuotaManager creates an empty manager.

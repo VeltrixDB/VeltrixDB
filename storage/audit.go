@@ -57,12 +57,12 @@ type AuditLog struct {
 	ch      chan AuditRecord
 	dropped *atomic.Uint64
 
-	mu       sync.Mutex
-	f        *os.File
-	enc      *json.Encoder
+	mu        sync.Mutex
+	f         *os.File
+	enc       *json.Encoder
 	syncEvery time.Duration
-	stop     chan struct{}
-	done     chan struct{}
+	stop      chan struct{}
+	done      chan struct{}
 }
 
 // NewAuditLog opens (or creates) path and starts the background writer.

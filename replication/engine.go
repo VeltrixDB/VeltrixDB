@@ -65,7 +65,7 @@ const (
 type ReplicaState int
 
 const (
-	ReplicaStateSync    ReplicaState = iota
+	ReplicaStateSync ReplicaState = iota
 	ReplicaStateSync_Pending
 	ReplicaStateLag
 	ReplicaStateFailed
@@ -187,15 +187,15 @@ type ReplicaTransport interface {
 // under RLock, writes under Lock).  The atomic fields are safe to touch
 // without the engine lock.
 type ReplicaInfo struct {
-	NodeID         string
-	Address        string
-	Port           int
-	State          ReplicaState
-	LastAckSeqNum  uint64
-	LagBytes       atomic.Uint64
-	LagNs          atomic.Int64
-	FailureCount   atomic.Uint64
-	SyncedAt       int64
+	NodeID        string
+	Address       string
+	Port          int
+	State         ReplicaState
+	LastAckSeqNum uint64
+	LagBytes      atomic.Uint64
+	LagNs         atomic.Int64
+	FailureCount  atomic.Uint64
+	SyncedAt      int64
 }
 
 // NewReplicationEngine creates a new replication engine
@@ -379,7 +379,7 @@ func (re *ReplicationEngine) WaitForReplication(seqNum uint64, targetReplicas in
 func (re *ReplicationEngine) GetReplicaLag() map[string]ReplicaLagInfo {
 	re.mu.RLock()
 	defer re.mu.RUnlock()
-	
+
 	lag := make(map[string]ReplicaLagInfo)
 	for nodeID, replica := range re.replicaStates {
 		lag[nodeID] = ReplicaLagInfo{
@@ -424,26 +424,26 @@ func (rs ReplicaState) String() string {
 func (re *ReplicationEngine) backgroundReplicationWorker() {
 	ticker := time.NewTicker(time.Duration(re.config.FlushIntervalMs) * time.Millisecond)
 	defer ticker.Stop()
-	
+
 	batch := make([]*WriteOperation, 0, re.config.BatchSize)
-	
+
 	for {
 		select {
 		case <-re.done:
 			return
 		case op := <-re.writeQueue:
 			batch = append(batch, op)
-			
+
 			// Store pending write
 			re.mu.Lock()
 			re.pendingWrites[op.SeqNum] = op
 			re.mu.Unlock()
-			
+
 			if len(batch) >= re.config.BatchSize {
 				re.replicateBatch(batch)
 				batch = make([]*WriteOperation, 0, re.config.BatchSize)
 			}
-		
+
 		case <-ticker.C:
 			if len(batch) > 0 {
 				re.replicateBatch(batch)
@@ -669,7 +669,7 @@ func (re *ReplicationEngine) sendReplicationRPC(replica *ReplicaInfo, ops []*Wri
 func (re *ReplicationEngine) backgroundAntiEntropyWorker() {
 	ticker := time.NewTicker(re.config.AntiEntropyInterval)
 	defer ticker.Stop()
-	
+
 	for {
 		select {
 		case <-re.done:
@@ -691,7 +691,7 @@ func (re *ReplicationEngine) runAntiEntropy() {
 		}
 	}
 	re.mu.Unlock()
-	
+
 	for _, replica := range replicas {
 		// Find operations that haven't been synced to this replica
 		re.mu.RLock()
@@ -702,7 +702,7 @@ func (re *ReplicationEngine) runAntiEntropy() {
 			}
 		}
 		re.mu.RUnlock()
-		
+
 		if len(pendingOps) > 0 {
 			// sendToReplica records ack progress so a caught-up replica
 			// transitions back to ReplicaStateSync.
@@ -715,7 +715,7 @@ func (re *ReplicationEngine) runAntiEntropy() {
 func (re *ReplicationEngine) backgroundLagMonitor() {
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
-	
+
 	for {
 		select {
 		case <-re.done:
@@ -785,7 +785,7 @@ func (vv *VersionVector) HappenedBefore(other *VersionVector) bool {
 	other.mu.RLock()
 	defer vv.mu.RUnlock()
 	defer other.mu.RUnlock()
-	
+
 	atLeastOneLess := false
 	for node := range vv.Clock {
 		if vv.Clock[node] > other.Clock[node] {
@@ -804,11 +804,11 @@ func (vv *VersionVector) Concurrent(other *VersionVector) bool {
 	other.mu.RLock()
 	defer vv.mu.RUnlock()
 	defer other.mu.RUnlock()
-	
+
 	// Check if neither happens-before the other
 	vvLess := false
 	otherLess := false
-	
+
 	for node := range vv.Clock {
 		if vv.Clock[node] < other.Clock[node] {
 			vvLess = true
@@ -816,6 +816,6 @@ func (vv *VersionVector) Concurrent(other *VersionVector) bool {
 			otherLess = true
 		}
 	}
-	
+
 	return vvLess && otherLess
 }

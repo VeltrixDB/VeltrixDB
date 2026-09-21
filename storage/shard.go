@@ -373,7 +373,8 @@ func (si *shardedIndex) vlogCandidates(diskIdx, numDisks int, gcHorizon uint64) 
 // were re-appended on replay). When in doubt, we round up — never down.
 //
 // alignedSize must match the encoding used by VLog.beginAppend:
-//   alignedLen = (vlogHeaderBytes + valueSize + vlogBlockSize-1) &^ (vlogBlockSize-1)
+//
+//	alignedLen = (vlogHeaderBytes + valueSize + vlogBlockSize-1) &^ (vlogBlockSize-1)
 //
 // Returns 0 when no entries reference diskIdx (fresh device).
 func (si *shardedIndex) maxVLogEndOffset(diskIdx, numDisks int) uint64 {

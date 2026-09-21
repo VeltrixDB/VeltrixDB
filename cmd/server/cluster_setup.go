@@ -107,10 +107,10 @@ type clusterParams struct {
 	peers       []peerSpec
 
 	// inter-node TLS
-	tlsCert  string
-	tlsKey   string
-	tlsCA    string
-	mutual   bool
+	tlsCert string
+	tlsKey  string
+	tlsCA   string
+	mutual  bool
 }
 
 // buildCoordinator constructs the coordinator for raft/replicated mode and

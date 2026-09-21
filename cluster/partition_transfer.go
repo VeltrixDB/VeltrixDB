@@ -96,14 +96,15 @@ type TransferAgent struct {
 	done        chan struct{}
 	// transferAddr is the "<host>:port" this node listens on for inbound transfers.
 	transferAddr string
-	scheme       string       // "http" or "https"
+	scheme       string // "http" or "https"
 	tlsEnabled   bool
 	boundAddr    atomic.Value // string; actual listen address, set by Start (useful with ":0")
 }
 
 // NewTransferAgent creates a plaintext TransferAgent.
-//   listenAddr   — ":9100" or "0.0.0.0:9100"; the HTTP server address for receiving keys
-//   transferAddr — the advertised "<host>:<port>" that OTHER nodes dial to reach this node
+//
+//	listenAddr   — ":9100" or "0.0.0.0:9100"; the HTTP server address for receiving keys
+//	transferAddr — the advertised "<host>:<port>" that OTHER nodes dial to reach this node
 func NewTransferAgent(pm *PartitionMap, localNodeID string, store LocalStore, listenAddr string) *TransferAgent {
 	ta, err := NewTransferAgentTLS(pm, localNodeID, store, listenAddr, nil)
 	if err != nil {
@@ -356,7 +357,7 @@ func (ta *TransferAgent) MigrateToNewOwners() error {
 	return firstErr
 }
 
-const transferConnRetries = 3         // attempts on "connection refused" before giving up
+const transferConnRetries = 3 // attempts on "connection refused" before giving up
 const transferConnRetryDelay = 100 * time.Millisecond
 
 // sendBatches sends kvs to nodeID in batches.  Returns (number successfully

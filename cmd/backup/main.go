@@ -1,56 +1,59 @@
 // veltrixdb-backup — offline backup and restore tool for VeltrixDB.
 //
 // Usage:
-//   veltrixdb-backup full         --data-dirs=<dirs> --dest=<dir>
-//   veltrixdb-backup incremental  --data-dirs=<dirs> --dest=<dir> --base=<dir>
-//   veltrixdb-backup restore      --chain=<dir1,dir2,...> --data-dirs=<dirs>
-//   veltrixdb-backup archive-status --archive=<dir>
-//   veltrixdb-backup restore-pitr --base-backup=<dir> --archive=<dir> --until=<RFC3339|version:N> --data=<dirs>
-//   veltrixdb-backup upload       --src=<local-backup-dir> --provider=s3|gcs|azure --bucket=<bucket> [cloud flags]
-//   veltrixdb-backup download     --cloud-path=<prefix> --dest=<local-dir> --provider=... [cloud flags]
-//   veltrixdb-backup list-cloud   --provider=... --bucket=<bucket> [cloud flags]
-//   veltrixdb-backup full-cloud   --data-dirs=<dirs> --provider=... --bucket=<bucket> [cloud flags]
+//
+//	veltrixdb-backup full         --data-dirs=<dirs> --dest=<dir>
+//	veltrixdb-backup incremental  --data-dirs=<dirs> --dest=<dir> --base=<dir>
+//	veltrixdb-backup restore      --chain=<dir1,dir2,...> --data-dirs=<dirs>
+//	veltrixdb-backup archive-status --archive=<dir>
+//	veltrixdb-backup restore-pitr --base-backup=<dir> --archive=<dir> --until=<RFC3339|version:N> --data=<dirs>
+//	veltrixdb-backup upload       --src=<local-backup-dir> --provider=s3|gcs|azure --bucket=<bucket> [cloud flags]
+//	veltrixdb-backup download     --cloud-path=<prefix> --dest=<local-dir> --provider=... [cloud flags]
+//	veltrixdb-backup list-cloud   --provider=... --bucket=<bucket> [cloud flags]
+//	veltrixdb-backup full-cloud   --data-dirs=<dirs> --provider=... --bucket=<bucket> [cloud flags]
 //
 // Examples:
-//   # Full backup of a single-disk server:
-//   veltrixdb-backup full --data-dirs=/data --dest=/backup/full-2026-05-02
 //
-//   # Upload a local backup to S3:
-//   veltrixdb-backup upload \
-//       --src=/backup/full-2026-05-02 \
-//       --provider=s3 --bucket=my-veltrix-backups --region=us-east-1
+//	# Full backup of a single-disk server:
+//	veltrixdb-backup full --data-dirs=/data --dest=/backup/full-2026-05-02
 //
-//   # Full backup straight to GCS in one step:
-//   veltrixdb-backup full-cloud \
-//       --data-dirs=/data \
-//       --provider=gcs --bucket=my-bucket --gcs-cred-file=/sa.json
+//	# Upload a local backup to S3:
+//	veltrixdb-backup upload \
+//	    --src=/backup/full-2026-05-02 \
+//	    --provider=s3 --bucket=my-veltrix-backups --region=us-east-1
 //
-//   # Download from Azure and restore:
-//   veltrixdb-backup download \
-//       --provider=azure --bucket=my-container \
-//       --cloud-path=backups/full-2026-05-02 \
-//       --dest=/tmp/restored
-//   veltrixdb-backup restore --chain=/tmp/restored --data-dirs=/data-new
+//	# Full backup straight to GCS in one step:
+//	veltrixdb-backup full-cloud \
+//	    --data-dirs=/data \
+//	    --provider=gcs --bucket=my-bucket --gcs-cred-file=/sa.json
 //
-//   # List all cloud backups:
-//   veltrixdb-backup list-cloud --provider=s3 --bucket=my-bucket --region=us-east-1
+//	# Download from Azure and restore:
+//	veltrixdb-backup download \
+//	    --provider=azure --bucket=my-container \
+//	    --cloud-path=backups/full-2026-05-02 \
+//	    --dest=/tmp/restored
+//	veltrixdb-backup restore --chain=/tmp/restored --data-dirs=/data-new
 //
-//   # Inspect the PITR WAL archive (segments, version + time coverage):
-//   veltrixdb-backup archive-status --archive=/backup/wal-archive
+//	# List all cloud backups:
+//	veltrixdb-backup list-cloud --provider=s3 --bucket=my-bucket --region=us-east-1
 //
-//   # Point-in-time restore: base full backup + archived WAL up to a moment
-//   # (engine must be stopped; --data must be fresh, empty directories):
-//   veltrixdb-backup restore-pitr \
-//       --base-backup=/backup/full-2026-05-02 \
-//       --archive=/backup/wal-archive \
-//       --until=2026-05-02T14:30:00Z \
-//       --data=/data-new
-//   # ...or exact to a single write:  --until=version:123456
+//	# Inspect the PITR WAL archive (segments, version + time coverage):
+//	veltrixdb-backup archive-status --archive=/backup/wal-archive
+//
+//	# Point-in-time restore: base full backup + archived WAL up to a moment
+//	# (engine must be stopped; --data must be fresh, empty directories):
+//	veltrixdb-backup restore-pitr \
+//	    --base-backup=/backup/full-2026-05-02 \
+//	    --archive=/backup/wal-archive \
+//	    --until=2026-05-02T14:30:00Z \
+//	    --data=/data-new
+//	# ...or exact to a single write:  --until=version:123456
 //
 // Cloud auth (env vars override flags):
-//   S3:    AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION, AWS_SESSION_TOKEN
-//   GCS:   GOOGLE_APPLICATION_CREDENTIALS (service account file) or GCS_ACCESS_TOKEN
-//   Azure: AZURE_STORAGE_ACCOUNT, AZURE_STORAGE_KEY, AZURE_STORAGE_CONTAINER
+//
+//	S3:    AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION, AWS_SESSION_TOKEN
+//	GCS:   GOOGLE_APPLICATION_CREDENTIALS (service account file) or GCS_ACCESS_TOKEN
+//	Azure: AZURE_STORAGE_ACCOUNT, AZURE_STORAGE_KEY, AZURE_STORAGE_CONTAINER
 //
 // The engine must be STOPPED before running restore.
 // Full and incremental backups are safe to run against a live engine.

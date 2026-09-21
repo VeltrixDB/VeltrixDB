@@ -110,9 +110,9 @@ func (l *LocalFSColdTier) Name() string { return "local-fs:" + l.root }
 // ── Engine wiring ───────────────────────────────────────────────────────────
 
 var (
-	tierMu      sync.RWMutex
-	globalTier  ColdTier
-	tierStats   tieredCounters
+	tierMu     sync.RWMutex
+	globalTier ColdTier
+	tierStats  tieredCounters
 )
 
 type tieredCounters struct {
@@ -173,10 +173,10 @@ func GetColdTier(handle string) ([]byte, error) {
 
 // TieredStats exposes counters for monitoring.
 type TieredStats struct {
-	Backend     string
-	Demotions   uint64
-	HitCount    uint64
-	MissCount   uint64
+	Backend   string
+	Demotions uint64
+	HitCount  uint64
+	MissCount uint64
 }
 
 // GetTieredStats snapshots the counters.
@@ -216,9 +216,9 @@ func (se *StorageEngine) GetTieredStats() TieredStats {
 // Rate-limited at demotionMBPerSec to avoid competing with GC or reads.
 
 const (
-	demotionMBPerSec         = 20                     // max demotion throughput MB/s
-	demotionCandidateCap     = 4096                   // max keys inspected per pass
-	demotionColdAgeThreshold = 5 * time.Minute        // minimum idle time before demotion
+	demotionMBPerSec         = 20              // max demotion throughput MB/s
+	demotionCandidateCap     = 4096            // max keys inspected per pass
+	demotionColdAgeThreshold = 5 * time.Minute // minimum idle time before demotion
 )
 
 // DemotionCandidate is produced by the LIRS cache eviction path and consumed

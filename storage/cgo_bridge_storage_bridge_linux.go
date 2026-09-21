@@ -37,10 +37,10 @@ func newCGOStorageBridge(numDisks int, sqPoll bool) *cgoStorageBridge {
 	}
 
 	cfg := C.BridgeConfig{
-		num_disks:         C.int(numDisks),
-		ring_depth:        C.int(1024),
-		sq_poll_idle_ms:   C.uint(2000),
-		fixed_buf_size:    C.uint64_t(4096),
+		num_disks:           C.int(numDisks),
+		ring_depth:          C.int(1024),
+		sq_poll_idle_ms:     C.uint(2000),
+		fixed_buf_size:      C.uint64_t(4096),
 		fixed_bufs_per_ring: C.uint64_t(256),
 	}
 	if sqPoll {
@@ -111,11 +111,11 @@ func (b *cgoStorageBridge) submitVLogBatch(fd, diskIdx int, staged []stagedRecor
 		// has a raw pointer to its backing array.
 		pinner.Pin(&rec.buf[0])
 
-		reqSlice[i].disk_idx    = C.int(diskIdx)
-		reqSlice[i].fd          = C.int(fd)
+		reqSlice[i].disk_idx = C.int(diskIdx)
+		reqSlice[i].fd = C.int(fd)
 		reqSlice[i].file_offset = C.uint64_t(uint64(rec.offset))
-		reqSlice[i].data        = unsafe.Pointer(&rec.buf[0])
-		reqSlice[i].len         = C.uint(uint32(rec.alignedSz))
+		reqSlice[i].data = unsafe.Pointer(&rec.buf[0])
+		reqSlice[i].len = C.uint(uint32(rec.alignedSz))
 		// kNoFixedBuf = UINT32_MAX: buffer is from ioPool, not from the
 		// bridge's registered fixed-buffer pool.  io_uring_prep_write is
 		// used (correct, just without pre-registered DMA mapping).  Still
@@ -134,8 +134,8 @@ func (b *cgoStorageBridge) bridgeStats() (submits, completions, errors uint64) {
 	if b == nil || b.handle == nil {
 		return
 	}
-	submits     = uint64(C.veltrix_bridge_total_submits(b.handle))
+	submits = uint64(C.veltrix_bridge_total_submits(b.handle))
 	completions = uint64(C.veltrix_bridge_total_completions(b.handle))
-	errors      = uint64(C.veltrix_bridge_total_errors(b.handle))
+	errors = uint64(C.veltrix_bridge_total_errors(b.handle))
 	return
 }

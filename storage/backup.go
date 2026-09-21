@@ -55,11 +55,11 @@ const (
 
 // DiskBackupMeta holds per-disk metadata stored in the manifest.
 type DiskBackupMeta struct {
-	DiskIdx        int    `json:"disk_idx"`
-	WALFile        string `json:"wal_file"`         // relative path inside backup dir
-	VLogFile       string `json:"vlog_file"`        // relative path; "vlog_delta.dat" for incr
-	VLogStartOff   int64  `json:"vlog_start_off"`   // byte offset in original VLog (0 for full)
-	VLogEndOff     int64  `json:"vlog_end_off"`     // byte offset in original VLog
+	DiskIdx      int    `json:"disk_idx"`
+	WALFile      string `json:"wal_file"`       // relative path inside backup dir
+	VLogFile     string `json:"vlog_file"`      // relative path; "vlog_delta.dat" for incr
+	VLogStartOff int64  `json:"vlog_start_off"` // byte offset in original VLog (0 for full)
+	VLogEndOff   int64  `json:"vlog_end_off"`   // byte offset in original VLog
 }
 
 // BackupManifest is the JSON descriptor written to every backup directory.

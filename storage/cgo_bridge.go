@@ -112,9 +112,9 @@ func (e *cgoBatchEngine) batchPutViaCGO(reqs []MultiPutRequest) int {
 		// Store in C struct as uintptr_t integers (not pointer types) so the
 		// CGO checker does not flag them as "Go pointer in C memory".
 		// The C++ side reads: const void* p = (const void*)(uintptr_t)addr;
-		entSlice[i].key.ptr = unsafe.Pointer(keyAddr)     //nolint:unsafeptr
+		entSlice[i].key.ptr = unsafe.Pointer(keyAddr) //nolint:unsafeptr
 		entSlice[i].key.len = C.size_t(len(r.Key))
-		entSlice[i].value.ptr = unsafe.Pointer(valAddr)   //nolint:unsafeptr
+		entSlice[i].value.ptr = unsafe.Pointer(valAddr) //nolint:unsafeptr
 		entSlice[i].value.len = C.size_t(len(r.Value))
 		entSlice[i].ttl_seconds = C.int(r.TTL)
 		entSlice[i].shard_hint = C.ushort(fnv64a(r.Key) & (numShards - 1))

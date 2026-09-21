@@ -135,20 +135,20 @@ func handleStats(w http.ResponseWriter, r *http.Request, e Engine) {
 	ns := e.ListNamespaces()
 
 	writeJSON(w, 200, map[string]any{
-		"index_keys":           e.GetIndexSize(),
-		"writes_total":         m.Writes.Load(),
-		"reads_total":          m.Reads.Load(),
-		"deletes_total":        m.Deletes.Load(),
-		"atomic_ops_total":     m.AtomicOps.Load(),
-		"audit_dropped_total":  m.AuditDropped.Load(),
-		"cache":                cs,
-		"wal_bytes":            walBytes,
-		"wal_entries":          walEntries,
-		"cdc_broadcast_total":  cdcTotal,
-		"cdc_dropped_total":    cdcDropped,
-		"cdc_subscribers":      cdcSubs,
-		"vlogs":                vlogs,
-		"namespaces":           ns,
+		"index_keys":          e.GetIndexSize(),
+		"writes_total":        m.Writes.Load(),
+		"reads_total":         m.Reads.Load(),
+		"deletes_total":       m.Deletes.Load(),
+		"atomic_ops_total":    m.AtomicOps.Load(),
+		"audit_dropped_total": m.AuditDropped.Load(),
+		"cache":               cs,
+		"wal_bytes":           walBytes,
+		"wal_entries":         walEntries,
+		"cdc_broadcast_total": cdcTotal,
+		"cdc_dropped_total":   cdcDropped,
+		"cdc_subscribers":     cdcSubs,
+		"vlogs":               vlogs,
+		"namespaces":          ns,
 	})
 }
 

@@ -27,13 +27,13 @@ type FailureDetector struct {
 
 // FailureDetectorConfig contains failure detector configuration
 type FailureDetectorConfig struct {
-	HeartbeatInterval    time.Duration // How often to check for failures
-	SuspectThreshold     time.Duration // Time before marking as suspect
-	FailureThreshold     time.Duration // Time before marking as failed
-	MaxSuspectTime       time.Duration // Max time a node can be suspected
-	RecoveryInterval     time.Duration // How often to attempt recovery
-	MaxRecoveryRetries   int
-	PingTimeout          time.Duration // Dial + exchange timeout for pingNode; 0 → defaultPingTimeout
+	HeartbeatInterval  time.Duration // How often to check for failures
+	SuspectThreshold   time.Duration // Time before marking as suspect
+	FailureThreshold   time.Duration // Time before marking as failed
+	MaxSuspectTime     time.Duration // Max time a node can be suspected
+	RecoveryInterval   time.Duration // How often to attempt recovery
+	MaxRecoveryRetries int
+	PingTimeout        time.Duration // Dial + exchange timeout for pingNode; 0 → defaultPingTimeout
 }
 
 // defaultPingTimeout is used when FailureDetectorConfig.PingTimeout is zero
@@ -55,12 +55,12 @@ func DefaultFailureDetectorConfig() *FailureDetectorConfig {
 
 // FailureDetectionMetrics tracks failure detection statistics
 type FailureDetectionMetrics struct {
-	NodesDetected     atomic.Uint64 // Nodes detected as failed
-	NodesRecovered    atomic.Uint64 // Nodes that recovered
-	FalsePositives    atomic.Uint64 // False failure detections
-	RecoveryAttempts  atomic.Uint64
-	RecoverySuccess   atomic.Uint64
-	RecoveryFailures  atomic.Uint64
+	NodesDetected    atomic.Uint64 // Nodes detected as failed
+	NodesRecovered   atomic.Uint64 // Nodes that recovered
+	FalsePositives   atomic.Uint64 // False failure detections
+	RecoveryAttempts atomic.Uint64
+	RecoverySuccess  atomic.Uint64
+	RecoveryFailures atomic.Uint64
 }
 
 // NewFailureDetector creates a new failure detector
@@ -100,16 +100,16 @@ func (fd *FailureDetector) Start() {
 func (fd *FailureDetector) RecordHeartbeat(nodeID string) {
 	fd.mu.Lock()
 	defer fd.mu.Unlock()
-	
+
 	fd.nodeHeartbeats[nodeID] = time.Now().UnixNano()
-	
+
 	// Clear suspect state if was suspected
 	if fd.suspectedNodes[nodeID] {
 		delete(fd.suspectedNodes, nodeID)
 		fd.partitionMap.UpdateNodeState(nodeID, NodeStateActive)
 		fd.metrics.FalsePositives.Add(1)
 	}
-	
+
 	// Clear failed state if was failed (recovery)
 	if fd.failedNodes[nodeID] {
 		delete(fd.failedNodes, nodeID)
@@ -122,7 +122,7 @@ func (fd *FailureDetector) RecordHeartbeat(nodeID string) {
 func (fd *FailureDetector) backgroundHeartbeatChecker() {
 	ticker := time.NewTicker(fd.config.HeartbeatInterval)
 	defer ticker.Stop()
-	
+
 	for {
 		select {
 		case <-fd.done:
@@ -137,12 +137,12 @@ func (fd *FailureDetector) backgroundHeartbeatChecker() {
 func (fd *FailureDetector) checkNodeHealth() {
 	fd.mu.Lock()
 	defer fd.mu.Unlock()
-	
+
 	now := time.Now().UnixNano()
 	suspectThresholdNs := fd.config.SuspectThreshold.Nanoseconds()
 	failureThresholdNs := fd.config.FailureThreshold.Nanoseconds()
 	_ = fd.config.MaxSuspectTime.Nanoseconds() // reserved for future eviction policy
-	
+
 	// Get all nodes from partition map (skip the local node — it heartbeats itself
 	// via SetLocalNode refresh, not via gossip, so skipping avoids false positives).
 	for nodeID, node := range fd.partitionMap.Nodes {
@@ -153,10 +153,10 @@ func (fd *FailureDetector) checkNodeHealth() {
 		if lastHeartbeat == 0 {
 			lastHeartbeat = node.LastHeartbeat
 		}
-		
+
 		timeSinceHeartbeat := now - lastHeartbeat
 		currentState := node.State.Load().(NodeState)
-		
+
 		// No heartbeat for a while
 		if timeSinceHeartbeat > failureThresholdNs {
 			if currentState != NodeStateFailed {
@@ -165,7 +165,7 @@ func (fd *FailureDetector) checkNodeHealth() {
 				fd.failedNodes[nodeID] = true
 				delete(fd.suspectedNodes, nodeID)
 				fd.metrics.NodesDetected.Add(1)
-				
+
 				// Queue for recovery attempts
 				select {
 				case fd.recoveryQueue <- nodeID:
@@ -191,17 +191,17 @@ func (fd *FailureDetector) checkNodeHealth() {
 func (fd *FailureDetector) backgroundRecoveryWorker() {
 	ticker := time.NewTicker(fd.config.RecoveryInterval)
 	defer ticker.Stop()
-	
+
 	recoveryRetries := make(map[string]int)
-	
+
 	for {
 		select {
 		case <-fd.done:
 			return
-		
+
 		case nodeID := <-fd.recoveryQueue:
 			fd.metrics.RecoveryAttempts.Add(1)
-			
+
 			retries := recoveryRetries[nodeID]
 			if retries >= fd.config.MaxRecoveryRetries {
 				// Max retries exceeded
@@ -209,7 +209,7 @@ func (fd *FailureDetector) backgroundRecoveryWorker() {
 				delete(recoveryRetries, nodeID)
 				continue
 			}
-			
+
 			if fd.attemptNodeRecovery(nodeID) {
 				fd.metrics.RecoverySuccess.Add(1)
 				delete(recoveryRetries, nodeID)
@@ -221,7 +221,7 @@ func (fd *FailureDetector) backgroundRecoveryWorker() {
 				default:
 				}
 			}
-		
+
 		case <-ticker.C:
 			// Periodically check for recovery update
 		}
@@ -321,7 +321,7 @@ func (fd *FailureDetector) Close() error {
 func (fd *FailureDetector) GetFailureStats() FailureStats {
 	fd.mu.RLock()
 	defer fd.mu.RUnlock()
-	
+
 	return FailureStats{
 		NodesDetected:    fd.metrics.NodesDetected.Load(),
 		NodesRecovered:   fd.metrics.NodesRecovered.Load(),
