@@ -61,7 +61,7 @@ These must never be violated. Breaking them corrupts data or causes silent bugs.
 ### 1. Shard routing must stay consistent
 
 ```
-shard = FNV-1a(key) & 0x3FF          (1024 shards, 0–1023)
+shard = FNV-1a(key) & 0x1FFF         (8192 shards, 0–8191)
 disk  = shard % numDisks              (which physical disk)
 ```
 

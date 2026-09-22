@@ -11,6 +11,54 @@ Types: `Added`, `Changed`, `Fixed`, `Performance`, `Breaking`
 
 ### Fixed
 
+- **Test bloom filters allocated 256 MB per engine, taking the suite to
+  8 GB peak RSS and killing CI.** Bloom memory is
+  `BloomFilterShardBits / 8 × 8192`, allocated eagerly per engine.
+  `backup_test.go`, `pitr_test.go` and `property_test.go` each set `1 << 18`;
+  one of them carried the comment "~32 MB total", which was correct when
+  `numShards` was 1024. The storage suite builds ~105 engines.
+
+  Measured at `GOMAXPROCS=4` under `-race`: peak RSS **8.07 GB → 1.14 GB**. A
+  GitHub runner has 16 GB, and a 6 GB tmpfs had just been mounted on top of
+  it, so the box went to swap and the job died at its 45-minute budget
+  (exit 143). This was the third bug from the same stale-1024 arithmetic; it
+  drifted because three near-identical test helpers each carried their own
+  copy of the config block. They now share `storage/testconfig_test.go`.
+
+- **CI test scratch moved to tmpfs — a real `fdatasync` was the 45-minute
+  gap.** Darwin's `fsync(2)` returns at the drive cache (**0.020 ms**
+  measured); Linux `fdatasync` on a runner's network-backed disk is a real
+  round trip, and every `Put` does two. No `-timeout` value could close that.
+  Mount is **1G** — measured peak scratch is 4.9 MB (storage) and 10.2 MB
+  (integration), and tmpfs pages are RAM the tests need.
+
+- **`TMPDIR` must be set on the test step, not the job.** `actions/setup-go`
+  runs `go env` before the mount step exists, and the toolchain builds its
+  work dir under `TMPDIR`, so a job-level value failed every matrix leg at
+  setup with `creating work dir: stat /mnt/veltrix-tmp: no such file or
+  directory`.
+
+### Changed
+
+- **Documentation corrected against the code, repo-wide.** Several docs had
+  drifted far enough to mislead an operator:
+
+  | Claim | Reality |
+  |---|---|
+  | `F_FULLFSYNC ≈ 7–10 ms` on macOS (7 sites, incl. `veltrix info` output) | Never called. Plain `fsync(2)`, **0.020 ms**, drive cache only — macOS builds are **not power-loss safe** |
+  | Admission control fires at 3 / 4 / 2 ms (`PERFORMANCE.md`) | **15 / 20 / 10 ms** |
+  | Flush window default 10 ms (`README.md`, `PERFORMANCE.md`, `veltrix info`) | **15 ms** |
+  | 1024 shards, `& 0x3FF` (`docs/storage.md`, `IMPLEMENTATION_GUIDE.md`) | **8192**, `& 0x1FFF` |
+  | 7-field WAL (`docs/storage.md`, `docs/node-lifecycle.md`, `CLAUDE.md` file map) | **10-field** — `CLAUDE.md` contradicted its own invariant 21 |
+  | Cache hit ~220 ns (`README.md`) | **~92 ns** since the cache was sharded |
+
+- **`ARCHITECTURE.md` now carries real diagrams** (Mermaid, rendered by
+  GitHub): system overview with the C++ boundary drawn honestly, a write-path
+  sequence showing the concurrent WAL/VLog fdatasync, a read-path flow, and
+  the three-way hash split. Plus a new "Durability" section documenting the
+  macOS fsync caveat above.
+
+
 - **The default bloom-filter budget allocated 4 GB per engine, 8× its
   documented intent.** `BloomFilterShardBits: 1 << 22` carried the comment
   "4 M bits/shard × 1024 shards = 512 MB" — it was sized when `numShards` was

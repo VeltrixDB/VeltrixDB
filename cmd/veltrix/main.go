@@ -770,9 +770,10 @@ func cmdWAL(adminAddr string, rawJSON bool) error {
 	}
 
 	fmt.Print(sectionLine())
-	fmt.Printf("  %s\n", dim("Flush window: 10 ms (group-commit). P99 ≈ window + fdatasync."))
-	fmt.Printf("  %s\n", dim("On Linux NVMe: fdatasync ~0.2–0.5ms → P99 ~10.2ms."))
-	fmt.Printf("  %s\n", dim("On macOS (F_FULLFSYNC ~8ms) → P99 ~18ms."))
+	fmt.Printf("  %s\n", dim("Flush window: 15 ms default (group-commit). P99 ≈ window + fdatasync."))
+	fmt.Printf("  %s\n", dim("On Linux NVMe: fdatasync ~0.2–0.5ms → P99 ~15.2ms."))
+	fmt.Printf("  %s\n", dim("macOS uses plain fsync(2) (~0.02ms, drive cache only) — dev builds"))
+	fmt.Printf("  %s\n", dim("are not power-loss safe and their write timings do not predict Linux."))
 
 	return nil
 }

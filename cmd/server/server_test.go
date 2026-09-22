@@ -43,7 +43,8 @@ func startTestServer(t *testing.T, dataDir string, ae *security.AuthEnforcer) *t
 	// many; tests do not need a production false-positive rate.
 	cfg.BloomFilterShardBits = 1 << 12
 	cfg.DataDirPath = dataDir
-	// Short flush windows keep per-Put latency low on macOS F_FULLFSYNC.
+	// Short flush windows keep per-Put latency low; tests write sequentially
+	// so the production window has nothing to batch.
 	cfg.WALFlushWindowMs = 2
 	cfg.VLogFlushWindowMs = 2
 	engine, err := storage.NewStorageEngine(cfg)

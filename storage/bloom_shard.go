@@ -2,14 +2,14 @@ package storage
 
 // bloom_shard.go — Lock-free per-shard Bloom filter for negative-lookup acceleration.
 //
-// One filter per indexShard (1024 filters total). Sized at construction; bits
+// One filter per indexShard (8192 filters total). Sized at construction; bits
 // are atomic uint64 words so Add and MayContain do not contend on a mutex.
 //
 // Why per-shard, not global:
 //   - The shardedIndex already partitions keys by shard; a global filter wouldn't
 //     give any extra information beyond what each shard already knows.
-//   - Sizing per shard scales with key count: 1B keys / 1024 shards = ~1M keys/shard,
-//     so each shard's filter only needs ~1M-key capacity, not 1B.
+//   - Sizing per shard scales with key count: 1B keys / 8192 shards = ~122K keys/shard,
+//     so each shard's filter only needs ~122K-key capacity, not 1B.
 //   - Cache locality: when a shard's hot path is on one CPU, the bloom bits live
 //     in that CPU's L2/L3 — global filter would be cache-line-shared across cores.
 //
@@ -30,10 +30,15 @@ package storage
 //   bits_per_key=14 → FP ~0.1% (k=10)
 //   bits_per_key=4  → FP ~7%   (k=3)
 //
-// Default: 4M bits per shard at 10 bits/key — sized for ~400K keys/shard at
-// ~1% FP rate. Memory: 1024 × 512 KB = 512 MB. Acceptable for n2-highmem-64.
-// Operators with > 400K keys/shard can raise BloomFilterBitsPerShard at cost
-// of memory.
+// TOTAL MEMORY IS BloomFilterShardBits / 8 * 8192, ALLOCATED EAGERLY at
+// startup, per engine, before a single key is stored. Do the arithmetic
+// against 8192 shards — not 1024. This comment used to read "1024 x 512 KB =
+// 512 MB" for a 1<<22 default that actually took 4 GB, and two test configs
+// repeated the same mistake at 256 MB each.
+//
+// Default: 1<<19 bits/shard = 512 MB total, ~10 bits/key for ~52K keys/shard
+// at ~1% FP. A 1B-key deployment (~122K keys/shard) should raise it to
+// 1<<21 (2 GB) deliberately, with the memory budgeted.
 
 import (
 	"sync/atomic"

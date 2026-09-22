@@ -6,6 +6,7 @@ Technical documentation for VeltrixDB internals.
 
 | Document | What It Covers |
 |----------|---------------|
+| [../ARCHITECTURE.md](../ARCHITECTURE.md) | **Start here** — system diagram, write/read path sequences, shard routing, durability, admission control, GC tiers, the real C++ boundary |
 | [storage.md](storage.md) | How data is stored: sharding, WAL, VLog, Index Vault, LIRS cache, defragmentation, crash recovery |
 | [replication.md](replication.md) | Raft consensus replication + async Replication Engine; consistency levels; anti-entropy; version vectors |
 | [partitioning.md](partitioning.md) | Consistent hash ring; virtual nodes; partition assignment; rebalancing; data migration via TransferAgent |
@@ -19,6 +20,7 @@ Technical documentation for VeltrixDB internals.
 | [DR_RUNBOOK.md](DR_RUNBOOK.md) | Disaster recovery runbook; encryption key rotation; data corruption recovery |
 | [SOC2_CONTROLS.md](SOC2_CONTROLS.md) | SOC 2 compliance controls |
 | [TESTING_GUIDE.md](TESTING_GUIDE.md) | How to run integration and e2e tests |
+| [../cpp/README.md](../cpp/README.md) | What in `cpp/` is actually reachable from Go (most of it is not) |
 
 ## Quick Reference
 
@@ -38,3 +40,7 @@ Technical documentation for VeltrixDB internals.
 | Backup / restore | `storage/backup.go`, `cmd/backup/main.go` |
 | TCP server | `cmd/server/main.go` |
 | Prometheus metrics | `metrics/prometheus.go` |
+| Sharded LIRS cache | `storage/cache_sharded.go` |
+| Value transform (compress/encrypt) | `storage/engine.go` — `transformForWrite` |
+| Transform-metadata repair | `storage/repair.go`, `cmd/veltrix-repair/main.go` |
+| Platform fdatasync split | `storage/fdatasync_linux.go`, `storage/fdatasync_other.go` |

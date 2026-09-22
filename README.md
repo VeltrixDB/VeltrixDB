@@ -42,7 +42,7 @@ echo -e "PUT hello world\nGET hello\nPING" | nc localhost 9000
 | Operation | P50 | P99 |
 |-----------|-----|-----|
 | GET — cache hit | 0.05 ms | 0.28 ms (~1.4M reads/s) |
-| PUT — 10 ms flush window | 5 ms | 10.2 ms |
+| PUT — 15 ms flush window (default) | 5 ms | 15.2 ms |
 | PUT — 5 ms window, 512 workers | 2.6 ms | 5.2 ms (~102K writes/s) |
 | MultiPut 1024 entries | — | ~9.5 ms (~426K entries/s) |
 
@@ -76,9 +76,9 @@ In the YCSB run above (100M operations): **zero errors and zero GC emergency eve
 
 **8192 shards, FNV-1a routing.** Each key hashes (FNV-1a & 0x1FFF) into 1 of 8192 shards. With 8 NVMe disks, shard `N` routes to disk `N % 8`. All 8 disks write in parallel — no single hot lock.
 
-**Values on NVMe, index in DRAM.** The in-memory index stores only a 64-byte pointer per key (disk offset, shard, size, TTL, version). Value bytes go directly to the per-disk append-only VLog. A cache hit is a DRAM lookup (~220 ns). A cache miss is one NVMe random read (~400 µs).
+**Values on NVMe, index in DRAM.** The in-memory index stores only a 64-byte pointer per key (disk offset, shard, size, TTL, version). Value bytes go directly to the per-disk append-only VLog. A cache hit is a DRAM lookup (**~92 ns** since the cache was sharded; it was 711 ns when a single mutex fronted it). A cache miss is one NVMe random read (~400 µs).
 
-**Group-commit WAL.** A background flusher amortizes `fdatasync` across all writers within a configurable window (default 10 ms). One `fdatasync` per batch instead of per write — 10–100× write throughput improvement at the cost of at most one window of durability latency.
+**Group-commit WAL.** A background flusher amortizes `fdatasync` across all writers within a configurable window (default 15 ms). One `fdatasync` per batch instead of per write — 10–100× write throughput improvement at the cost of at most one window of durability latency.
 
 **LIRS cache.** Scan-resistant eviction: large sequential reads don't evict your hot keys. Small values (≤256 B) get higher eviction priority, keeping the working set in RAM even under mixed workloads.
 

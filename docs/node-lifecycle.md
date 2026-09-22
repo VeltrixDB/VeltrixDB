@@ -245,7 +245,7 @@ When `node-2` restarts:
 
 2. StorageEngine starts → replayWAL()
    ├─ Open wal.log on each disk
-   ├─ Parse every 7-field WAL record
+   ├─ Parse every WAL record (10-field; 6/7/8-field still accepted)
    └─ applyWALReplay() → rebuild shardedIndex in RAM
       (WAL file was not zeroed on crash — replay needed)
 

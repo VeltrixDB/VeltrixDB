@@ -68,7 +68,7 @@ Both gates must pass on your branch before submitting.
 
 [CLAUDE.md](CLAUDE.md) contains the invariants that MUST NOT be broken. Critical ones:
 
-- Shard routing is `FNV-1a(key) & 0x3FF` — never change the hash or bitmask without a full migration
+- Shard routing is `FNV-1a(key) & 0x1FFF` (8192 shards) — never change the hash or bitmask without a full migration. Anything sized *per shard* is multiplied by 8192, not 1024; getting that wrong has caused three separate over-allocation bugs
 - `WALFlushWindowMs` and `VLogFlushWindowMs` must always be equal
 - VLog is written BEFORE WAL in the Put path (crash safety, see Invariant 19)
 - `MarkDead` must be called whenever a key's VLog pointer is superseded (Invariant 17)
