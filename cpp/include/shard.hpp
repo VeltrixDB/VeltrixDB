@@ -62,10 +62,18 @@ static_assert(sizeof(RecordHeader) == 64, "RecordHeader must be 64 bytes");
 // Cross-shard operations (e.g., the Defragmenter reading index entries) use
 // the AtomicIndexEntry CAS interface and never hold any shard-internal lock.
 //
-// alignas(64) prevents false sharing between adjacent Shards in a shards[]
-// array — each Shard starts on its own cache line.
+// alignas(4096) keeps adjacent Shards in a shards[] array off each other's
+// cache lines, and is REQUIRED rather than merely desirable: write_buf_ below
+// is alignas(4096) for O_DIRECT, so Shard's natural alignment is already
+// 4096. Declaring the class alignas(64) asked for weaker alignment than a
+// member requires, which is ill-formed ([dcl.align]/5) — clang rejects it
+// with "requested alignment is less than minimum alignment of 4096". This
+// went unnoticed because nothing compiled shard.cpp until CI job node-6-cpp
+// was added.
+//
+// If write_buf_ ever stops being over-aligned, this may drop back to 64.
 
-class alignas(64) Shard {
+class alignas(4096) Shard {
 public:
     explicit Shard(ShardConfig cfg);
     ~Shard();

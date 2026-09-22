@@ -98,8 +98,8 @@ func (se *StorageEngine) SetReplicaWatermark(replicaID string, writeTimestampUs 
 // can be physically removed without risking zombie data on a lagging replica.
 //
 // Two conditions must BOTH hold:
-//   1. The tombstone is older than the configured grace period (existing rule).
-//   2. Every known replica has acknowledged a writeTimestamp ≥ this one.
+//  1. The tombstone is older than the configured grace period (existing rule).
+//  2. Every known replica has acknowledged a writeTimestamp ≥ this one.
 //
 // Single-node deployments (no replicas tracked) skip rule (2) entirely.
 func (se *StorageEngine) CanReapTombstone(tombstoneWriteTsUs int64, nowUs int64, gracePeriodSec int64) bool {

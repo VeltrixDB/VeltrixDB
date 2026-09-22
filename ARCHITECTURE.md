@@ -52,7 +52,7 @@ With 8 disks, 1024 shards land on each disk. A failure on one disk doesn't affec
 
 **LIRS Cache** — scan-resistant; small values (≤256 B) get priority 2 vs priority 1, making them harder to evict. Sized with `-cache <MB>`.
 
-**WAL (Write-Ahead Log)** — group-commit: N writes share one `fdatasync`. Default 10 ms window. One WAL per disk.
+**WAL (Write-Ahead Log)** — group-commit: N writes share one `fdatasync`. Default 15 ms window. One WAL per disk.
 
 **VLog (Value Log)** — append-only file per disk. Values are written here; only key metadata lives in the index (WiscKey KV separation). Lock-free concurrent appends via atomic offset reservation.
 
@@ -65,8 +65,8 @@ With 8 disks, 1024 shards land on each disk. A failure on one disk doesn't affec
 ```
 PUT "user:42" → value
   1. Hash key → shard 307 → disk 2 (307 % 8)
-  2. Atomically reserve VLog offset; write value
-  3. Write WAL entry (key + vlogOffset)
+  2. Compress, then encrypt; atomically reserve VLog offset; write the blob
+  3. Write WAL entry (key + vlogOffset + on-disk length + transform flags)
   4. WAL + VLog fdatasync race concurrently (wait = max of both)
   5. Update shard 307 index entry (DiskOffset, Version++)
   6. Insert into LIRS cache
@@ -85,9 +85,10 @@ GET "user:42"
   2. LIRS cache hit → return value (no disk I/O)
   3. Cache miss → lock shard (read), look up index entry
   4. Not in index → NOT_FOUND
-  5. In index → read value from VLog at DiskOffset
-  6. Insert into cache
-  7. Return value
+  5. In index → read blob from VLog at DiskOffset (magic + CRC32C checked)
+  6. Decrypt, then decompress, then apply any pending schema migration
+  7. Insert into cache
+  8. Return value
 ```
 
 ---
@@ -98,10 +99,10 @@ Protects reads from being starved by heavy writes:
 
 | Read EWMA | Action |
 |-----------|--------|
-| < 3 ms | Normal — GC runs at full speed |
-| ≥ 3 ms | GC bandwidth capped at 60 MB/s |
-| ≥ 4 ms | GC paused + each PUT sleeps 2 ms |
-| < 2 ms | Everything resumes |
+| < 15 ms | Normal — GC runs at full speed |
+| ≥ 15 ms | GC bandwidth capped at 60 MB/s (`gcLatencyThresholdNs`) |
+| > 20 ms | GC paused + each PUT sleeps 2 ms (`admissionThrottleNs`) |
+| < 10 ms | Everything resumes (`admissionResumeNs`) |
 | No reads for 4 min | EWMA treated as stale — GC resumes |
 
 ---
@@ -123,14 +124,24 @@ Emergency mode logs `[gc] disk=N EMERGENCY` and increments `veltrixdb_vlog_gc_em
 
 ## C++ Layer (Linux Only)
 
-| Component | What it replaces | Win |
-|-----------|-----------------|-----|
-| ART index | Go hash map | Faster range scans, prefix compression |
-| io_uring scheduler | blocking pwrite | 3-tier I/O priority (reads always beat compaction) |
-| SQPOLL VLog reader | blocking pread | Zero-syscall NVMe reads |
-| NUMA thread pinning | default scheduler | Eliminates cross-socket memory latency |
+The Go layer is fully functional on its own. C++ is an optional Linux accelerator — and **less of it is wired up than the file tree suggests**, so check this table before attributing behaviour to it.
 
-The Go layer is fully functional without C++. C++ is loaded on Linux for production throughput.
+| Component | Source | Reachable from Go? |
+|-----------|--------|--------------------|
+| Vectorized batch put | `batch_engine.cpp` | Yes — cgo shim in `storage/` |
+| SQPOLL SSTable reader | `uring_reader.cpp` | Yes — cgo shim |
+| NUMA thread pinning | `numa_topology.cpp` | Yes — cgo shim |
+| 8-ring SQPOLL write bridge | `storage_bridge.cpp` | Yes — via `storage_bridge_capi.h`, CMake static lib |
+| ART index | `art.cpp` | **No** — compiled into the CMake lib, but no Go call site |
+| Priority io_uring scheduler | `scheduler.cpp` | **No** — same |
+| LIRS cache / shard / write path / defragmenter | `lirs_cache.cpp`, `shard.cpp`, `write_path.cpp`, `defragmenter.cpp` | **No** — same |
+| C++ VLog reader | `vlog.cpp` | **No** — compiled into the CMake lib, but no Go call site |
+| eBPF GC throttle | `ebpf_gc_throttle.cpp` | **No** — same |
+
+Two consequences worth internalising:
+
+- **The published Docker image is `CGO_ENABLED=0`**, and so is every CI job. Neither contains any C++. `scripts/build.sh` flips `CGO_ENABLED=1` only when it builds the CMake lib on Linux.
+- **CI job `node-6-cpp` compiles the C++** — the CMake target, the cgo shims, and `scripts/build.sh` end to end. Every other job is `CGO_ENABLED=0`.
 
 ---
 

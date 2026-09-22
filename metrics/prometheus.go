@@ -20,13 +20,13 @@ type VeltrixCollector struct {
 	replMetrics *replication.ReplicationMetrics // optional, may be nil
 
 	// ── Storage: write path ───────────────────────────────────────────────────
-	writes                 *prometheus.Desc
-	writesLatencyNs        *prometheus.Desc
-	walFlushes             *prometheus.Desc
-	compactionRuns         *prometheus.Desc
-	sstableCreations       *prometheus.Desc
-	writeBackpressureEvents  *prometheus.Desc
-	writeAdmissionThrottles  *prometheus.Desc // admission control throttle events
+	writes                  *prometheus.Desc
+	writesLatencyNs         *prometheus.Desc
+	walFlushes              *prometheus.Desc
+	compactionRuns          *prometheus.Desc
+	sstableCreations        *prometheus.Desc
+	writeBackpressureEvents *prometheus.Desc
+	writeAdmissionThrottles *prometheus.Desc // admission control throttle events
 
 	// ── Storage: read path ────────────────────────────────────────────────────
 	reads          *prometheus.Desc
@@ -47,8 +47,8 @@ type VeltrixCollector struct {
 	cacheMaxBytes  *prometheus.Desc
 
 	// ── Eviction ──────────────────────────────────────────────────────────────
-	evictionsTotal      *prometheus.Desc // label: type={lirs,ttl,defrag}
-	evictionLatencyNs   *prometheus.Desc
+	evictionsTotal    *prometheus.Desc // label: type={lirs,ttl,defrag}
+	evictionLatencyNs *prometheus.Desc
 
 	// ── Index ─────────────────────────────────────────────────────────────────
 	indexSize *prometheus.Desc
@@ -72,34 +72,34 @@ type VeltrixCollector struct {
 	fdRecoveryFailures *prometheus.Desc
 
 	// ── VLog (WiscKey KV separation) ──────────────────────────────────────────
-	vlogWrites          *prometheus.Desc // counter, per-node
-	vlogReads           *prometheus.Desc // counter, per-node
-	vlogGCRuns          *prometheus.Desc // counter, per-node
-	vlogGCBytes         *prometheus.Desc // counter, bytes reclaimed by GC, per-node
-	vlogGarbageRatio    *prometheus.Desc // gauge, per-disk (label: disk)
-	vlogFileBytes       *prometheus.Desc // gauge, per-disk (label: disk)
+	vlogWrites       *prometheus.Desc // counter, per-node
+	vlogReads        *prometheus.Desc // counter, per-node
+	vlogGCRuns       *prometheus.Desc // counter, per-node
+	vlogGCBytes      *prometheus.Desc // counter, bytes reclaimed by GC, per-node
+	vlogGarbageRatio *prometheus.Desc // gauge, per-disk (label: disk)
+	vlogFileBytes    *prometheus.Desc // gauge, per-disk (label: disk)
 	// GC diagnostic counters — expose why compactVLog is or is not making progress.
-	vlogGCSkippedRatio  *prometheus.Desc // counter: exited because GCRatio < threshold
-	vlogGCSkippedPaused *prometheus.Desc // counter: exited because GCPaused was true
-	vlogGCSkippedEmpty  *prometheus.Desc // counter: exited because no candidates found
-	vlogGCReadErrors    *prometheus.Desc // counter: ReadValue failures inside GC loop
-	vlogGCCASFails      *prometheus.Desc // counter: CAS misses (concurrent Put won)
-	vlogGCCandidates    *prometheus.Desc // counter: total candidates scanned
+	vlogGCSkippedRatio   *prometheus.Desc // counter: exited because GCRatio < threshold
+	vlogGCSkippedPaused  *prometheus.Desc // counter: exited because GCPaused was true
+	vlogGCSkippedEmpty   *prometheus.Desc // counter: exited because no candidates found
+	vlogGCReadErrors     *prometheus.Desc // counter: ReadValue failures inside GC loop
+	vlogGCCASFails       *prometheus.Desc // counter: CAS misses (concurrent Put won)
+	vlogGCCandidates     *prometheus.Desc // counter: total candidates scanned
 	vlogGCEmergencyRuns  *prometheus.Desc // counter: GC bypassed admission-control pause (garbage ≥ 65%)
 	vlogBlkDiscardErrors *prometheus.Desc // counter: BLKDISCARD ioctl failures (missing SYS_RAWIO cap)
 
 	// ── Replication ───────────────────────────────────────────────────────────
-	replWrites            *prometheus.Desc
-	replFailures          *prometheus.Desc
-	replLagBytes          *prometheus.Desc
-	replLagNs             *prometheus.Desc
-	replConflicts         *prometheus.Desc
+	replWrites             *prometheus.Desc
+	replFailures           *prometheus.Desc
+	replLagBytes           *prometheus.Desc
+	replLagNs              *prometheus.Desc
+	replConflicts          *prometheus.Desc
 	replVectorClockUpdates *prometheus.Desc
-	replAntiEntropyRuns   *prometheus.Desc
+	replAntiEntropyRuns    *prometheus.Desc
 
 	// ── WAL I/O ───────────────────────────────────────────────────────────────
-	walWriteBytes    *prometheus.Desc // counter: bytes written to WAL across all disks
-	walBatchEntries  *prometheus.Desc // counter: WAL entries batched (/ walFlushes = avg batch)
+	walWriteBytes   *prometheus.Desc // counter: bytes written to WAL across all disks
+	walBatchEntries *prometheus.Desc // counter: WAL entries batched (/ walFlushes = avg batch)
 
 	// ── VLog I/O (per-disk) ───────────────────────────────────────────────────
 	vlogWriteBytesDisk *prometheus.Desc // counter: raw value bytes written (disk label)
@@ -134,10 +134,11 @@ type VeltrixCollector struct {
 	bloomSkipped *prometheus.Desc // counter: negative Gets shortcut by the bloom
 
 	// ── Scrubber ────────────────────────────────────────────────────────────
-	scrubRecords    *prometheus.Desc // counter: VLog records inspected
-	scrubCorruption *prometheus.Desc // counter: CRC32C/magic mismatches
-	scrubBytes      *prometheus.Desc // counter: bytes read by the scrubber
-	scrubReadErrors *prometheus.Desc // counter: pread errors during scrub
+	scrubRecords             *prometheus.Desc // counter: VLog records inspected
+	scrubCorruption          *prometheus.Desc // counter: CRC32C/magic mismatches
+	transformMetadataDamaged *prometheus.Desc // gauge: records with lost compress/encrypt metadata
+	scrubBytes               *prometheus.Desc // counter: bytes read by the scrubber
+	scrubReadErrors          *prometheus.Desc // counter: pread errors during scrub
 
 	// ── Atomic ops ──────────────────────────────────────────────────────────
 	atomicOps *prometheus.Desc // counter: CAS+INCR+DECR+SETNX successful operations
@@ -225,8 +226,8 @@ func NewVeltrixCollector(
 		walFlushes:              desc("storage", "wal_flushes_total", "Total WAL fdatasync flushes."),
 		compactionRuns:          desc("storage", "compaction_runs_total", "Total memtable-to-SSTable compaction runs."),
 		sstableCreations:        desc("storage", "sstable_creations_total", "Total SSTable files created."),
-		writeBackpressureEvents:  desc("storage", "write_backpressure_events_total", "PUT operations delayed by back-pressure due to oversized dirty memtable."),
-		writeAdmissionThrottles:  desc("storage", "write_admission_throttles_total", "PUT operations delayed by admission control (read P99 EWMA > 4ms)."),
+		writeBackpressureEvents: desc("storage", "write_backpressure_events_total", "PUT operations delayed by back-pressure due to oversized dirty memtable."),
+		writeAdmissionThrottles: desc("storage", "write_admission_throttles_total", "PUT operations delayed by admission control (read P99 EWMA > 4ms)."),
 
 		// read path
 		reads:          desc("storage", "reads_total", "Total GET operations completed."),
@@ -272,18 +273,18 @@ func NewVeltrixCollector(
 		fdRecoveryFailures: desc("failure_detector", "recovery_failures_total", "Recovery pings that permanently failed."),
 
 		// vlog
-		vlogWrites:          desc("vlog", "writes_total", "Total values appended to VLog files (KV-separation enabled)."),
-		vlogReads:           desc("vlog", "reads_total", "Total values read from VLog files."),
-		vlogGCRuns:          desc("vlog", "gc_runs_total", "Total VLog defragmentation (GC) passes that reclaimed ≥1 byte."),
-		vlogGCBytes:         desc("vlog", "gc_bytes_total", "Total bytes reclaimed by VLog GC across all disks."),
-		vlogGarbageRatio:    desc("vlog", "garbage_ratio", "Fraction of VLog bytes that are dead (garbage). Triggers GC when > VLogGCThreshold.", "disk"),
-		vlogFileBytes:       desc("vlog", "file_bytes", "Current VLog file size in bytes per disk.", "disk"),
-		vlogGCSkippedRatio:  desc("vlog", "gc_skipped_ratio_total", "Times compactVLog exited early: GCRatio was below the threshold."),
-		vlogGCSkippedPaused: desc("vlog", "gc_skipped_paused_total", "Times compactVLog exited early: GCPaused was true (read latency EWMA above 4ms)."),
-		vlogGCSkippedEmpty:  desc("vlog", "gc_skipped_empty_total", "Times compactVLog exited early: zero live candidates found below the GC horizon."),
-		vlogGCReadErrors:    desc("vlog", "gc_read_errors_total", "ReadValue failures inside the GC candidate loop (skipped candidates)."),
-		vlogGCCASFails:      desc("vlog", "gc_cas_fails_total", "CAS misses in GC: a concurrent Put updated the entry before GC could move it."),
-		vlogGCCandidates:    desc("vlog", "gc_candidates_total", "Cumulative live VLog entries scanned as GC candidates across all disks."),
+		vlogWrites:           desc("vlog", "writes_total", "Total values appended to VLog files (KV-separation enabled)."),
+		vlogReads:            desc("vlog", "reads_total", "Total values read from VLog files."),
+		vlogGCRuns:           desc("vlog", "gc_runs_total", "Total VLog defragmentation (GC) passes that reclaimed ≥1 byte."),
+		vlogGCBytes:          desc("vlog", "gc_bytes_total", "Total bytes reclaimed by VLog GC across all disks."),
+		vlogGarbageRatio:     desc("vlog", "garbage_ratio", "Fraction of VLog bytes that are dead (garbage). Triggers GC when > VLogGCThreshold.", "disk"),
+		vlogFileBytes:        desc("vlog", "file_bytes", "Current VLog file size in bytes per disk.", "disk"),
+		vlogGCSkippedRatio:   desc("vlog", "gc_skipped_ratio_total", "Times compactVLog exited early: GCRatio was below the threshold."),
+		vlogGCSkippedPaused:  desc("vlog", "gc_skipped_paused_total", "Times compactVLog exited early: GCPaused was true (read latency EWMA above 4ms)."),
+		vlogGCSkippedEmpty:   desc("vlog", "gc_skipped_empty_total", "Times compactVLog exited early: zero live candidates found below the GC horizon."),
+		vlogGCReadErrors:     desc("vlog", "gc_read_errors_total", "ReadValue failures inside the GC candidate loop (skipped candidates)."),
+		vlogGCCASFails:       desc("vlog", "gc_cas_fails_total", "CAS misses in GC: a concurrent Put updated the entry before GC could move it."),
+		vlogGCCandidates:     desc("vlog", "gc_candidates_total", "Cumulative live VLog entries scanned as GC candidates across all disks."),
 		vlogGCEmergencyRuns:  desc("vlog", "gc_emergency_runs_total", "Times compactVLog bypassed the admission-control GC-pause because garbage ratio crossed the emergency threshold (65%). A persistent non-zero rate signals write throughput exceeds sustainable GC bandwidth."),
 		vlogBlkDiscardErrors: desc("vlog", "blkdiscard_errors_total", "BLKDISCARD ioctl failures in punchDeadHead. Non-zero means the container lacks CAP_SYS_RAWIO — NVMe TRIM is silently skipped and the raw VLog head will grow without reclaim. Fix: add SYS_RAWIO to securityContext.capabilities.add."),
 
@@ -333,10 +334,11 @@ func NewVeltrixCollector(
 		bloomSkipped: desc("storage", "bloom_filter_skipped_total", "Negative Get operations short-circuited by the per-shard Bloom filter (no shard lock taken, no map lookup).  A high value means the filter is paying for itself; combined with bloom_false_positives_total it gives the practical FP rate."),
 
 		// scrubber
-		scrubRecords:    desc("scrub", "records_total", "VLog records inspected by the background scrubber across all disks."),
-		scrubCorruption: desc("scrub", "corruption_total", "CRC32C or magic-mismatch detections by the background scrubber. ANY non-zero rate indicates silent disk corruption — investigate immediately."),
-		scrubBytes:      desc("scrub", "bytes_total", "VLog bytes read by the background scrubber."),
-		scrubReadErrors: desc("scrub", "read_errors_total", "Transient pread failures during scrubbing."),
+		scrubRecords:             desc("scrub", "records_total", "VLog records inspected by the background scrubber across all disks."),
+		scrubCorruption:          desc("scrub", "corruption_total", "CRC32C or magic-mismatch detections by the background scrubber. ANY non-zero rate indicates silent disk corruption — investigate immediately."),
+		transformMetadataDamaged: desc("storage", "transform_metadata_damaged", "Sampled records whose compression/encryption metadata disagrees with their on-disk bytes (written by a build predating the value-transform WAL fix). ANY non-zero value means this node is silently returning compressed or encrypted blobs to clients — run veltrix-repair. Sampled at startup."),
+		scrubBytes:               desc("scrub", "bytes_total", "VLog bytes read by the background scrubber."),
+		scrubReadErrors:          desc("scrub", "read_errors_total", "Transient pread failures during scrubbing."),
 
 		// atomic ops
 		atomicOps: desc("storage", "atomic_ops_total", "Successful atomic operations (CAS, INCR, DECR, SETNX) committed to durable storage."),
@@ -393,6 +395,7 @@ func (c *VeltrixCollector) Describe(ch chan<- *prometheus.Desc) {
 		c.vlogDiskWriteLatencyEWMA, c.vlogDiskReadLatencyEWMA, c.vlogDiskSlow,
 		c.bloomSkipped,
 		c.scrubRecords, c.scrubCorruption, c.scrubBytes, c.scrubReadErrors,
+		c.transformMetadataDamaged,
 		c.atomicOps,
 	}
 	for _, d := range descs {
@@ -549,6 +552,8 @@ func (c *VeltrixCollector) Collect(ch chan<- prometheus.Metric) {
 	counter(c.bloomSkipped, m.BloomFilterSkipped.Load())
 	counter(c.scrubRecords, m.ScrubRecords.Load())
 	counter(c.scrubCorruption, m.ScrubCorruption.Load())
+	// Gauge, not counter: it is a current-state sample, not an accumulating total.
+	gauge(c.transformMetadataDamaged, float64(m.TransformMetadataDamaged.Load()))
 	counter(c.scrubBytes, m.ScrubBytes.Load())
 	counter(c.scrubReadErrors, m.ScrubReadErrors.Load())
 	counter(c.atomicOps, m.AtomicOps.Load())

@@ -33,9 +33,9 @@ var ErrTxnConflict = errors.New("transaction conflict")
 
 // Txn is a builder for a batched, atomic write set.
 type Txn struct {
-	se      *StorageEngine
-	mu      sync.Mutex
-	writes  []txnOp
+	se        *StorageEngine
+	mu        sync.Mutex
+	writes    []txnOp
 	committed bool
 }
 

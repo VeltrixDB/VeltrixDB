@@ -144,7 +144,10 @@ func TestNodeReplacement_Kubernetes(t *testing.T) {
 	cfg.VirtualNodesPerNode = 32
 	pm := NewPartitionMap(cfg)
 
-	initNodes := []struct{ id string; port int }{
+	initNodes := []struct {
+		id   string
+		port int
+	}{
 		{"n1", basePort},
 		{"n2", basePort + 1},
 		{"n3", basePort + 2},

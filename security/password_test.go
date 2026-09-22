@@ -64,9 +64,9 @@ func TestVerifyPasswordMalformed(t *testing.T) {
 		"",
 		"pbkdf2$sha256$",
 		"pbkdf2$sha256$abc$x$y",
-		"pbkdf2$sha256$0$c2FsdA$c2FsdA",         // iter < 1
-		"pbkdf2$sha256$99999999999$c2FsdA$c2FsdA", // absurd iter
-		"pbkdf2$sha256$1000$!!!$c2FsdA",           // bad b64 salt
+		"pbkdf2$sha256$0$c2FsdA$c2FsdA", // iter < 1
+		"pbkdf2$sha256$99999999999$c2FsdA$c2FsdA",                          // absurd iter
+		"pbkdf2$sha256$1000$!!!$c2FsdA",                                    // bad b64 salt
 		"nothexnothexnothexnothexnothexnothexnothexnothexnothexnothexnot!", // 64 chars, not hex
 	} {
 		if verifyPassword(bad, "pw", "u") {

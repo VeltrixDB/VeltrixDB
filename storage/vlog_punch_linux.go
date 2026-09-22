@@ -18,9 +18,9 @@ import (
 // than failing GC.
 func vlogPunchHole(f *os.File, length int64) error {
 	const (
-		fallocPunchHole  = 0x2
-		fallocKeepSize   = 0x1
-		fallocMode       = fallocPunchHole | fallocKeepSize
+		fallocPunchHole = 0x2
+		fallocKeepSize  = 0x1
+		fallocMode      = fallocPunchHole | fallocKeepSize
 	)
 	err := syscall.Fallocate(int(f.Fd()), fallocMode, 0, length)
 	if err == syscall.EOPNOTSUPP || err == syscall.ENOSYS {

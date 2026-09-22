@@ -133,15 +133,16 @@ type peerMap map[string]string
 // Connections are established lazily and re-dialled on error.
 type TCPTransport struct {
 	mu     sync.Mutex
-	addrs  peerMap            // nodeID → dial address
-	conns  map[string]net.Conn // cached connections
+	addrs  peerMap                // nodeID → dial address
+	conns  map[string]net.Conn    // cached connections
 	callMu map[string]*sync.Mutex // one mutex per peer — serialises concurrent RPCs
-	tlsCfg *tls.Config // nil = plaintext
+	tlsCfg *tls.Config            // nil = plaintext
 }
 
 // NewTCPTransport creates a plaintext transport that dials the given peer
 // addresses.
-//   peers  — map[nodeID]"host:port"
+//
+//	peers  — map[nodeID]"host:port"
 func NewTCPTransport(peers map[string]string) *TCPTransport {
 	callMu := make(map[string]*sync.Mutex, len(peers))
 	for id := range peers {

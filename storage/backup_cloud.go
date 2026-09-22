@@ -884,12 +884,12 @@ func (u *CloudBackupUploader) gcsGetToken() (string, error) {
 
 // serviceAccountJSON is the minimal shape of a GCP service-account key file.
 type serviceAccountJSON struct {
-	Type                    string `json:"type"`
-	ProjectID               string `json:"project_id"`
-	PrivateKeyID            string `json:"private_key_id"`
-	PrivateKey              string `json:"private_key"`
-	ClientEmail             string `json:"client_email"`
-	TokenURI                string `json:"token_uri"`
+	Type         string `json:"type"`
+	ProjectID    string `json:"project_id"`
+	PrivateKeyID string `json:"private_key_id"`
+	PrivateKey   string `json:"private_key"`
+	ClientEmail  string `json:"client_email"`
+	TokenURI     string `json:"token_uri"`
 }
 
 func gcsTokenFromServiceAccount(credFile string) (string, error) {

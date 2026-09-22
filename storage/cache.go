@@ -6,6 +6,14 @@ import (
 	"sync/atomic"
 )
 
+// hashedGetter is an optional Cache capability: a lookup that reuses a key
+// hash the caller already computed. shardedLIRSCache implements it; plain
+// LIRSCache does not need to (it has no shard to select). The read path type-
+// asserts once at engine construction rather than per operation.
+type hashedGetter interface {
+	getHashed(key string, h uint64) ([]byte, bool)
+}
+
 // Cache is the pluggable data-block cache interface.  Eviction applies only to
 // this layer; the Index Vault (shardedIndex) is never evicted.
 type Cache interface {

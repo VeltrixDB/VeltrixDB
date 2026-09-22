@@ -58,7 +58,7 @@ func (e *cgoBatchEngine) close() {
 // duration of the pin (until Unpin() is called via defer).  This satisfies
 // the CGO rule added in Go 1.21:
 //
-//   "A Go pointer to a pinned Go variable may be stored in C memory."
+//	"A Go pointer to a pinned Go variable may be stored in C memory."
 //
 // Therefore we can store &keyBytes[0] and &r.Value[0] — both in pinned
 // Go heap memory — directly in the C heap BatchPutEntry.key.ptr / .value.ptr

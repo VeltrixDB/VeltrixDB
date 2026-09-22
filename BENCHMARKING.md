@@ -75,3 +75,45 @@ watch -n 2 'W=$(curl -s :2112/metrics | awk "/^veltrixdb_storage_writes_total /{
 # GC and latency at a glance
 curl -s :2112/metrics | grep -E "gc_(run|emerg|skipp)|latency"
 ```
+
+---
+
+## Ordered key index: measuring whether you need it
+
+Every write maintains a skiplist mirroring all live keys so `RANGE` /
+`SCANCUR` can run in O(log N + limit). Point-lookup-only workloads pay for it
+and get nothing. `--disable-ordered-index` turns it off; `RANGE` and `SCANCUR`
+then return `ErrOrderedIndexDisabled` and everything else is unaffected.
+
+Measured cost on darwin/arm64, 18 cores:
+
+| | ordered ON | ordered OFF | delta |
+|---|---|---|---|
+| `MultiPut_1024` wall (benchstat, n=6) | 3.482 ms | 3.304 ms | **−5.09%** (p=0.002) |
+| `MultiPut_1024` allocations | 9416 | 7368 | **−21.75%** (p=0.002) |
+| Resident RAM per live key | 90.7 B | 0 B | **−90.7 B/key** |
+
+**The memory figure is the one that matters at scale: ~85 GB at 1 billion
+keys.** Give it to `--cache` instead. A cache hit is ~90 ns against ~80 µs for
+an NVMe miss, so hit-rate buys far more than any CPU micro-optimisation.
+
+End-to-end `bench.sh` on the same machine, **single run each — indicative
+only, not significant**:
+
+| Phase | ordered ON | ordered OFF |
+|-------|-----------|-------------|
+| Bulk load (MPut) | 583,840 ops/s | 591,955 ops/s |
+| Read-only | 53,789 ops/s | 53,979 ops/s |
+| Mixed 70R/30W | 18,701 ops/s | 18,753 ops/s |
+| Write stress | 575,071 ops/s | 595,563 ops/s |
+| Read P99 | 750.12 µs | 717.04 µs |
+
+Both runs passed the density and GC-emergency gates. The 1–4% deltas are
+within run-to-run variance for an fsync-bound macOS run; the microbenchmark
+above is the rigorous measurement. Re-measure on Linux NVMe before deciding.
+
+To A/B it yourself:
+
+```bash
+EXTRA_SERVER_FLAGS="--disable-ordered-index" ./scripts/bench.sh
+```

@@ -322,11 +322,11 @@ func TestTierManager_RunPassSkipsAlreadyTiered(t *testing.T) {
 
 	// Enqueue with an old LastAccessedNs so age check passes.
 	tm := &TierManager{
-		index:    se.index,
-		vlogs:    se.vlogs,
-		numDisks: len(se.vlogs),
-		config:   se.config,
-		metrics:  se.metrics,
+		index:      se.index,
+		vlogs:      se.vlogs,
+		numDisks:   len(se.vlogs),
+		config:     se.config,
+		metrics:    se.metrics,
 		candidates: make(chan DemotionCandidate, 16),
 		done:       make(chan struct{}),
 	}

@@ -2,6 +2,7 @@ package storage
 
 import (
 	"fmt"
+	"runtime"
 	"sync"
 	"time"
 )
@@ -171,6 +172,8 @@ func (se *StorageEngine) multiPutKVSep(reqs []MultiPutRequest, errs []error) []e
 				shardID uint16
 				crc     uint32
 				packed  bool
+				diskLen uint32 // on-disk blob length (post compress/encrypt)
+				xflags  uint8  // FlagCompressed | FlagEncrypted
 			}
 			committed := make([]stagedEntry, 0, len(idxs))
 			walEntries := make([]*WALEntry, 0, len(idxs))
@@ -180,39 +183,59 @@ func (se *StorageEngine) multiPutKVSep(reqs []MultiPutRequest, errs []error) []e
 				if old, _, exists := se.index.get(r.Key); exists && !old.IsTombstone() && old.DiskOffset > 0 {
 					vl.MarkDead(old.ValueSize, old.IsPacked())
 				}
-				offset, err := batcher.Stage(r.Value)
+				// Same compress→encrypt pipeline as the single-key Put path.
+				// Skipping it here used to mean every batched write (MPUT, the
+				// WriteBatcher, the server's PUT coalescing) stored plaintext
+				// on disk even with --encrypt-at-rest on — silently, because
+				// FlagEncrypted is per-record so reads simply never decrypted.
+				writeBytes, xflags, xerr := se.transformForWrite(r.Value)
+				if xerr != nil {
+					errs[i] = xerr
+					continue
+				}
+				offset, isPacked, err := batcher.Stage(writeBytes)
 				if err != nil {
 					errs[i] = fmt.Errorf("vlog stage: %w", err)
 					continue
 				}
-				isPacked := vlogHeaderBytes+len(r.Value) <= vlogBlockSize
 				committed = append(committed, stagedEntry{
 					reqIdx:  i,
 					offset:  offset,
 					shardID: prep[j].shardID,
 					crc:     prep[j].crc,
 					packed:  isPacked,
+					diskLen: uint32(len(writeBytes)),
+					xflags:  xflags,
 				})
-				walEntries = append(walEntries, &WALEntry{
-					Timestamp:  nowNs,
-					Key:        r.Key,
-					KeyLen:     uint32(len(r.Key)),
-					ValueLen:   uint32(len(r.Value)),
-					Value:      nil, // value lives in VLog after Flush
-					Checksum:   prep[j].crc,
-					Version:    se.version.Add(1),
-					VLogOffset: offset,
-					Packed:     isPacked,
-				})
+				// Pooled, as the single-key Put path already does: these
+				// die once appendAll has serialized them, and allocating one
+				// per key cost 1024 allocations per 1024-entry batch.
+				we := walEntryPool.Get().(*WALEntry)
+				we.Timestamp = nowNs
+				we.Key = r.Key
+				we.KeyLen = uint32(len(r.Key))
+				// ValueLen is the plaintext length; DiskValueLen is what
+				// actually landed in the VLog. Replay needs both.
+				we.ValueLen = uint32(len(r.Value))
+				we.Value = nil // value lives in VLog after Flush
+				we.Checksum = prep[j].crc
+				we.ReplicationID = 0
+				we.IsTombstone = false
+				we.Version = se.version.Add(1)
+				we.VLogOffset = offset
+				we.Packed = isPacked
+				we.DiskValueLen = uint32(len(writeBytes))
+				we.XformFlags = xflags
+				walEntries = append(walEntries, we)
 				walEntryIdx = append(walEntryIdx, i)
 			}
 
 			// Phase 2: WAL appendAll and VLog Flush run concurrently.
 			// Effective fsync wait = max(WAL_fsync, VLog_fsync), not the sum.
 			var (
-				walErrs       []error
-				vlogFlushErr  error
-				phase2Wg      sync.WaitGroup
+				walErrs      []error
+				vlogFlushErr error
+				phase2Wg     sync.WaitGroup
 			)
 			if len(walEntries) > 0 {
 				phase2Wg.Add(2)
@@ -225,6 +248,13 @@ func (se *StorageEngine) multiPutKVSep(reqs []MultiPutRequest, errs []error) []e
 					vlogFlushErr = batcher.Flush()
 				}()
 				phase2Wg.Wait()
+
+				// appendAll has serialized every entry, so the envelopes can
+				// go back. Done here rather than after phase 4 because
+				// nothing below reads them.
+				for _, we := range walEntries {
+					walEntryPool.Put(we)
+				}
 			}
 
 			// Phase 3: apply errors. VLog Flush failure poisons every staged
@@ -249,10 +279,12 @@ func (se *StorageEngine) multiPutKVSep(reqs []MultiPutRequest, errs []error) []e
 				}
 				r := reqs[s.reqIdx]
 				entry := &IndexEntry{
-					KeyHash:          fnv64a(r.Key),
-					DiskOffset:       uint64(s.offset),
-					SegmentID:        uint32(d),
-					ValueSize:        uint32(len(r.Value)),
+					KeyHash:    fnv64a(r.Key),
+					DiskOffset: uint64(s.offset),
+					SegmentID:  uint32(d),
+					// ValueSize is the on-disk blob (what ReadValue pulls);
+					// UncompressedSize is the plaintext the read path restores.
+					ValueSize:        s.diskLen,
 					UncompressedSize: uint32(len(r.Value)),
 					KeySize:          uint32(len(r.Key)),
 					WriteTimestampUs: nowUs,
@@ -263,6 +295,7 @@ func (se *StorageEngine) multiPutKVSep(reqs []MultiPutRequest, errs []error) []e
 				if s.packed {
 					entry.Flags |= FlagPacked
 				}
+				entry.Flags |= s.xflags
 				if r.TTL > 0 {
 					entry.Flags |= FlagHasTTL
 					entry.TTLExpiryUs = nowUs + int64(r.TTL)*1_000_000
@@ -279,40 +312,72 @@ func (se *StorageEngine) multiPutKVSep(reqs []MultiPutRequest, errs []error) []e
 	return errs
 }
 
-// MultiGet executes all reads concurrently, grouped by shard.
+// multiGetParallelThreshold is the batch size below which MultiGet stays on
+// the calling goroutine. Below it, goroutine scheduling costs more than the
+// per-key work it parallelises.
+const multiGetParallelThreshold = 16
+
+// MultiGet reads many keys concurrently.
 //
-// Keys in the same shard are read sequentially under a single RLock, while
-// different shards are read in parallel.  Returns one result per key in the
-// same order as the input slice.
+// Work is split into GOMAXPROCS contiguous chunks rather than grouped by index
+// shard. The previous implementation built a map[uint16][]int preallocated for
+// `numShards` (8192) entries on every call and launched one goroutine per
+// distinct shard. Both were costly and neither bought anything:
+//
+//   - The 8192-entry map dominated the allocation profile: a 256-key batch
+//     spent ~573 KB and ~1046 allocations to produce 256 results.
+//   - Up to one goroutine per key was spawned, each performing a single Get.
+//   - The grouping was meant to amortise a shard lock across same-shard keys,
+//     but the body calls se.Get(), which takes and releases the shard lock
+//     itself per key. Same-shard keys shared nothing, so grouping was pure
+//     overhead.
+//
+// Chunking gives the same parallelism with a bounded, CPU-proportional
+// goroutine count and no intermediate map. Result ordering is unchanged: each
+// worker writes only its own disjoint index range, so no synchronisation is
+// needed on `results`.
 func (se *StorageEngine) MultiGet(keys []string) []MultiGetResult {
 	results := make([]MultiGetResult, len(keys))
 	if len(keys) == 0 {
 		return results
 	}
 
-	groups := make(map[uint16][]int, numShards)
-	for i, key := range keys {
-		sid := uint16(fnv64a(key) & (numShards - 1))
-		groups[sid] = append(groups[sid], i)
+	read := func(i int) {
+		val, err := se.Get(keys[i])
+		results[i] = MultiGetResult{
+			Key:   keys[i],
+			Value: val,
+			Found: err == nil && val != nil,
+			Err:   err,
+		}
 	}
 
+	workers := runtime.GOMAXPROCS(0)
+	if workers > len(keys) {
+		workers = len(keys)
+	}
+	// Small batches are not worth the scheduling round-trip.
+	if workers <= 1 || len(keys) < multiGetParallelThreshold {
+		for i := range keys {
+			read(i)
+		}
+		return results
+	}
+
+	chunk := (len(keys) + workers - 1) / workers
 	var wg sync.WaitGroup
-	wg.Add(len(groups))
-	for sid, idxs := range groups {
-		sid, idxs := sid, idxs
-		go func() {
+	for start := 0; start < len(keys); start += chunk {
+		end := start + chunk
+		if end > len(keys) {
+			end = len(keys)
+		}
+		wg.Add(1)
+		go func(lo, hi int) {
 			defer wg.Done()
-			_ = sid
-			for _, i := range idxs {
-				val, err := se.Get(keys[i])
-				results[i] = MultiGetResult{
-					Key:   keys[i],
-					Value: val,
-					Found: err == nil && val != nil,
-					Err:   err,
-				}
+			for i := lo; i < hi; i++ {
+				read(i)
 			}
-		}()
+		}(start, end)
 	}
 	wg.Wait()
 	return results

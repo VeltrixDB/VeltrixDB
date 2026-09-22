@@ -31,14 +31,7 @@ func newTestEngine2Disks(t *testing.T) *StorageEngine {
 		os.RemoveAll(dir1)
 	})
 
-	cfg := DefaultStorageConfig()
-	cfg.DataDirPath = ""
-	cfg.DataDirPaths = []string{dir0, dir1}
-	cfg.CacheMaxSizeMB = 16
-	cfg.NumShards = 1024
-	cfg.WALFlushWindowMs = 1
-	cfg.VLogFlushWindowMs = 1
-	cfg.ScrubEnabled = false
+	cfg := testStorageConfig(dir0, dir1)
 
 	se, err := NewStorageEngine(cfg)
 	if err != nil {
@@ -285,10 +278,13 @@ func TestEngine_CrashRecovery(t *testing.T) {
 	t.Cleanup(func() { os.RemoveAll(dir) })
 
 	cfg := DefaultStorageConfig()
+	// 4 K bits/shard x 8192 shards = 4 MB. The 512 MB production
+	// default is eagerly allocated per engine and the suite builds
+	// many; tests do not need a production false-positive rate.
+	cfg.BloomFilterShardBits = 1 << 12
 	cfg.DataDirPath = dir
 	cfg.DataDirPaths = nil
 	cfg.CacheMaxSizeMB = 16
-	cfg.NumShards = 1024
 	cfg.WALFlushWindowMs = 1
 	cfg.VLogFlushWindowMs = 1
 	cfg.ScrubEnabled = false

@@ -13,9 +13,9 @@ import (
 // ── mock text-protocol server ─────────────────────────────────────────────────
 
 type textServer struct {
-	ln   net.Listener
-	wg   sync.WaitGroup
-	mu   sync.Mutex
+	ln    net.Listener
+	wg    sync.WaitGroup
+	mu    sync.Mutex
 	conns []net.Conn
 
 	// store is a simple in-memory KV for GET/PUT/DEL.
@@ -23,6 +23,12 @@ type textServer struct {
 	store   map[string]string
 
 	// authRequired, if set, causes AUTH to check these credentials.
+	//
+	// These are read by connection-handler goroutines, so they must be set
+	// BEFORE serve() is started — hence newTextServerAuth rather than
+	// assignment after construction. Assigning post-construction is a data
+	// race even when the test happens to dial afterwards, because nothing
+	// establishes a happens-before edge with the handler goroutine.
 	authRequired bool
 	authUser     string
 	authPass     string
@@ -30,13 +36,26 @@ type textServer struct {
 
 func newTextServer(t *testing.T) *textServer {
 	t.Helper()
+	return newTextServerAuth(t, false, "", "")
+}
+
+// newTextServerAuth builds a mock server with credentials already installed,
+// so the handler goroutines observe them without a race.
+func newTextServerAuth(t *testing.T, required bool, user, pass string) *textServer {
+	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	ts := &textServer{ln: ln, store: make(map[string]string)}
+	ts := &textServer{
+		ln:           ln,
+		store:        make(map[string]string),
+		authRequired: required,
+		authUser:     user,
+		authPass:     pass,
+	}
 	ts.wg.Add(1)
-	go ts.serve()
+	go ts.serve() // starting the goroutine here publishes the fields above
 	t.Cleanup(ts.close)
 	return ts
 }
@@ -255,10 +274,7 @@ func TestInfo(t *testing.T) {
 }
 
 func TestAuth_Success(t *testing.T) {
-	ts := newTextServer(t)
-	ts.authRequired = true
-	ts.authUser = "alice"
-	ts.authPass = "secret"
+	ts := newTextServerAuth(t, true, "alice", "secret")
 
 	conn, err := DialTCP(ts.addr(), time.Second)
 	if err != nil {
@@ -276,10 +292,7 @@ func TestAuth_Success(t *testing.T) {
 }
 
 func TestAuth_Failure(t *testing.T) {
-	ts := newTextServer(t)
-	ts.authRequired = true
-	ts.authUser = "alice"
-	ts.authPass = "secret"
+	ts := newTextServerAuth(t, true, "alice", "wrong-on-purpose")
 
 	conn, err := DialTCP(ts.addr(), time.Second)
 	if err != nil {
@@ -287,7 +300,7 @@ func TestAuth_Failure(t *testing.T) {
 	}
 	defer conn.Close()
 
-	if err := conn.Auth("alice", "wrong"); err == nil {
+	if err := conn.Auth("alice", "definitely-not-the-password"); err == nil {
 		t.Fatal("expected error on bad credentials")
 	}
 }

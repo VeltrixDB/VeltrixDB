@@ -437,12 +437,12 @@ func (d *Defragmenter) compactVLog(diskIdx int, vl *VLog) {
 
 	// gcReloc holds the state needed to CAS-update the index after a batch flush.
 	type gcReloc struct {
-		key         string
-		oldOffset   uint64
-		newOffset   int64
-		valueSize   uint32 // used for MarkDead on both success and CAS-fail paths
-		oldPacked   bool   // packed flag of the record being relocated (for MarkDead)
-		newPacked   bool   // true when relocated copy is packed (always true today — VLogBatcher packs)
+		key       string
+		oldOffset uint64
+		newOffset int64
+		valueSize uint32 // used for MarkDead on both success and CAS-fail paths
+		oldPacked bool   // packed flag of the record being relocated (for MarkDead)
+		newPacked bool   // whether the relocated copy was packed (as reported by Stage)
 	}
 
 	batcher := vl.NewBatcher()
@@ -485,7 +485,7 @@ func (d *Defragmenter) compactVLog(diskIdx int, vl *VLog) {
 				// The orphan is in a packed block (we just wrote it via
 				// VLogBatcher), so the orphan's footprint is its raw size.
 				d.metrics.VLogGCCASFails.Add(1)
-				vl.MarkDead(r.valueSize, true /* newPacked: orphan is in our packed block */)
+				vl.MarkDead(r.valueSize, r.newPacked) // orphan's footprint follows how it was staged
 				deferPostCAS++
 				batchCASFails++
 				if casLogCount < gcCASLogMax {
@@ -589,7 +589,7 @@ func (d *Defragmenter) compactVLog(diskIdx int, vl *VLog) {
 
 		// Stage: reserve a new offset and buffer the record.  No disk I/O yet —
 		// the fdatasync happens only at Flush, shared across gcBatchSize records.
-		newOffset, err := batcher.Stage(value)
+		newOffset, newPacked, err := batcher.Stage(value)
 		if err != nil {
 			deferIOErr++
 			continue
@@ -600,7 +600,12 @@ func (d *Defragmenter) compactVLog(diskIdx int, vl *VLog) {
 			oldOffset: c.diskOffset,
 			newOffset: newOffset,
 			oldPacked: c.packed,
-			newPacked: true, // VLogBatcher packs all relocated records
+			// Take packed-ness from Stage rather than assuming it. Records
+			// bigger than a 4 KB block fall back to the unpacked path, and
+			// marking one of those packed makes MarkDead subtract only
+			// header+value instead of the whole aligned span — liveBytes
+			// drifts permanently high and GCRatio under-reports garbage.
+			newPacked: newPacked,
 
 			valueSize: c.valueSize,
 		})

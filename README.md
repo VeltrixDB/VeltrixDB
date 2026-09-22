@@ -82,7 +82,9 @@ In the YCSB run above (100M operations): **zero errors and zero GC emergency eve
 
 **LIRS cache.** Scan-resistant eviction: large sequential reads don't evict your hot keys. Small values (≤256 B) get higher eviction priority, keeping the working set in RAM even under mixed workloads.
 
-**C++ io_uring on Linux.** The optional C++ layer uses `io_uring` SQPOLL + `O_DIRECT` for VLog reads, an Adaptive Radix Tree (ART) index on 2 MB hugepages, and NUMA-aware thread pinning. The Go layer is cross-platform; the C++ layer adds ~25 µs off the NVMe read P99 on production hardware.
+**Optional C++ acceleration on Linux.** With `CGO_ENABLED=1` on Linux, a C++ layer adds a vectorized batch-put engine, an `io_uring` SQPOLL reader and NUMA-aware thread pinning. Everything else runs in Go, including the index, the VLog read path and the LIRS cache.
+
+> The published Docker image is built `CGO_ENABLED=0` and contains no C++ — the benchmarks above are the pure-Go path. An ART index and a priority io_uring scheduler exist under `cpp/` but have no Go call site and do not run; see [cpp/README.md](cpp/README.md). Earlier revisions of this section claimed both as shipped features.
 
 ---
 

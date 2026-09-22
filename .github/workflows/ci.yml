@@ -28,14 +28,47 @@ jobs:
           go-version: "1.21"
           cache: true
 
+      - name: gofmt
+        run: |
+          unformatted="$(gofmt -l $(find . -name '*.go' -not -path './dist/*'))"
+          if [ -n "$unformatted" ]; then
+            echo "::error::these files are not gofmt-clean:"
+            echo "$unformatted"
+            gofmt -d $(echo "$unformatted")
+            exit 1
+          fi
+
       - name: build
         run: CGO_ENABLED=0 go build ./...
 
       - name: vet
         run: CGO_ENABLED=0 go vet ./...
 
+      # Put test scratch on tmpfs.
+      #
+      # THIS is why the storage suite took 45+ minutes on a runner and 18
+      # seconds on a developer laptop, and no timeout tuning was ever going to
+      # close that gap. Every Put fdatasyncs twice (WAL and VLog). On macOS
+      # syscall.Fsync is plain fsync(2), which on Darwin returns as soon as the
+      # write reaches the drive cache — effectively free. On Linux,
+      # syscall.Fdatasync against a runner's network-backed disk is a real
+      # round trip, and the suite performs thousands of them across tests that
+      # run in parallel and contend for the same device.
+      #
+      # t.TempDir() honours TMPDIR, so pointing it at tmpfs makes those syncs
+      # memory-speed. Durability semantics are unchanged — the code still
+      # calls fdatasync, it just lands on a RAM-backed filesystem.
+      # 1G, not 6G: tmpfs pages are RAM. Measured peak scratch usage is 4.9 MB
+      # for the storage suite and 10.2 MB for integration, so 1G is ~100x
+      # headroom, and the 5G it gives back matters on a 16 GB runner.
+      - name: mount tmpfs for test scratch
+        run: |
+          sudo mkdir -p /mnt/veltrix-tmp
+          sudo mount -t tmpfs -o size=1G,mode=1777 tmpfs /mnt/veltrix-tmp
+          df -h /mnt/veltrix-tmp
+
       - name: storage + adminapi tests
-        run: CGO_ENABLED=0 go test -timeout 120s -count=1 ./storage/... ./adminapi/...
+        run: CGO_ENABLED=0 TMPDIR=/mnt/veltrix-tmp go test -timeout 300s -count=1 ./storage/... ./adminapi/...
 
       - name: client + security + tracing tests
         run: CGO_ENABLED=0 go test -timeout 60s -count=1 ./client/... ./security/... ./tracing/...
@@ -111,17 +144,67 @@ jobs:
           go-version: "1.21"
           cache: true
 
+      # Put test scratch on tmpfs.
+      #
+      # THIS is why the storage suite took 45+ minutes on a runner and 18
+      # seconds on a developer laptop, and no timeout tuning was ever going to
+      # close that gap. Every Put fdatasyncs twice (WAL and VLog). On macOS
+      # syscall.Fsync is plain fsync(2), which on Darwin returns as soon as the
+      # write reaches the drive cache — effectively free. On Linux,
+      # syscall.Fdatasync against a runner's network-backed disk is a real
+      # round trip, and the suite performs thousands of them across tests that
+      # run in parallel and contend for the same device.
+      #
+      # t.TempDir() honours TMPDIR, so pointing it at tmpfs makes those syncs
+      # memory-speed. Durability semantics are unchanged — the code still
+      # calls fdatasync, it just lands on a RAM-backed filesystem.
+      # 1G, not 6G: tmpfs pages are RAM. Measured peak scratch usage is 4.9 MB
+      # for the storage suite and 10.2 MB for integration, so 1G is ~100x
+      # headroom, and the 5G it gives back matters on a 16 GB runner.
+      - name: mount tmpfs for test scratch
+        run: |
+          sudo mkdir -p /mnt/veltrix-tmp
+          sudo mount -t tmpfs -o size=1G,mode=1777 tmpfs /mnt/veltrix-tmp
+          df -h /mnt/veltrix-tmp
+
       - name: build server binary
         run: CGO_ENABLED=0 go build -o /tmp/veltrixdb ./cmd/server
 
       - name: build backup binary
         run: CGO_ENABLED=0 go build -o /tmp/veltrixdb-backup ./cmd/backup
 
+      # Output is teed to a file and uploaded on failure. A -v run is long
+      # enough that the interesting "--- FAIL:" line scrolls far above the
+      # tail, which is all anyone reads from a failed job; without the
+      # artifact the actual assertion is effectively unrecoverable.
       - name: integration tests (starts 3 in-process server nodes)
-        run: CGO_ENABLED=0 go test -v -timeout 300s -count=1 ./tests/integration/...
+        run: |
+          set -o pipefail
+          CGO_ENABLED=0 go test -v -timeout 300s -count=1 ./tests/integration/... \
+            2>&1 | tee /tmp/integration-test-output.txt
         env:
           VELTRIX_SERVER_BIN: /tmp/veltrixdb
           VELTRIX_BACKUP_BIN: /tmp/veltrixdb-backup
+          TMPDIR: /mnt/veltrix-tmp
+
+      # Re-print just the failures at the very end of the log, so the job
+      # summary shows what broke without downloading anything.
+      - name: summarise failures
+        if: failure()
+        run: |
+          echo "───────── FAILED TESTS ─────────"
+          grep -E '^--- FAIL|^\s+--- FAIL|^    .*_test\.go:[0-9]+:' \
+            /tmp/integration-test-output.txt | head -60 || echo "(no --- FAIL lines found)"
+          echo "────────────────────────────────"
+
+      - name: upload full test output
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-test-output
+          path: /tmp/integration-test-output.txt
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: upload server logs on failure
         if: failure()
@@ -188,6 +271,214 @@ jobs:
         run: |
           bash scripts/push-ci-metrics.sh \
             --job    "node-4-paper-changes" \
+            --start  "${{ steps.t0.outputs.ts }}" \
+            --status "${{ job.status }}" \
+            --run-id "${{ github.run_id }}" \
+            --sha    "${{ github.sha }}" \
+            --branch "${{ github.ref_name }}"
+
+  # ── Node 5: race detector ─────────────────────────────────────────────────
+  # -race REQUIRES cgo, and enabling cgo silently switches the storage engine
+  # onto the C++ path: every NewStorageEngine would build an io_uring bridge
+  # with SQPOLL (a busy-polling kernel thread per ring) plus NumCPU() C++
+  # worker threads. A test suite constructs dozens of engines, and on a 2-core
+  # runner that starved the job into a 30-minute timeout (SIGTERM, exit 143).
+  #
+  # So: cgo ON (for -race), C++ engine OFF (via VELTRIXDB_DISABLE_CGO_ENGINE).
+  # This job is here to find data races in the Go logic; node-6-cpp is what
+  # exercises the C++ layer.
+  #
+  # Split into a matrix so each group gets its own timeout budget and they run
+  # in parallel — -race is roughly 5-10x slower on a 2-core runner.
+  node-5-race:
+    name: "Node 5 — race (${{ matrix.group }})"
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - group: storage
+            pkgs: "./storage/..."
+          - group: server
+            pkgs: "./cmd/server/..."
+          - group: cluster
+            pkgs: "./consensus/... ./cluster/... ./replication/..."
+          - group: rest
+            pkgs: "./adminapi/... ./client/... ./security/... ./tracing/..."
+    env:
+      CGO_ENABLED: "1"
+      VELTRIXDB_DISABLE_CGO_ENGINE: "1"
+      # TMPDIR is deliberately NOT set at job level: actions/setup-go runs
+      # `go env` during its own setup, before the mount step below exists, and
+      # the Go toolchain creates its work dir under TMPDIR — so a job-level
+      # value fails the whole job with "creating work dir: stat
+      # /mnt/veltrix-tmp: no such file or directory". Set it on the test step.
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: record start time
+        id: t0
+        run: echo "ts=$(date +%s)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.21"
+          cache: true
+
+      # Put test scratch on tmpfs.
+      #
+      # THIS is why the storage suite took 45+ minutes on a runner and 18
+      # seconds on a developer laptop, and no timeout tuning was ever going to
+      # close that gap. Every Put fdatasyncs twice (WAL and VLog). On macOS
+      # syscall.Fsync is plain fsync(2), which on Darwin returns as soon as the
+      # write reaches the drive cache — effectively free. On Linux,
+      # syscall.Fdatasync against a runner's network-backed disk is a real
+      # round trip, and the suite performs thousands of them across tests that
+      # run in parallel and contend for the same device.
+      #
+      # t.TempDir() honours TMPDIR, so pointing it at tmpfs makes those syncs
+      # memory-speed. Durability semantics are unchanged — the code still
+      # calls fdatasync, it just lands on a RAM-backed filesystem.
+      # 1G, not 6G: tmpfs pages are RAM. Measured peak scratch usage is 4.9 MB
+      # for the storage suite and 10.2 MB for integration, so 1G is ~100x
+      # headroom, and the 5G it gives back matters on a 16 GB runner.
+      - name: mount tmpfs for test scratch
+        run: |
+          sudo mkdir -p /mnt/veltrix-tmp
+          sudo mount -t tmpfs -o size=1G,mode=1777 tmpfs /mnt/veltrix-tmp
+          df -h /mnt/veltrix-tmp
+
+      # cgo on Linux compiles the storage package's C++ shims, which include
+      # liburing headers even though the engine itself is disabled above.
+      - name: install liburing
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends liburing-dev
+
+      # -timeout is deliberately WELL BELOW timeout-minutes.
+      #
+      # Previously it was 2400s against a 45-minute job budget, so the runner
+      # SIGTERMed the job (exit 143) before Go's own timeout could fire — which
+      # meant no diagnostics at all, just "exit code 143". Go's timeout, by
+      # contrast, panics and dumps every goroutine's stack, which names the
+      # thing that is stuck.
+      #
+      # These groups take 18-30s locally on 2 cores under -race, so 600s is
+      # ~20x headroom. If a group exceeds it, we want the stack dump, not a
+      # silent kill. -v so the last "=== RUN" identifies the offending test.
+      - name: "${{ matrix.group }} under -race"
+        env:
+          TMPDIR: /mnt/veltrix-tmp
+        run: |
+          set -o pipefail
+          go test -race -v -timeout 600s -count=1 ${{ matrix.pkgs }} \
+            2>&1 | tee /tmp/race-${{ matrix.group }}.txt
+
+      # On a hang, Go's timeout panic dumps every goroutine; on a failure, the
+      # assertion is buried mid-log. Surface both at the end of the job.
+      - name: summarise failures
+        if: failure()
+        run: |
+          echo "───────── FAILED TESTS ─────────"
+          grep -E '^--- FAIL|^\s+--- FAIL' /tmp/race-${{ matrix.group }}.txt | head -40 \
+            || echo "(none — likely a timeout/panic, see below)"
+          echo "───────── PANIC / TIMEOUT ──────"
+          grep -A40 -E '^panic:|test timed out' /tmp/race-${{ matrix.group }}.txt | head -80 \
+            || echo "(no panic)"
+          echo "────────────────────────────────"
+
+      - name: upload full test output
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: race-output-${{ matrix.group }}
+          path: /tmp/race-${{ matrix.group }}.txt
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: push CI metrics
+        if: always()
+        env:
+          PUSH_GW_URL: ${{ secrets.PUSH_GW_URL }}
+        run: |
+          bash scripts/push-ci-metrics.sh \
+            --job    "node-5-race-${{ matrix.group }}" \
+            --start  "${{ steps.t0.outputs.ts }}" \
+            --status "${{ job.status }}" \
+            --run-id "${{ github.run_id }}" \
+            --sha    "${{ github.sha }}" \
+            --branch "${{ github.ref_name }}"
+
+  # ── Node 6: C++ layer ─────────────────────────────────────────────────────
+  # No other job compiles cpp/ at all: every Go job is CGO_ENABLED=0, and the
+  # published Docker image is too. A change under cpp/ was therefore completely
+  # unverified. This builds both halves of the C++ story:
+  #   1. the CMake static lib (libveltrixdb_engine.a)
+  #   2. the cgo shims in storage/, which compile batch_engine.cpp,
+  #      uring_reader.cpp and numa_topology.cpp into the Go package
+  node-6-cpp:
+    name: "Node 6 — C++ / cgo build"
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # GATING. Every source under cpp/ was verified to compile before this
+    # job was allowed to block: each was run through the compiler against the
+    # REAL liburing headers (fetched from axboe/liburing), not a hand-written
+    # stub, so API misuse would have surfaced. That verification found and
+    # fixed a genuine bug — cpp/include/shard.hpp declared `class alignas(64)
+    # Shard` while holding an alignas(4096) member, which is ill-formed
+    # ([dcl.align]/5). It had gone unnoticed because nothing compiled
+    # shard.cpp.
+    #
+    # Residual risk this job exists to cover: the local check used clang, CI
+    # uses g++, and -fsyntax-only does not link. The one clang/GCC divergence
+    # this codebase documents (CWG 1497, invariant 12) was checked by hand —
+    # Defragmenter::Config is the only nested config struct and already uses a
+    # constructor initializer list.
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: record start time
+        id: t0
+        run: echo "ts=$(date +%s)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.21"
+          cache: true
+
+      - name: install liburing + cmake
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends liburing-dev cmake g++
+
+      - name: cmake configure + build
+        run: |
+          cmake -S cpp -B cpp/build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_COMPILER=g++ \
+            -DBUILD_SHARED_LIBS=OFF
+          cmake --build cpp/build --parallel "$(nproc)"
+
+      - name: cgo build (compiles the storage/ C++ shims)
+        run: CGO_ENABLED=1 go build ./storage/... ./cmd/server/...
+
+      - name: cgo vet
+        run: CGO_ENABLED=1 go vet ./storage/...
+
+      - name: storage tests with cgo enabled
+        run: CGO_ENABLED=1 go test -timeout 300s -count=1 ./storage/...
+
+      - name: full build via scripts/build.sh
+        run: VERSION=ci ./scripts/build.sh --output /tmp/dist
+
+      - name: push CI metrics
+        if: always()
+        env:
+          PUSH_GW_URL: ${{ secrets.PUSH_GW_URL }}
+        run: |
+          bash scripts/push-ci-metrics.sh \
+            --job    "node-6-cpp" \
             --start  "${{ steps.t0.outputs.ts }}" \
             --status "${{ job.status }}" \
             --run-id "${{ github.run_id }}" \

@@ -184,10 +184,10 @@ func hashPassword(password, username string) string {
 
 // ConnAuth is attached to each TCP connection to track login state.
 type ConnAuth struct {
-	enforcer    *AuthEnforcer
-	Granted     Permission
+	enforcer      *AuthEnforcer
+	Granted       Permission
 	Authenticated bool
-	Username    string
+	Username      string
 }
 
 // NewConnAuth creates a new per-connection auth tracker.
@@ -227,8 +227,8 @@ func (ca *ConnAuth) Check(perm Permission) error {
 // ── Sentinel errors ───────────────────────────────────────────────────────────
 
 var (
-	ErrUnauthorized    = fmt.Errorf("AUTH failed: invalid username or password")
+	ErrUnauthorized     = fmt.Errorf("AUTH failed: invalid username or password")
 	ErrNotAuthenticated = fmt.Errorf("AUTH required: send AUTH <user> <password> first")
-	ErrForbidden       = fmt.Errorf("FORBIDDEN: insufficient permissions for this operation")
-	ErrAuthDisabled    = fmt.Errorf("AUTH disabled: server does not require authentication")
+	ErrForbidden        = fmt.Errorf("FORBIDDEN: insufficient permissions for this operation")
+	ErrAuthDisabled     = fmt.Errorf("AUTH disabled: server does not require authentication")
 )

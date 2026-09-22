@@ -208,7 +208,7 @@ func listKeys(admin, prefix string) []string {
 	}
 	defer resp.Body.Close()
 	var stats struct {
-		IndexKeys  int          `json:"index_keys"`
+		IndexKeys  int                          `json:"index_keys"`
 		Namespaces []struct{ Namespace string } `json:"namespaces"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&stats); err != nil {

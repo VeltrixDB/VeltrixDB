@@ -98,8 +98,26 @@ trap cleanup EXIT
 # ── Phase 1: build + start ────────────────────────────────────────────────────
 hdr "phase 1: build + start"
 say "building veltrixdb + loadtest"
-go build -o "${SERVER_BIN}" ./cmd/server >>"${RUN_LOG}" 2>&1 || fail "server build failed (see ${RUN_LOG})"
-go build -o "${LOAD_BIN}"   ./cmd/loadtest >>"${RUN_LOG}" 2>&1 || fail "loadtest build failed"
+# Default to CGO_ENABLED=0, matching how the published Docker image and every
+# CI job are built — so the harness measures the artifact people actually run.
+#
+# It is also required on macOS: with cgo enabled Go links through clang, and
+# recent Xcode toolchains emit a binary with no LC_UUID load command, which
+# dyld refuses to start ("missing LC_UUID load command", SIGABRT). That made
+# this script unrunnable on macOS despite the header advertising dev runs.
+#
+# Export CGO_ENABLED=1 explicitly to benchmark the C++-accelerated build on
+# Linux.
+BENCH_CGO="${CGO_ENABLED:-0}"
+say "building with CGO_ENABLED=${BENCH_CGO}"
+CGO_ENABLED="${BENCH_CGO}" go build -o "${SERVER_BIN}" ./cmd/server >>"${RUN_LOG}" 2>&1 || fail "server build failed (see ${RUN_LOG})"
+CGO_ENABLED="${BENCH_CGO}" go build -o "${LOAD_BIN}"   ./cmd/loadtest >>"${RUN_LOG}" 2>&1 || fail "loadtest build failed"
+
+# Fail loudly here rather than 30 s later at "server never became ready".
+"${SERVER_BIN}" --help >/dev/null 2>&1 || {
+  "${SERVER_BIN}" --help 2>&1 | head -3 >>"${RUN_LOG}"
+  fail "built server binary will not execute (see ${RUN_LOG})"
+}
 say "binaries: ${SERVER_BIN} ${LOAD_BIN}"
 
 # Wipe data dirs (only the ones we manage; refuse to wipe /mnt/nvmeX paths)
@@ -128,6 +146,13 @@ fi
 if [[ -n "${RAW_VLOGS}" ]]; then
   server_args+=(--raw-vlogs "${RAW_VLOGS}")
   say "raw VLog mode: ${RAW_VLOGS}"
+fi
+# EXTRA_SERVER_FLAGS lets a run A/B a server option without editing this
+# script, e.g. EXTRA_SERVER_FLAGS="--disable-ordered-index" ./scripts/bench.sh
+if [[ -n "${EXTRA_SERVER_FLAGS:-}" ]]; then
+  # shellcheck disable=SC2206 — deliberate word-splitting into separate flags
+  server_args+=(${EXTRA_SERVER_FLAGS})
+  say "extra server flags: ${EXTRA_SERVER_FLAGS}"
 fi
 
 say "starting server: ${SERVER_BIN} ${server_args[*]}"

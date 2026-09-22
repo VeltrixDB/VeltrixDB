@@ -1,7 +1,6 @@
 package hardware
 
 import (
-	"math/bits"
 	"time"
 
 	"github.com/VeltrixDB/veltrixdb/storage"
@@ -37,9 +36,6 @@ func AutoConfig(p *Profile, diskPaths []string) *storage.StorageConfig {
 	cfg.MaxMemorySizeMB = combined * 15 / 100
 	cfg.CacheMaxSizeMB = uint32(combined * 85 / 100)
 
-	// ── Sharding ─────────────────────────────────────────────────────────
-	cfg.NumShards = nearestPow2Capped256(p.CPUCores * 8)
-
 	// ── Compaction ───────────────────────────────────────────────────────
 	threads := p.CPUCores / 4
 	switch {
@@ -66,22 +62,6 @@ func AutoConfig(p *Profile, diskPaths []string) *storage.StorageConfig {
 	}
 
 	return cfg
-}
-
-// nearestPow2Capped256 returns the smallest power-of-2 that is ≥ n, capped at 256.
-// The bitmask & 0xFF in shard routing makes 256 the hard ceiling (CLAUDE.md invariant 1).
-func nearestPow2Capped256(n int) int {
-	if n < 1 {
-		n = 1
-	}
-	p := 1 << bits.Len(uint(n-1))
-	if p < 1 {
-		p = 1
-	}
-	if p > 256 {
-		return 256
-	}
-	return p
 }
 
 // sstMaxSize returns 512 MB for all-NVMe setups, 64 MB when any HDD is present.

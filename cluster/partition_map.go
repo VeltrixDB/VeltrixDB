@@ -13,7 +13,7 @@ import (
 type NodeState int
 
 const (
-	NodeStateActive    NodeState = iota
+	NodeStateActive NodeState = iota
 	NodeStateSuspect
 	NodeStateFailed
 	NodeStateRecovering
@@ -29,29 +29,29 @@ type Node struct {
 	Rack          string       // failure domain (rack / cloud zone); "" if unknown. See SetNodeRack.
 	State         atomic.Value // NodeState
 	LastHeartbeat int64        // Unix nanoseconds
-	Version       uint64        // Partition map version
+	Version       uint64       // Partition map version
 	RepairCount   atomic.Uint64
 }
 
 // PartitionReplica represents a single partition replica
 type PartitionReplica struct {
-	PartitionID   uint32
-	NodeID        string
-	Role          string // "primary" or "replica"
-	SequenceNum   uint64
-	Version       uint64
+	PartitionID uint32
+	NodeID      string
+	Role        string // "primary" or "replica"
+	SequenceNum uint64
+	Version     uint64
 }
 
 // PartitionMap maps hash ranges to nodes
 type PartitionMap struct {
-	mu              sync.RWMutex
-	Version         uint64
-	Timestamp       int64
-	Nodes           map[string]*Node
-	Partitions      map[uint32]*PartitionInfo
-	Ring            *ConsistentHashRing
+	mu                sync.RWMutex
+	Version           uint64
+	Timestamp         int64
+	Nodes             map[string]*Node
+	Partitions        map[uint32]*PartitionInfo
+	Ring              *ConsistentHashRing
 	ReplicationFactor int
-	metrics         *ClusterMetrics
+	metrics           *ClusterMetrics
 
 	// epoch is the split-brain fencing counter. Every membership-changing
 	// operation (AddNode / RemoveNode and their fenced *WithEpoch variants)
@@ -104,30 +104,30 @@ func (pm *PartitionMap) notifyMembershipLocked(ev MembershipEvent) {
 
 // PartitionInfo stores information about a partition
 type PartitionInfo struct {
-	PartitionID   uint32
-	HashRange     [2]uint64 // [start, end)
-	PrimaryNode   string
-	ReplicaNodes  []string
-	Version       uint64
-	LastModified  int64
+	PartitionID  uint32
+	HashRange    [2]uint64 // [start, end)
+	PrimaryNode  string
+	ReplicaNodes []string
+	Version      uint64
+	LastModified int64
 }
 
 // ConsistentHashRing implements consistent hashing with virtual nodes
 type ConsistentHashRing struct {
 	mu           sync.RWMutex
 	virtualNodes map[uint64]string // hash → node_id
-	sortedKeys   []uint64 // Sorted hash values for binary search
-	replicas     int      // Number of virtual nodes per physical node
+	sortedKeys   []uint64          // Sorted hash values for binary search
+	replicas     int               // Number of virtual nodes per physical node
 }
 
 // ClusterMetrics tracks cluster-level metrics
 type ClusterMetrics struct {
-	NodeAdditions     atomic.Uint64
-	NodeRemovals      atomic.Uint64
+	NodeAdditions       atomic.Uint64
+	NodeRemovals        atomic.Uint64
 	PartitionMigrations atomic.Uint64
-	FailureDetections atomic.Uint64
-	Rebalances        atomic.Uint64
-	MetaUpdateTime    atomic.Int64 // Latest update timestamp
+	FailureDetections   atomic.Uint64
+	Rebalances          atomic.Uint64
+	MetaUpdateTime      atomic.Int64 // Latest update timestamp
 }
 
 // ClusterConfig contains cluster configuration
@@ -322,15 +322,15 @@ func (pm *PartitionMap) GetReplicasForKey(key string) ([]string, error) {
 func (pm *PartitionMap) UpdateNodeState(nodeID string, newState NodeState) error {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
-	
+
 	node, exists := pm.Nodes[nodeID]
 	if !exists {
 		return fmt.Errorf("node %s not found", nodeID)
 	}
-	
+
 	oldState := node.State.Load().(NodeState)
 	node.State.Store(newState)
-	
+
 	if oldState != newState {
 		pm.Version++
 		pm.Timestamp = time.Now().UnixNano()
@@ -347,14 +347,14 @@ func (pm *PartitionMap) UpdateNodeState(nodeID string, newState NodeState) error
 func (pm *PartitionMap) UpdateNodeHeartbeat(nodeID string) error {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
-	
+
 	node, exists := pm.Nodes[nodeID]
 	if !exists {
 		return fmt.Errorf("node %s not found", nodeID)
 	}
-	
+
 	node.LastHeartbeat = time.Now().UnixNano()
-	
+
 	// Recover from suspect state if was suspect
 	state := node.State.Load().(NodeState)
 	if state == NodeStateSuspect {
@@ -362,7 +362,7 @@ func (pm *PartitionMap) UpdateNodeHeartbeat(nodeID string) error {
 		pm.Version++
 		pm.Timestamp = time.Now().UnixNano()
 	}
-	
+
 	return nil
 }
 
@@ -370,12 +370,12 @@ func (pm *PartitionMap) UpdateNodeHeartbeat(nodeID string) error {
 func (pm *PartitionMap) GetPartition(partitionID uint32) (*PartitionInfo, error) {
 	pm.mu.RLock()
 	defer pm.mu.RUnlock()
-	
+
 	partition, exists := pm.Partitions[partitionID]
 	if !exists {
 		return nil, fmt.Errorf("partition %d not found", partitionID)
 	}
-	
+
 	return partition, nil
 }
 
@@ -383,11 +383,11 @@ func (pm *PartitionMap) GetPartition(partitionID uint32) (*PartitionInfo, error)
 func (pm *PartitionMap) Rebalance(partitionCount uint32) error {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
-	
+
 	if len(pm.Nodes) == 0 {
 		return fmt.Errorf("no nodes in cluster")
 	}
-	
+
 	// Distribute partitions uniformly.  The node list is sorted by ID so the
 	// assignment is deterministic: every cluster member computing Rebalance
 	// independently derives the SAME partition table (Go map iteration order
@@ -415,10 +415,10 @@ func (pm *PartitionMap) Rebalance(partitionCount uint32) error {
 	for i := uint32(0); i < partitionCount; i++ {
 		start := int(uint64(i) % uint64(len(nodeList)))
 		replicas := pickReplicas(nodeList, start, pm.ReplicationFactor)
-		
+
 		rangeStart := (uint64(i) * (^uint64(0) / uint64(partitionCount)))
 		rangeEnd := ((uint64(i) + 1) * (^uint64(0) / uint64(partitionCount)))
-		
+
 		pm.Partitions[i] = &PartitionInfo{
 			PartitionID:  i,
 			HashRange:    [2]uint64{rangeStart, rangeEnd},
@@ -428,7 +428,7 @@ func (pm *PartitionMap) Rebalance(partitionCount uint32) error {
 			LastModified: time.Now().UnixNano(),
 		}
 	}
-	
+
 	pm.Version++
 	pm.Timestamp = time.Now().UnixNano()
 	pm.metrics.Rebalances.Add(1)
@@ -481,25 +481,25 @@ func (pm *PartitionMap) PartitionCount() uint32 {
 func (pm *PartitionMap) GetNodeStats() map[string]NodeStats {
 	pm.mu.RLock()
 	defer pm.mu.RUnlock()
-	
+
 	stats := make(map[string]NodeStats)
-	
+
 	for nodeID, node := range pm.Nodes {
 		state := node.State.Load().(NodeState)
 		heartbeatAge := time.Now().UnixNano() - node.LastHeartbeat
-		
+
 		stats[nodeID] = NodeStats{
-			NodeID:        nodeID,
-			Address:       node.Address,
-			Port:          node.Port,
-			Rack:          node.Rack,
-			State:         state.String(),
+			NodeID:         nodeID,
+			Address:        node.Address,
+			Port:           node.Port,
+			Rack:           node.Rack,
+			State:          state.String(),
 			HeartbeatAgeNs: heartbeatAge,
-			Version:       node.Version,
-			RepairCount:   node.RepairCount.Load(),
+			Version:        node.Version,
+			RepairCount:    node.RepairCount.Load(),
 		}
 	}
-	
+
 	return stats
 }
 
@@ -523,14 +523,14 @@ func (ns NodeState) String() string {
 
 // NodeStats represents statistics for a node
 type NodeStats struct {
-	NodeID        string
-	Address       string
-	Port          int
-	Rack          string
-	State         string
+	NodeID         string
+	Address        string
+	Port           int
+	Rack           string
+	State          string
 	HeartbeatAgeNs int64
-	Version       uint64
-	RepairCount   uint64
+	Version        uint64
+	RepairCount    uint64
 }
 
 // NewConsistentHashRing creates a new consistent hash ring
@@ -546,13 +546,13 @@ func NewConsistentHashRing(virtualNodesPerNode int) *ConsistentHashRing {
 func (chr *ConsistentHashRing) AddNode(nodeID string) {
 	chr.mu.Lock()
 	defer chr.mu.Unlock()
-	
+
 	for i := 0; i < chr.replicas; i++ {
 		hash := hashValue(fmt.Sprintf("%s:%d", nodeID, i))
 		chr.virtualNodes[hash] = nodeID
 		chr.sortedKeys = append(chr.sortedKeys, hash)
 	}
-	
+
 	sort.Slice(chr.sortedKeys, func(i, j int) bool {
 		return chr.sortedKeys[i] < chr.sortedKeys[j]
 	})
@@ -562,18 +562,18 @@ func (chr *ConsistentHashRing) AddNode(nodeID string) {
 func (chr *ConsistentHashRing) RemoveNode(nodeID string) {
 	chr.mu.Lock()
 	defer chr.mu.Unlock()
-	
+
 	keysToRemove := make([]uint64, 0)
 	for hash, id := range chr.virtualNodes {
 		if id == nodeID {
 			keysToRemove = append(keysToRemove, hash)
 		}
 	}
-	
+
 	for _, hash := range keysToRemove {
 		delete(chr.virtualNodes, hash)
 	}
-	
+
 	// Rebuild sorted keys
 	chr.sortedKeys = make([]uint64, 0, len(chr.virtualNodes))
 	for hash := range chr.virtualNodes {
@@ -588,20 +588,20 @@ func (chr *ConsistentHashRing) RemoveNode(nodeID string) {
 func (chr *ConsistentHashRing) GetNode(hash uint64) (string, error) {
 	chr.mu.RLock()
 	defer chr.mu.RUnlock()
-	
+
 	if len(chr.sortedKeys) == 0 {
 		return "", fmt.Errorf("ring is empty")
 	}
-	
+
 	// Binary search for the first key >= hash
 	idx := sort.Search(len(chr.sortedKeys), func(i int) bool {
 		return chr.sortedKeys[i] >= hash
 	})
-	
+
 	if idx == len(chr.sortedKeys) {
 		idx = 0 // Wrap around
 	}
-	
+
 	return chr.virtualNodes[chr.sortedKeys[idx]], nil
 }
 
@@ -609,22 +609,22 @@ func (chr *ConsistentHashRing) GetNode(hash uint64) (string, error) {
 func (chr *ConsistentHashRing) GetNodeWithReplicas(hash uint64, count int) ([]string, error) {
 	chr.mu.RLock()
 	defer chr.mu.RUnlock()
-	
+
 	if len(chr.sortedKeys) == 0 {
 		return nil, fmt.Errorf("ring is empty")
 	}
-	
+
 	replicas := make([]string, 0, count)
 	seen := make(map[string]bool)
-	
+
 	idx := sort.Search(len(chr.sortedKeys), func(i int) bool {
 		return chr.sortedKeys[i] >= hash
 	})
-	
+
 	if idx == len(chr.sortedKeys) {
 		idx = 0
 	}
-	
+
 	for i := 0; i < len(chr.sortedKeys) && len(replicas) < count; i++ {
 		nodeID := chr.virtualNodes[chr.sortedKeys[(idx+i)%len(chr.sortedKeys)]]
 		if !seen[nodeID] {
@@ -632,7 +632,7 @@ func (chr *ConsistentHashRing) GetNodeWithReplicas(hash uint64, count int) ([]st
 			seen[nodeID] = true
 		}
 	}
-	
+
 	return replicas, nil
 }
 

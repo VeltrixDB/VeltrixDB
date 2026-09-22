@@ -38,9 +38,9 @@ import (
 )
 
 const (
-	vlogMagic     = uint32(0x564C5402) // "VLT\x02"
-	vlogBlockSize = 4096               // O_DIRECT alignment unit
-	vlogHeaderSize = 24                // magic(4)+valLen(4)+crc(4)+reserved(4)+writeUs(8)
+	vlogMagic      = uint32(0x564C5402) // "VLT\x02"
+	vlogBlockSize  = 4096               // O_DIRECT alignment unit
+	vlogHeaderSize = 24                 // magic(4)+valLen(4)+crc(4)+reserved(4)+writeUs(8)
 
 	// Header field offsets
 	vhdrOffMagic  = 0

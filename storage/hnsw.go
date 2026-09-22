@@ -326,4 +326,3 @@ func (vi *VectorIndex) hnswStatsBytes() int64 {
 	}
 	return b
 }
-

@@ -12,7 +12,7 @@ const (
 	mclCurrent = 0x1 // MCL_CURRENT — lock all currently mapped pages
 	mclFuture  = 0x2 // MCL_FUTURE  — lock all pages mapped in the future
 	mclOnFault = 0x4 // MCL_ONFAULT — only lock pages when they are faulted in
-	                 //               (Linux 4.4+; avoids pre-faulting 64 GB on startup)
+	//               (Linux 4.4+; avoids pre-faulting 64 GB on startup)
 
 	// rlimitMemlock is RLIMIT_MEMLOCK = 8 on Linux.  Go's syscall package does
 	// not export this constant (it was omitted from the generated zerrors file).

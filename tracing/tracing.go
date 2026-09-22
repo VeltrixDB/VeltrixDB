@@ -42,6 +42,12 @@ type Span interface {
 	SetError(err error)
 	TraceID() string
 	SpanID() string
+	// IsRecording reports whether this span will be retained. Hot paths
+	// should guard SetAttribute calls with it: passing a value as `any`
+	// boxes it at the CALL SITE, which allocates for anything the runtime
+	// does not keep a static copy of, and that cost is paid even when the
+	// span is an unsampled no-op that discards the attribute.
+	IsRecording() bool
 }
 
 // Sampler decides whether a new root span is recorded. Returning false makes
@@ -99,15 +105,15 @@ func Configure(c Configuration) {
 
 // completedSpan is the on-record-buffer struct.
 type completedSpan struct {
-	Service        string         `json:"service"`
-	Name           string         `json:"name"`
-	TraceID        string         `json:"trace_id"`
-	SpanID         string         `json:"span_id"`
-	ParentSpanID   string         `json:"parent_span_id,omitempty"`
-	StartUnixNano  int64          `json:"start_unix_ns"`
-	DurationNs     int64          `json:"duration_ns"`
-	StatusError    string         `json:"error,omitempty"`
-	Attributes     map[string]any `json:"attrs,omitempty"`
+	Service       string         `json:"service"`
+	Name          string         `json:"name"`
+	TraceID       string         `json:"trace_id"`
+	SpanID        string         `json:"span_id"`
+	ParentSpanID  string         `json:"parent_span_id,omitempty"`
+	StartUnixNano int64          `json:"start_unix_ns"`
+	DurationNs    int64          `json:"duration_ns"`
+	StatusError   string         `json:"error,omitempty"`
+	Attributes    map[string]any `json:"attrs,omitempty"`
 }
 
 // span is the concrete in-flight implementation.
@@ -127,6 +133,15 @@ type span struct {
 
 type ctxKey struct{}
 
+// noopSpan is the single shared instance handed back for every unsampled
+// span. It carries no per-span state and every method short-circuits on
+// s.noop, so sharing it across goroutines is safe and keeps the unsampled
+// path allocation-free.
+var noopSpan = &span{noop: true}
+
+// IsRecording reports whether the span will be retained.
+func (s *span) IsRecording() bool { return !s.noop }
+
 // Start opens a new span. If parent context already carries a span, the new
 // span links to it as child; otherwise a new trace begins.
 func Start(ctx context.Context, name string) (context.Context, Span) {
@@ -137,9 +152,16 @@ func Start(ctx context.Context, name string) (context.Context, Span) {
 	parent, hasParent := ctx.Value(ctxKey{}).(*span)
 
 	// Sampling decision: unsampled becomes a fast no-op span.
+	//
+	// The unsampled path must not allocate. At the default 1% sample rate it
+	// runs for 99% of every Get and Put, and allocating a span struct there
+	// (plus a time.Now() nobody reads) showed up as one of the largest
+	// allocation sources in a read-path profile. A single shared instance is
+	// safe because a no-op span is immutable: End, SetAttribute and SetError
+	// all short-circuit on s.noop before touching any field.
 	sampled := hasParent || curCfg.Sampler(name)
 	if !sampled {
-		return ctx, &span{name: name, noop: true, startTime: time.Now()}
+		return ctx, noopSpan
 	}
 
 	s := &span{name: name, startTime: time.Now()}
@@ -162,6 +184,12 @@ func Start(ctx context.Context, name string) (context.Context, Span) {
 
 // End records the span. Idempotent.
 func (s *span) End() {
+	// Checked BEFORE the mutex: noopSpan is shared across every goroutine, so
+	// locking here would turn the no-op path into a global contention point —
+	// exactly what it exists to avoid.
+	if s.noop {
+		return
+	}
 	s.mu.Lock()
 	if s.ended {
 		s.mu.Unlock()
@@ -172,10 +200,6 @@ func (s *span) End() {
 	attrs := s.attrs
 	errStr := s.errStr
 	s.mu.Unlock()
-
-	if s.noop {
-		return
-	}
 
 	cfgMu.RLock()
 	slowThresh := cfg.SlowThreshold

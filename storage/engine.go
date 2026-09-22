@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"hash/crc32"
 	"log"
@@ -46,7 +47,7 @@ func computeCRC32C(data []byte) uint32 {
 type StorageEngine struct {
 	config   *StorageConfig
 	index    *shardedIndex
-	wals     []*WriteAheadLog  // one per disk; wals[i] lives on dirs[i]
+	wals     []*WriteAheadLog // one per disk; wals[i] lives on dirs[i]
 	cache    Cache
 	segments []*SegmentWriter // one per disk; len == numDisks
 	vlogs    []*VLog          // one per disk; non-nil when KeyValueSeparation=true
@@ -77,6 +78,10 @@ type StorageEngine struct {
 	// Callers that need a fully-warmed index (e.g. a readiness probe) may
 	// select on this channel; normal Get/Put need not wait.
 	ReplayDone <-chan struct{}
+
+	// cacheHashed is se.cache when it supports hashed lookup (the sharded
+	// cache does). nil otherwise; the read path falls back to cache.Get.
+	cacheHashed hashedGetter
 
 	// scrubPassCounter tracks how many full scrub passes have completed —
 	// used by the admin /scrubstatus endpoint and integration tests.
@@ -126,8 +131,13 @@ func NewStorageEngine(cfg *StorageConfig) (*StorageEngine, error) {
 	if cfg == nil {
 		cfg = DefaultStorageConfig()
 	}
-	if cfg.NumShards == 0 {
-		cfg.NumShards = 256
+	// NumShards is vestigial — the index always uses the numShards constant.
+	// Warn rather than silently ignoring, so an operator who "tuned" it finds
+	// out instead of believing it took effect.
+	if cfg.NumShards != 0 && cfg.NumShards != numShards {
+		log.Printf("[config] WARNING: StorageConfig.NumShards=%d is ignored — "+
+			"the index shard count is fixed at %d (compile-time). Remove the setting.",
+			cfg.NumShards, numShards)
 	}
 
 	// Resolve disk paths: DataDirPaths wins; fall back to single DataDirPath.
@@ -181,7 +191,9 @@ func NewStorageEngine(cfg *StorageConfig) (*StorageEngine, error) {
 		return nil, err
 	}
 
-	cache := NewLIRSCache(cfg.CacheMaxSizeMB, lirRatio)
+	// Sharded: a single LIRSCache mutex serialises every read across all 8192
+	// index shards. Profiling put 21.7% of CPU in that one lock.
+	cache := NewShardedLIRSCache(cfg.CacheMaxSizeMB, lirRatio)
 	index := newShardedIndex()
 	if cfg.DisableOrderedIndex {
 		// Drop the ordered key view: the shard-lock hooks become no-ops and
@@ -310,13 +322,49 @@ func NewStorageEngine(cfg *StorageConfig) (*StorageEngine, error) {
 		}
 	}
 
+	// Phase 2b (fast, in-memory): seed each VLog's write cursor past the
+	// highest position any WAL entry references, BEFORE the engine is handed
+	// out and starts serving.
+	//
+	// This is load-bearing for raw block-device mode. A block device reports
+	// Stat().Size()==0, so newVLog provisionally parked vl.end at vlogStart
+	// (4096). The index-derived seed below (after replay) is authoritative,
+	// but replay runs in the BACKGROUND and the server accepts writes the
+	// instant NewStorageEngine returns — so a Put arriving during warmup would
+	// reserve offsets from 4096 and overwrite live records the rebuilt index
+	// still points at. Deriving the seed from the parsed WAL entries needs no
+	// index, so it can run here, synchronously, closing that window.
+	//
+	// On file-backed VLogs vl.end already equals the file size, which is >=
+	// any recorded offset, and SetEndAtLeast never retreats — so this is a
+	// no-op there.
+	if cfg.KeyValueSeparation {
+		for diskIdx, vl := range vlogs {
+			if diskIdx >= len(allEntries) {
+				break
+			}
+			if maxEnd := maxVLogEndFromWAL(allEntries[diskIdx], diskIdx, len(dirs)); maxEnd > 0 {
+				before := vl.end.Load()
+				vl.SetEndAtLeast(int64(maxEnd))
+				if after := vl.end.Load(); after > before {
+					mode := "file"
+					if vl.rawDevicePath != "" {
+						mode = "raw"
+					}
+					log.Printf("[vlog] disk=%d %s mode end pre-seeded to %d from WAL before serving (was %d)",
+						diskIdx, mode, after, before)
+				}
+			}
+		}
+	}
+
 	// Create the io_uring storage bridge and wire it into every VLog.
 	// The bridge owns 8 SQPOLL rings (one per NVMe disk) and fixed-buffer
 	// pools registered once with the kernel.  VLogBatcher.Flush will route
 	// writes through the bridge (1 io_uring_submit per batch) instead of N
 	// separate pwrite syscalls.  nil on macOS dev / CGO_ENABLED=0.
 	var storageBridge *cgoStorageBridge
-	if cfg.KeyValueSeparation && len(vlogs) > 0 {
+	if cfg.KeyValueSeparation && len(vlogs) > 0 && !cgoEngineDisabled() {
 		storageBridge = newCGOStorageBridge(len(vlogs), true /*sqPoll*/)
 		if storageBridge != nil {
 			for _, vl := range vlogs {
@@ -346,7 +394,10 @@ func NewStorageEngine(cfg *StorageConfig) (*StorageEngine, error) {
 	if numCGOThreads > numShards {
 		numCGOThreads = numShards
 	}
-	cgoBatch := newCGOBatchEngine(numCGOThreads)
+	var cgoBatch *cgoBatchEngine
+	if !cgoEngineDisabled() {
+		cgoBatch = newCGOBatchEngine(numCGOThreads)
+	}
 
 	se := &StorageEngine{
 		config:           cfg,
@@ -362,6 +413,11 @@ func NewStorageEngine(cfg *StorageConfig) (*StorageEngine, error) {
 		sst:              sst,
 		cgoBatch:         cgoBatch,
 		storageBridge:    storageBridge,
+	}
+	// Probe once for the hashed-lookup capability rather than type-asserting
+	// on every read.
+	if hg, ok := cache.(hashedGetter); ok {
+		se.cacheHashed = hg
 	}
 	se.initDiskHealth(len(wals))
 	defrag.diskFailed = se.diskIsFailed
@@ -403,7 +459,7 @@ func NewStorageEngine(cfg *StorageConfig) (*StorageEngine, error) {
 				}
 				go func() {
 					defer rwg.Done()
-					applyWALReplay(entries, index, vl, diskIdx, len(dirs), cfg.KeyValueSeparation)
+					applyWALReplay(entries, index, vl, diskIdx, len(dirs), cfg.KeyValueSeparation, se.transformForWrite)
 				}()
 			}
 			rwg.Wait()
@@ -436,6 +492,11 @@ func NewStorageEngine(cfg *StorageConfig) (*StorageEngine, error) {
 					}
 				}
 			}
+
+			// Damage from a pre-fix build is invisible to every read-path
+			// check, so the engine looks for it once and says so rather than
+			// silently serving blobs. Sampled and bounded.
+			se.reportTransformHealth()
 
 			close(replayDone)
 		}()
@@ -484,6 +545,48 @@ func NewStorageEngine(cfg *StorageConfig) (*StorageEngine, error) {
 
 // ── Write path ────────────────────────────────────────────────────────────────
 
+// transformForWrite applies the on-disk value pipeline — compress, then
+// encrypt — and returns the blob to store plus the IndexEntry flags that
+// describe it.
+//
+// Order is not arbitrary. Compression MUST run before encryption: ciphertext
+// is high-entropy and therefore incompressible, so compressing afterwards
+// burns CPU for nothing. Get() reverses this exactly: decrypt → decompress →
+// migrate-on-read.
+//
+// len(out) is the value's on-disk footprint and belongs in IndexEntry.ValueSize;
+// the caller keeps len(value) as UncompressedSize so the read path can size its
+// output buffer. The returned flags must reach BOTH the IndexEntry and the WAL
+// record, or a crash restart loses them.
+//
+// EVERY path that writes a value into the VLog must call this — single Put,
+// the batched MultiPut path, and legacy-WAL re-append alike. A path that skips
+// it stores plaintext even when --encrypt-at-rest is on, and does so silently,
+// because FlagEncrypted is per-record and the read path simply won't decrypt
+// what was never marked encrypted.
+func (se *StorageEngine) transformForWrite(value []byte) ([]byte, uint8, error) {
+	out := value
+	var flags uint8
+
+	if se.config.Compression == "zstd" || se.config.Compression == "flate" {
+		if cb, ok := MaybeCompress(out, se.config.CompressionLevel); ok {
+			out = cb
+			flags |= FlagCompressed
+		}
+	}
+	if EncryptionEnabled() {
+		ct, sealed, err := Encrypt(out)
+		if err != nil {
+			return nil, 0, fmt.Errorf("encrypt: %w", err)
+		}
+		if sealed {
+			out = ct
+			flags |= FlagEncrypted
+		}
+	}
+	return out, flags, nil
+}
+
 // Put stores key → value with an optional TTL (seconds; -1 = immortal).
 //
 // Standard write path:
@@ -504,8 +607,12 @@ func NewStorageEngine(cfg *StorageConfig) (*StorageEngine, error) {
 func (se *StorageEngine) Put(key string, value []byte, ttl int32) error {
 	_, span := tracing.Start(context.Background(), "engine.Put")
 	defer span.End()
-	span.SetAttribute("key.size", len(key))
-	span.SetAttribute("value.size", len(value))
+	// Guarded: passing an int as `any` boxes it at the call site, which
+	// allocates even though an unsampled span throws the attribute away.
+	if span.IsRecording() {
+		span.SetAttribute("key.size", len(key))
+		span.SetAttribute("value.size", len(value))
+	}
 
 	se.applyBackPressure()
 
@@ -582,32 +689,15 @@ func (se *StorageEngine) Put(key string, value []byte, ttl int32) error {
 			se.vlogs[int(old.SegmentID)%len(se.vlogs)].MarkDead(old.ValueSize, old.IsPacked())
 		}
 
-		// Compression: try flate when the value crosses the 256-byte threshold.
-		// On wins we keep UncompressedSize=len(value) for the read path and store
-		// FlagCompressed on the IndexEntry; ValueSize becomes the compressed
-		// blob length (1B algo prefix + compressed bytes).
-		writeBytes := value
-		if se.config.Compression == "zstd" || se.config.Compression == "flate" {
-			if cb, ok := MaybeCompress(value, se.config.CompressionLevel); ok {
-				writeBytes = cb
-				entry.Flags |= FlagCompressed
-				entry.ValueSize = uint32(len(cb))
-			}
+		// Value transform: compress, then encrypt. See transformForWrite for
+		// why the order is fixed. UncompressedSize keeps the plaintext length
+		// for the read path; ValueSize becomes the on-disk blob length.
+		writeBytes, xflags, xerr := se.transformForWrite(value)
+		if xerr != nil {
+			return xerr
 		}
-		// Encryption: applied AFTER compression (encrypted data is incompressible)
-		// and only when a key is loaded. Adds 12 B nonce + 16 B AEAD tag = 28 B
-		// overhead per record. ValueSize tracks the post-encryption blob length.
-		if EncryptionEnabled() {
-			ct, sealed, encErr := Encrypt(writeBytes)
-			if encErr != nil {
-				return fmt.Errorf("encrypt: %w", encErr)
-			}
-			if sealed {
-				writeBytes = ct
-				entry.Flags |= FlagEncrypted
-				entry.ValueSize = uint32(len(ct))
-			}
-		}
+		entry.Flags |= xflags
+		entry.ValueSize = uint32(len(writeBytes))
 
 		// Reserve the VLog offset atomically (non-blocking) so we can record it
 		// in the WAL entry before submitting to the WAL flusher. Both fdatasyncs
@@ -623,6 +713,13 @@ func (se *StorageEngine) Put(key string, value []byte, ttl int32) error {
 		// value is already durable in the VLog after its fdatasync completes.
 		walEntry.VLogOffset = vlogOffset
 		walEntry.Value = nil // value bytes not needed in WAL when VLogOffset is set
+		// Persist the on-disk length and transform flags. Without these the
+		// replayed IndexEntry would carry the PLAINTEXT length as ValueSize
+		// and no transform bits, so ReadValue would pull the wrong byte count
+		// and fail CRC — every compressed or encrypted key unreadable after a
+		// crash restart.
+		walEntry.DiskValueLen = uint32(len(writeBytes))
+		walEntry.XformFlags = xflags
 		walRp := se.wals[diskIdx].beginAppend(walEntry)
 		walEntryPool.Put(walEntry) // safe: serialize() consumed all fields above
 
@@ -677,6 +774,19 @@ func (se *StorageEngine) Put(key string, value []byte, ttl int32) error {
 	return nil
 }
 
+// ErrKeyNotFound is returned by Get for a key that is absent, tombstoned, or
+// whose shard bloom reports a definitive miss.
+//
+// A sentinel rather than fmt.Errorf("key not found: %s", key): the formatted
+// version allocated the error and its message on every negative lookup, which
+// on a bloom-accelerated miss path was most of the remaining per-op cost.
+// Callers that need the key already have it. Match with errors.Is.
+var ErrKeyNotFound = errors.New("key not found")
+
+// ErrKeyExpired is returned when a key is found but its TTL has elapsed.
+// Distinct from ErrKeyNotFound so callers can tell expiry from absence.
+var ErrKeyExpired = errors.New("key expired")
+
 // ── Read path ─────────────────────────────────────────────────────────────────
 
 // Get retrieves the value for key.
@@ -689,18 +799,16 @@ func (se *StorageEngine) Put(key string, value []byte, ttl int32) error {
 func (se *StorageEngine) Get(key string) ([]byte, error) {
 	_, span := tracing.Start(context.Background(), "engine.Get")
 	defer span.End()
-	span.SetAttribute("key.size", len(key))
+	if span.IsRecording() {
+		span.SetAttribute("key.size", len(key))
+	}
 
 	start := time.Now()
 	se.metrics.Reads.Add(1)
 	defer func() {
 		elapsed := time.Since(start)
 		ns := elapsed.Nanoseconds()
-		se.metrics.ReadsLatencyNs.Store(ns)
 		se.metrics.ObserveReadLatency(elapsed.Seconds())
-		// Stamp the last-read time so compactVLog can detect a stale EWMA
-		// when the workload becomes write-only after a brief read burst.
-		se.metrics.Admission.LastReadNs.Store(time.Now().UnixNano())
 
 		// EWMA + admission-control flag updates: SAMPLED 1-in-N (default 64) so
 		// the CAS-loop on a single global atomic does not pingpong across all
@@ -711,6 +819,16 @@ func (se *StorageEngine) Get(key string) ([]byte, error) {
 		if idx&readEWMASampleMask != 0 {
 			return // skip CAS update on 63/64 reads
 		}
+
+		// Both of these are monitoring HINTS, so they ride the same 1-in-64
+		// sample rather than storing to a shared cache line on every read.
+		// ReadsLatencyNs is a "last read latency" gauge. LastReadNs only
+		// feeds compactVLog's 4-minute staleness check, so a 64-read lag is
+		// immaterial — and it is stamped from `start` rather than a fresh
+		// time.Now(), which removes the third clock read from the hot path
+		// (walltime + nanotime were 12.5% of CPU on this path).
+		se.metrics.ReadsLatencyNs.Store(ns)
+		se.metrics.Admission.LastReadNs.Store(start.UnixNano())
 
 		// EWMA update α=1/8: newEWMA = old*7/8 + sample/8 (integer, no float).
 		var next int64
@@ -734,8 +852,21 @@ func (se *StorageEngine) Get(key string) ([]byte, error) {
 		}
 	}()
 
+	// Hash once and reuse it for cache routing, index routing and the bloom
+	// probe. Each of those used to hash the key independently.
+	h := fnv64a(key)
+
 	// Step 1: LIRS cache.
-	if value, hit := se.cache.Get(key); hit {
+	var (
+		value []byte
+		hit   bool
+	)
+	if se.cacheHashed != nil {
+		value, hit = se.cacheHashed.getHashed(key, h)
+	} else {
+		value, hit = se.cache.Get(key)
+	}
+	if hit {
 		se.metrics.CacheHits.Add(1)
 		return value, nil
 	}
@@ -744,25 +875,25 @@ func (se *StorageEngine) Get(key string) ([]byte, error) {
 	// Step 2: Index Vault. The shardedIndex.get() call already does a bloom
 	// pre-check when blooms are installed; we count its negative hits here so
 	// operators can verify the filter is paying for itself.
-	entry, dirtyValue, exists := se.index.get(key)
+	entry, dirtyValue, exists := se.index.getHashed(key, h)
 	if !exists {
 		if shardBloomEnabled.Load() {
-			shard, _ := se.index.shardFor(key)
-			if shard.bloom != nil && !shard.bloom.MayContain(fnv64a(key)) {
+			shard := &se.index.shards[uint16(h&(numShards-1))]
+			if shard.bloom != nil && !shard.bloom.MayContain(h) {
 				se.metrics.BloomFilterSkipped.Add(1)
 			}
 		}
-		return nil, fmt.Errorf("key not found: %s", key)
+		return nil, ErrKeyNotFound
 	}
 	if entry.IsTombstone() {
-		return nil, fmt.Errorf("key not found: %s", key)
+		return nil, ErrKeyNotFound
 	}
 
 	nowUs := time.Now().UnixMicro()
 	if entry.IsExpired(nowUs) {
 		se.index.markTombstone(key, nowUs)
 		se.cache.Evict(key)
-		return nil, fmt.Errorf("key expired: %s", key)
+		return nil, ErrKeyExpired
 	}
 
 	// Step 3: Dirty value in RAM (pre-flush).
@@ -825,7 +956,7 @@ func (se *StorageEngine) Get(key string) ([]byte, error) {
 		}
 	}
 
-	return nil, fmt.Errorf("key not found: %s", key)
+	return nil, ErrKeyNotFound
 }
 
 // ── Delete path ───────────────────────────────────────────────────────────────
@@ -1366,10 +1497,10 @@ func (se *StorageEngine) GetDiskStats() []DiskStat {
 	stats := make([]DiskStat, len(se.segments))
 	for i, sw := range se.segments {
 		stats[i] = DiskStat{
-			DiskIdx:       i,
-			Path:          sw.DiskPath(),
-			SegmentBytes:  sw.DiskSize(),
-			ShardsOnDisk:  numShards / len(se.segments),
+			DiskIdx:      i,
+			Path:         sw.DiskPath(),
+			SegmentBytes: sw.DiskSize(),
+			ShardsOnDisk: numShards / len(se.segments),
 		}
 	}
 	return stats

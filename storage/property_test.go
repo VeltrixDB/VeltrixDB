@@ -38,16 +38,7 @@ func newTestEngine(t *testing.T) *StorageEngine {
 	}
 	t.Cleanup(func() { os.RemoveAll(dir) })
 
-	cfg := DefaultStorageConfig()
-	cfg.DataDirPath = dir
-	cfg.DataDirPaths = nil
-	cfg.CacheMaxSizeMB = 16
-	cfg.NumShards = 1024
-	// Tighten group-commit windows so per-test latency is bearable.
-	cfg.WALFlushWindowMs = 1
-	cfg.VLogFlushWindowMs = 1
-	cfg.ScrubEnabled = false
-	cfg.BloomFilterShardBits = 1 << 18 // 256 K bits/shard, ~32 MB total
+	cfg := testStorageConfig(dir)
 
 	se, err := NewStorageEngine(cfg)
 	if err != nil {

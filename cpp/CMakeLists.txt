@@ -25,6 +25,21 @@ find_path(URING_INCLUDE_DIR liburing.h
     REQUIRED)
 
 # ── veltrixdb_engine static library ───────────────────────────────────────────
+# NOTE: batch_engine.cpp, uring_reader.cpp, numa_topology.cpp and
+# storage_bridge.cpp are NOT listed here on purpose — they are compiled
+# directly into the Go storage package by the cgo shims in
+# storage/cgo_*_linux.cpp. Listing them here too would define their symbols
+# twice when scripts/build.sh links this archive alongside the cgo objects.
+#
+# storage_bridge.cpp was in this list and had no shim, which meant its
+# veltrix_bridge_* symbols existed only in this archive — so `CGO_ENABLED=1 go
+# build ./storage/...` failed to link. It now has a shim like the others.
+#
+# Everything else under src/ belongs in this list. vlog.cpp and
+# ebpf_gc_throttle.cpp were missing for a long time, so they were compiled by
+# nothing at all and silently rotted while the docs advertised vlog.cpp as a
+# hot path. Both wrap their entire body in `#ifdef __linux__`, so adding them
+# is a no-op on non-Linux configurations.
 add_library(veltrixdb_engine STATIC
     src/lirs_cache.cpp
     src/shard.cpp
@@ -32,7 +47,8 @@ add_library(veltrixdb_engine STATIC
     src/defragmenter.cpp
     src/art.cpp              # ART index + Janitor compaction
     src/scheduler.cpp        # Priority io_uring scheduler
-    src/storage_bridge.cpp   # 8-ring SQPOLL batch-write bridge
+    src/vlog.cpp             # C++ VLog reader/writer (io_uring SQPOLL)
+    src/ebpf_gc_throttle.cpp # cgroup/eBPF GC bandwidth throttle
 )
 
 target_include_directories(veltrixdb_engine

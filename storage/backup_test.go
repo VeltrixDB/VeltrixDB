@@ -13,15 +13,7 @@ import (
 // for backup/restore round-trips).
 func newTestEngineWithDir(t *testing.T, dir string) *StorageEngine {
 	t.Helper()
-	cfg := DefaultStorageConfig()
-	cfg.DataDirPath = dir
-	cfg.DataDirPaths = nil
-	cfg.CacheMaxSizeMB = 16
-	cfg.NumShards = 1024
-	cfg.WALFlushWindowMs = 1
-	cfg.VLogFlushWindowMs = 1
-	cfg.ScrubEnabled = false
-	cfg.BloomFilterShardBits = 1 << 18
+	cfg := testStorageConfig(dir)
 
 	se, err := NewStorageEngine(cfg)
 	if err != nil {

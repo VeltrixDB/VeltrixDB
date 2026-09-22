@@ -40,11 +40,11 @@ import (
 )
 
 const (
-	replMagic          uint32 = 0x52454C50 // "RELP"
-	replDialTimeout           = 3 * time.Second
-	replSendTimeout           = 10 * time.Second
-	replMaxBackoff            = 30 * time.Second
-	replMaxSendAttempts       = 3
+	replMagic           uint32 = 0x52454C50 // "RELP"
+	replDialTimeout            = 3 * time.Second
+	replSendTimeout            = 10 * time.Second
+	replMaxBackoff             = 30 * time.Second
+	replMaxSendAttempts        = 3
 
 	replAckOK  byte = 0x00
 	replAckErr byte = 0x01
