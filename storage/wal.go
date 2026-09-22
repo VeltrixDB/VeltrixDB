@@ -74,6 +74,10 @@ type WriteAheadLog struct {
 
 type walItem struct {
 	data []byte
+	// rec is the pooled backing buffer for data. The flusher returns it to
+	// walRecPool once it has copied the bytes into the batch buffer, which is
+	// the last read of them.
+	rec  *[]byte
 	resp chan error
 }
 
@@ -141,10 +145,11 @@ func (wal *WriteAheadLog) append(entry *WALEntry) error {
 // call walRespPool.Put(rp).  This lets the caller overlap WAL and VLog
 // fdatasyncs: submit both, then wait for both.
 func (wal *WriteAheadLog) beginAppend(entry *WALEntry) *chan error {
-	data := wal.serialize(entry)
+	rec := wal.serialize(entry)
 	rp := walRespPool.Get().(*chan error)
 	item := walItemPool.Get().(*walItem)
-	item.data = data
+	item.rec = rec
+	item.data = *rec
 	item.resp = *rp
 	wal.appendCh <- item
 	return rp
@@ -169,7 +174,8 @@ func (wal *WriteAheadLog) appendAll(entries []*WALEntry) []error {
 		rp := walRespPool.Get().(*chan error)
 		ps[i] = pending{respPtr: rp}
 		item := walItemPool.Get().(*walItem)
-		item.data = wal.serialize(e)
+		item.rec = wal.serialize(e)
+		item.data = *item.rec
 		item.resp = *rp
 		wal.appendCh <- item
 	}
@@ -181,13 +187,19 @@ func (wal *WriteAheadLog) appendAll(entries []*WALEntry) []error {
 	return errs
 }
 
-// serializeBufPool avoids per-call allocation for the WAL header line.
-// The line is: timestamp|tombstone|key|valueLen|crc32hex|version\n
-// For a 16-byte key + typical field widths this is ~60-80 bytes.
-var serializeBufPool = sync.Pool{New: func() any { b := make([]byte, 0, 128); return &b }}
+// walRecPool holds one serialized WAL record. The record is built directly in
+// this buffer and handed to the flusher, which copies it into the batch buffer
+// and returns it here. Previously serialize borrowed a scratch buffer, then
+// allocated a second one to return — one guaranteed allocation per entry, i.e.
+// 1024 per 1024-entry MultiPut.
+//
+// 160 B covers a 10-field header for a ~16 B key without growing.
+var walRecPool = sync.Pool{New: func() any { b := make([]byte, 0, 160); return &b }}
 
-func (wal *WriteAheadLog) serialize(entry *WALEntry) []byte {
-	bufPtr := serializeBufPool.Get().(*[]byte)
+// serialize renders entry into a pooled buffer and returns that buffer. The
+// caller must hand the pointer to the flusher, which owns returning it.
+func (wal *WriteAheadLog) serialize(entry *WALEntry) *[]byte {
+	bufPtr := walRecPool.Get().(*[]byte)
 	buf := (*bufPtr)[:0]
 
 	// Header: timestamp|tombstone|key|valueLen|crc32hex|version|vlogOffset|packed|diskLen|xflags\n
@@ -255,22 +267,15 @@ func (wal *WriteAheadLog) serialize(entry *WALEntry) []byte {
 	}
 	buf = append(buf, '\n')
 
-	var result []byte
 	// Write value bytes only when the value is NOT stored in VLog (VLogOffset==0)
 	// and the entry carries value data (non-tombstone with a non-empty payload).
 	if !entry.IsTombstone && len(entry.Value) > 0 && entry.VLogOffset == 0 {
-		result = make([]byte, len(buf)+len(entry.Value)+1)
-		copy(result, buf)
-		copy(result[len(buf):], entry.Value)
-		result[len(buf)+len(entry.Value)] = '\n'
-	} else {
-		result = make([]byte, len(buf))
-		copy(result, buf)
+		buf = append(buf, entry.Value...)
+		buf = append(buf, '\n')
 	}
 
 	*bufPtr = buf
-	serializeBufPool.Put(bufPtr)
-	return result
+	return bufPtr
 }
 
 // flusher is the single goroutine that owns file I/O for this WAL.
@@ -288,28 +293,58 @@ func (wal *WriteAheadLog) flusher() {
 	defer close(wal.flusherDone)
 	pending := make([]*walItem, 0, 1024)
 
+	// batch is the coalescing buffer: every record in a group-commit batch is
+	// concatenated here and written with ONE write(2).
+	//
+	// This used to be one write(2) per entry, with the single fdatasync after
+	// them. Group commit therefore amortised the sync but not the writes, and
+	// at 8 concurrent 1024-key MultiPuts that left ~8K syscalls per batch on
+	// the table. Profiling the concurrent batch path measured syscall.write at
+	// 27% of total CPU against syscall.Fsync at 1.2% — the sync was never the
+	// expensive half.
+	//
+	// Durability is unchanged: identical bytes, identical order, still exactly
+	// one fdatasync covering the batch before any waiter is answered.
+	batch := make([]byte, 0, 64<<10)
+
 	flush := func() {
 		if len(pending) == 0 {
 			return
 		}
 
-		var writeErr error
-		var batchBytes int64
+		batch = batch[:0]
 		for _, item := range pending {
-			if writeErr != nil {
-				break
-			}
-			if _, err := wal.file.Write(item.data); err != nil {
+			batch = append(batch, item.data...)
+		}
+
+		var writeErr error
+		batchBytes := int64(len(batch))
+		if len(batch) > 0 {
+			if _, err := wal.file.Write(batch); err != nil {
 				writeErr = err
-				continue
 			}
-			wal.bytesWritten.Add(uint64(len(item.data)))
-			wal.entriesWritten.Add(1)
-			batchBytes += int64(len(item.data))
+		}
+		if writeErr == nil {
+			wal.bytesWritten.Add(uint64(batchBytes))
+			wal.entriesWritten.Add(uint64(len(pending)))
 		}
 
 		if writeErr == nil {
 			writeErr = fdatasync(int(wal.file.Fd()))
+		}
+
+		// Give the record buffers back now that their bytes are in `batch`.
+		for _, item := range pending {
+			if item.rec != nil {
+				walRecPool.Put(item.rec)
+				item.rec = nil
+			}
+		}
+
+		// A batch that grew far beyond the steady-state size is not worth
+		// holding onto between flushes.
+		if cap(batch) > 4<<20 {
+			batch = make([]byte, 0, 64<<10)
 		}
 
 		if writeErr == nil && wal.walFlushes != nil {

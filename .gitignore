@@ -6,3 +6,7 @@ raft*/
 /veltrix-server
 /veltrix-loadtest
 .DS_Store
+
+# Compiled test binaries. `go test -c` and `go test -cpuprofile/-memprofile`
+# both drop these in the package directory; one was committed by accident.
+*.test
