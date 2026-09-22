@@ -9,11 +9,11 @@ VeltrixDB uses **consistent hashing with virtual nodes** to distribute data acro
 Before reaching cluster-level partitioning, every key is routed to a specific **shard** and **disk** on the local node:
 
 ```
-key  ──► FNV-1a hash ──► shard_id = hash & 0x3FF   (0..1023)
+key  ──► FNV-1a hash ──► shard_id = hash & 0x1FFF  (0..8191)
                        ──► disk_idx = shard_id % numDisks
 ```
 
-1024 in-memory shards each hold their own `sync.RWMutex`. This allows concurrent reads and writes to different key ranges without global locking. The C++ `kNumShards` constant and Go `numShards` constant are both 1024 — they must always match.
+8192 in-memory shards each hold their own `sync.RWMutex`. This allows concurrent reads and writes to different key ranges without global locking. The C++ `kNumShards` constant and Go `numShards` constant are both 8192 — they must always match.
 
 ---
 

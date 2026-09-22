@@ -19,7 +19,7 @@ VeltrixDB uses a WiscKey-inspired **key-value separation** architecture: keys (w
           │         StorageEngine               │
           │  1. Transform: compress → encrypt   │
           │  2. Compute shard = FNV-1a(key)     │
-          │                     & 0x3FF         │
+          │                     & 0x1FFF        │
           │  3. diskIdx = shard % numDisks      │
           │  4. vl.beginAppend(value)  ─────────┼──► VLog[diskIdx]
           │  5. wal.beginAppend(entry) ─────────┼──► WAL[diskIdx]
@@ -32,12 +32,15 @@ VeltrixDB uses a WiscKey-inspired **key-value separation** architecture: keys (w
 
 ## 1. Sharding (In-Memory Index)
 
-The index is divided into **1024 shards**. Each shard has its own `sync.RWMutex` so reads and writes to different shards run in parallel.
+The index is divided into **8192 shards**. Each shard has its own `sync.RWMutex` so reads and writes to different shards run in parallel.
 
 ```
-shard_id = FNV-1a(key) & 0x3FF        // 0..1023
-disk_idx = shard_id % numDisks         // which NVMe disk owns this shard
+shard_id = FNV-1a(key) & 0x1FFF       // 0..8191
+disk_idx = shard_id % numDisks        // which NVMe disk owns this shard
 ```
+
+Anything sized *per shard* is multiplied by 8192. See the sizing note in
+[ARCHITECTURE.md](../ARCHITECTURE.md#sharding).
 
 Each shard holds a `map[string]IndexEntry` — the full live key space is always in memory (the Index Vault). There is no on-disk B-tree or LSM tree for the index; durability comes from the WAL.
 
@@ -122,12 +125,17 @@ Concurrent `pwrite64` calls to non-overlapping ranges are safe by POSIX. No mute
 
 Each disk has one `wal.log` file. The WAL provides crash durability: on unclean shutdown, `replayWAL()` reads it and rebuilds the index. On clean shutdown, `wal.truncate()` zeroes the file so next startup skips replay.
 
-### WAL Record Format (7-field pipe-delimited text)
+### WAL Record Format (10-field pipe-delimited text)
 
 ```
-timestamp|isTombstone|key|valueLen|crc32hex|version|vlogOffset[|packed]
+timestamp|isTombstone|key|valueLen|crc32hex|version|vlogOffset|packed|diskLen|xflags
 [value bytes]
 ```
+
+Fields 9–10 are emitted **only when they carry information** (a transform was
+applied, or the on-disk length differs from the plaintext length). An
+untransformed record still writes 8 fields, which is what keeps older binaries
+able to read newly-written data.
 
 | Field | Type | Meaning |
 |-------|------|---------|
@@ -138,7 +146,15 @@ timestamp|isTombstone|key|valueLen|crc32hex|version|vlogOffset[|packed]
 | `crc32hex` | hex | CRC32C of value |
 | `version` | decimal | Monotonic MVCC counter |
 | `vlogOffset` | decimal | 0 = value bytes follow inline; >0 = value already in VLog |
-| `packed` | "1"/"0" (optional 8th field) | VLog block packing flag |
+| `packed` | "1"/"0" | VLog block packing flag |
+| `diskLen` | decimal | On-disk blob length **after** compression + encryption |
+| `xflags` | hex | Transform bits: `FlagCompressed` (0x02), `FlagEncrypted` (0x04) |
+
+> `valueLen` is the **plaintext** length and `diskLen` is what actually sits
+> on disk. Conflating them — or dropping `xflags` — makes replay rebuild an
+> index entry that fails its CRC check or hands back ciphertext. Before
+> v1.1.0 the WAL carried neither, which is exactly what went wrong; see
+> [DR_RUNBOOK.md](DR_RUNBOOK.md) §7.
 
 **KV-separation mode**: `vlogOffset > 0` and no value bytes follow in the WAL — the WAL record is ~100 bytes instead of 100 + value_size. The VLog already has the durable value bytes.
 
@@ -163,7 +179,7 @@ In `Put()`, both WAL and VLog `beginAppend()` are called concurrently. The calle
 
 ```
 /data-dir-N/
-├── wal.log              — Write-Ahead Log (group-commit, 7-field text)
+├── wal.log              — Write-Ahead Log (group-commit, 10-field text)
 ├── vlog_active.dat      — Value Log (24-byte header + sector-aligned values)
 ├── seg_XXXXXXXX.dat     — Segment files (O_DIRECT sequential, 64-byte header)
 ├── vlog_punch_watermark — GC punch offset watermark for defragmentation
@@ -204,7 +220,7 @@ The **LIRS (Low Inter-Reference Recency Set)** cache is scan-resistant — a seq
 
 ## 7. Bloom Filters
 
-Each of the 1024 shards has a **lock-free Bloom filter** backed by atomic `uint64` words. Before a full index lookup, `MayContain(key)` returns false if the key is definitely absent — eliminating VLog reads for non-existent keys.
+Each of the 8192 shards has a **lock-free Bloom filter** backed by atomic `uint64` words. Before a full index lookup, `MayContain(key)` returns false if the key is definitely absent — eliminating VLog reads for non-existent keys.
 
 - Probe positions use double-hashing: `pos = h1 + i × h2`
 - Filters are rebuilt from the live index on every defrag pass (`vacuumBloomFilters`)
@@ -240,8 +256,8 @@ The emergency tier prevents a "death spiral" where high read EWMA permanently pa
            key="user:42"
                │
                ▼
-    shard = FNV-1a("user:42") & 0x3FF  = 731
-    disk  = 731 % 8                    = 3
+    shard = FNV-1a("user:42") & 0x1FFF = 4827
+    disk  = 4827 % 8                   = 3
                │
                ▼
     WAL[3]  ──► /mnt/nvme3/wal.log
@@ -257,9 +273,9 @@ All 8 NVMe disks receive writes in parallel — no single disk is a serializatio
 On unclean shutdown (crash, OOM kill, SIGKILL):
 
 1. **`replayWAL()`** opens `wal.log` on each disk.
-2. For each record: parse 7-field format, check CRC32C.
+2. For each record: parse the 10-field format, check CRC32C.
 3. **`applyWALReplay()`** rebuilds the in-memory `shardedIndex`.
 4. For KV-sep records (`vlogOffset > 0`): the VLog already has the value bytes; the WAL entry re-establishes the index pointer without re-reading the value.
-5. Legacy 6-field entries (no vlogOffset) are supported for backward compatibility.
+5. Legacy 6-, 7- and 8-field entries are still parsed for backward compatibility. An 8-field record replays with no transform flags, which is correct — it was written before the engine could record them.
 
 On clean shutdown (`SIGTERM`): `wal.truncate()` zeros the WAL file. Next startup sees an empty WAL and skips replay entirely — startup is O(1) instead of O(numLiveKeys).

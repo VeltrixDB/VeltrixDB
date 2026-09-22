@@ -17,8 +17,12 @@ writes/s ≈ goroutines × (1000 / window_ms)
 | Lowest latency (low concurrency) | 0 ms | ~0.2 ms |
 | Low latency | 2 ms | ~2.2 ms |
 | 100K+ writes/s | **5 ms** | ~5.2 ms |
-| Default (balance) | **10 ms** | ~10.2 ms |
+| **Default (balance)** | **15 ms** | ~15.2 ms |
 | Maximum throughput | 20 ms | ~20.2 ms |
+
+P99 figures are Linux NVMe. **Do not size against a macOS measurement** — on
+Darwin the engine calls plain `fsync(2)`, which returns at the drive cache in
+~0.02 ms and does not flush it. See ARCHITECTURE.md, "Durability".
 
 ```bash
 ./veltrixdb --wal-flush-window-ms 5 --vlog-flush-window-ms 5
@@ -69,15 +73,23 @@ Check hit rate: `veltrixdb_cache_hits_total / (hits + misses)`. Small values (�
 
 ## Admission Control
 
-| Read EWMA | What happens |
-|-----------|-------------|
-| < 3 ms | Normal |
-| ≥ 3 ms | GC capped at 60 MB/s |
-| ≥ 4 ms | GC paused + each PUT sleeps 2 ms |
-| < 2 ms | Full speed |
-| No reads 4+ min | EWMA stale — GC auto-resumes |
+| Read EWMA | What happens | Constant |
+|-----------|-------------|----------|
+| < 15 ms | Normal | — |
+| ≥ 15 ms | GC bandwidth capped at 60 MB/s | `gcLatencyThresholdNs` |
+| > 20 ms | GC paused + each PUT sleeps 2 ms | `admissionThrottleNs` |
+| < 10 ms | Everything resumes | `admissionResumeNs` |
+| No reads 4+ min | EWMA stale — GC auto-resumes | `gcEWMAStaleDuration` |
 
-If `veltrixdb_storage_write_admission_throttles_total` is rising, your read latency is above 4 ms. Diagnose with `veltrixdb_storage_read_latency_seconds`.
+If `veltrixdb_storage_write_admission_throttles_total` is rising, your read
+EWMA is above **20 ms**. Diagnose with `veltrixdb_storage_read_latency_seconds`.
+
+The GC bandwidth cap deliberately fires **before** the full pause, so GC is
+throttled progressively rather than stopped dead.
+
+> Earlier revisions of this table said 3 / 4 / 2 ms. Those numbers never
+> matched the code — the constants are in `storage/types.go` and
+> `storage/defrag.go`.
 
 ---
 

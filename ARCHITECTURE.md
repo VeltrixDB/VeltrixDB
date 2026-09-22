@@ -4,92 +4,253 @@
 
 ## Overview
 
+Everything on the serving path is Go. The C++ layer is an optional Linux-only
+accelerator, and most of what is under `cpp/` has no Go call site at all —
+the dashed box below is the honest boundary, not the file tree.
+
+```mermaid
+flowchart TB
+    CL["Client<br/><i>any SDK, or nc</i>"]
+
+    subgraph SRV["TCP Server — cmd/server"]
+        direction LR
+        CONN["1 goroutine per conn<br/>binary + text protocol"]
+        COAL["PUT/GET coalescing<br/>cap 256 → MultiPut/MultiGet"]
+        CONN --> COAL
+    end
+
+    subgraph ENG["Storage Engine — storage/engine.go"]
+        direction TB
+        ROUTE["Shard routing<br/>FNV-1a(key) &amp; 0x1FFF → 0..8191"]
+
+        subgraph MEM["In-memory, per shard"]
+            direction LR
+            IDX["Index Vault<br/>8192 shards · RWMutex each<br/>64 B entry, no value bytes"]
+            BLM["Bloom filter<br/>lock-free, per shard"]
+            CSH["Sharded LIRS cache<br/>up to 256 independent caches<br/>keyed on HIGH hash bits"]
+        end
+
+        XF["Value transform<br/>compress → encrypt<br/><i>single chokepoint</i>"]
+        ROUTE --> MEM
+        ROUTE --> XF
+    end
+
+    subgraph DISK["Per NVMe disk — N independent sets"]
+        direction LR
+        WAL["WAL<br/>group-commit<br/>one fdatasync per window"]
+        VLOG["VLog<br/>append-only values<br/>lock-free offset reservation"]
+        SEG["Segment writer<br/>O_DIRECT"]
+    end
+
+    GC["Defragmenter + VLog GC<br/>3-tier escalation"]
+    SCRUB["Scrubber<br/>CRC32C walk"]
+
+    CPP["<b>C++ accelerator</b> — Linux + CGO_ENABLED=1 only<br/>batch engine · io_uring SQPOLL reader · NUMA pinning<br/><i>absent from the published Docker image</i>"]
+
+    CL -->|TCP| SRV
+    SRV --> ENG
+    XF --> VLOG
+    ROUTE --> WAL
+    DISK --- GC
+    DISK --- SCRUB
+    ENG -.->|"optional, opt-out via<br/>VELTRIXDB_DISABLE_CGO_ENGINE"| CPP
+
+    classDef opt stroke-dasharray:6 6,stroke:#888,color:#555
+    class CPP opt
 ```
-Client (any SDK or nc)
-        │  TCP — binary or text protocol
-        ▼
-┌─────────────────────────────────────────┐
-│  TCP Server (cmd/server)                │
-│  1 goroutine/conn · pipeline coalescing │
-└──────────────────┬──────────────────────┘
-                   │
-                   ▼
-┌─────────────────────────────────────────┐
-│  Storage Engine (storage/engine.go)     │
-│                                         │
-│  In-Memory Index   LIRS Cache           │
-│  8192 shards       hot values in RAM    │
-│                                         │
-│  WAL (per disk)    VLog (per disk)      │
-│  group-commit      append-only values   │
-└──────────────────┬──────────────────────┘
-                   │ (Linux production only)
-                   ▼
-┌─────────────────────────────────────────┐
-│  C++ Layer                              │
-│  ART index · io_uring · NUMA pinning    │
-└─────────────────────────────────────────┘
-```
+
+### What is NOT in that diagram
+
+`cpp/` also contains an ART index, a 3-tier priority io_uring scheduler, a C++
+VLog, a LIRS cache and a defragmenter — roughly 5,400 lines. They compile and
+link, and **nothing in Go calls them**. See [cpp/README.md](cpp/README.md).
 
 ---
 
 ## Sharding
 
-All data is split across **8192 shards**. Each shard has its own lock — reads on shard 5 never block reads on shard 42.
+One 64-bit FNV-1a hash drives three independent placements. They deliberately
+read different parts of it, so a key that is hot in one is not systematically
+hot in the others.
 
-```
-key → FNV-1a hash → bottom 13 bits (& 0x1FFF) → shard ID (0–8191)
-shard ID % numDisks → which disk (WAL + VLog + compaction)
+```mermaid
+flowchart LR
+    K["key"] --> H["h = FNV-1a 64-bit"]
+    H -->|"low 13 bits<br/>h &amp; 0x1FFF"| S["Index shard<br/>0..8191<br/><i>own RWMutex + bloom</i>"]
+    H -->|"high bits<br/>h &gt;&gt; shift"| C["Cache shard<br/>up to 256<br/><i>own mutex</i>"]
+    S -->|"shard % numDisks"| D["Disk<br/>WAL + VLog + compaction"]
 ```
 
-With 8 disks, 1024 shards land on each disk. A failure on one disk doesn't affect the other 7. (The Go `numShards` and C++ `kNumShards` constants must stay equal — see invariant 1.)
+With 8 disks, 1024 of the 8192 shards land on each. A failure on one disk
+doesn't affect the other 7.
+
+The Go `numShards` and the C++ `kNumShards` must stay equal — see invariant 1.
+`StorageConfig.NumShards` is **vestigial**: it is defaulted and validated but
+nothing reads it, and changing it has no effect.
+
+> **Sizing trap.** Anything sized *per shard* is multiplied by **8192**, not
+> 1024. The Bloom default was written as "4 M bits/shard × 1024 shards =
+> 512 MB" and actually allocated **4 GB** per engine; two test configs
+> repeated the mistake at 256 MB each. Both are fixed — but when you add a
+> per-shard allocation, do the arithmetic against 8192.
 
 ---
 
 ## Key Components
 
-**In-Memory Index** — hash map per shard (Go) or ART tree (C++). Each entry stores disk offset, disk index, value size, flags, and a monotone version counter.
+**In-Memory Index** — a hash map per shard. Each entry is ~64 B: disk offset,
+disk index, value size, flags, TTL and a monotone version counter. No value
+bytes. (The C++ ART tree is *not* wired to Go; see the C++ section.)
 
-**LIRS Cache** — scan-resistant; small values (≤256 B) get priority 2 vs priority 1, making them harder to evict. Sized with `-cache <MB>`.
+**Sharded LIRS Cache** — scan-resistant, with value-aware eviction: small
+values (≤ 256 B) get priority 2 vs 1, so they resist eviction. Split across up
+to 256 independent caches, **each with its own mutex**.
 
-**WAL (Write-Ahead Log)** — group-commit: N writes share one `fdatasync`. Default 15 ms window. One WAL per disk.
+> This is not a micro-optimisation. `LIRSCache.Get` must take its lock
+> *exclusively*, because a read mutates the LIRS state machine. A single
+> cache-wide mutex therefore serialised every read in the engine and undid the
+> 8192-way index sharding entirely — profiling put **21.7% of total CPU** in
+> that one lock, 98.98% of it in `Get`. Sharding took a cache hit from
+> **711 ns to 92 ns**. Never collapse it back (invariant 36).
+>
+> The trade: per-shard budgets are not a global budget, so a skewed keyspace
+> can evict from a hot shard while a cold one has room.
 
-**VLog (Value Log)** — append-only file per disk. Values are written here; only key metadata lives in the index (WiscKey KV separation). Lock-free concurrent appends via atomic offset reservation.
+**Bloom filters** — one lock-free filter per index shard, atomic `uint64`
+words, double-hashed probes. Rebuilt from the live index on every defrag pass,
+otherwise deletes would leave bits set forever and the false-positive rate
+would climb.
 
-**Block Packing** — batched writes pack up to 26 records per 4 KB VLog block. For 128 B values: 4096 B → 152 B per record (27× density). Single `Put` stays on the unpacked fast path.
+**WAL** — group-commit: N writes share one `fdatasync`. Default 15 ms window.
+One WAL per disk.
+
+**VLog** — append-only file per disk. Values live here; only key metadata is
+in the index (WiscKey KV separation). Concurrent appends reserve offsets with
+an atomic add, so there is no mutex on the write path.
+
+**Block Packing** — batched writes pack up to ~26 records into a 4 KB VLog
+block. For 128 B values that is 4096 B → 152 B per record (27× density).
+Single `Put` stays on the unpacked lock-free path.
+
+**Value transform** — `transformForWrite` is the single chokepoint for
+compress-then-encrypt. Every VLog write path must call it; one that skips it
+stores plaintext even with `--encrypt-at-rest` on, and does so *silently*,
+because `FlagEncrypted` is per-record so reads simply never decrypt what was
+never marked.
 
 ---
 
 ## Write Path
 
-```
-PUT "user:42" → value
-  1. Hash key → shard 307 → disk 2 (307 % 8)
-  2. Compress, then encrypt; atomically reserve VLog offset; write the blob
-  3. Write WAL entry (key + vlogOffset + on-disk length + transform flags)
-  4. WAL + VLog fdatasync race concurrently (wait = max of both)
-  5. Update shard 307 index entry (DiskOffset, Version++)
-  6. Insert into LIRS cache
-  7. Return OK
+The ordering matters: **VLog is appended before the WAL**, and the two
+`fdatasync` calls race rather than run in sequence. The caller waits for
+`max(WAL, VLog)`, not their sum — serialising them doubles P99.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as Client
+    participant E as Engine
+    participant X as transformForWrite
+    participant V as VLog (disk N)
+    participant W as WAL (disk N)
+    participant I as Index shard
+    participant CA as LIRS cache
+
+    C->>E: PUT "user:42" = value
+    E->>E: shard = low 13 bits of FNV-1a, disk = shard % numDisks
+    E->>X: compress, then encrypt
+    Note over X: Compression FIRST — ciphertext is<br/>incompressible, so the reverse gains nothing
+    X-->>E: blob + FlagCompressed/FlagEncrypted + diskLen
+
+    par concurrent — this is the point
+        E->>V: reserve offset (atomic add), write blob
+        V-->>E: fdatasync
+    and
+        E->>W: append record with vlogOffset, diskLen, xflags
+        W-->>E: fdatasync (group-commit, shared with other writers)
+    end
+
+    Note over E: unblocks at max(WAL, VLog), not the sum
+    E->>I: install IndexEntry (DiskOffset, Version++)
+    E->>CA: insert
+    E-->>C: OK
 ```
 
-If the process crashes after step 2 but before step 3, the value is orphaned but never visible — safe.
+**Crash between the VLog write and the WAL fdatasync**: the offset never
+reaches the WAL, so replay never builds an index entry for it. The bytes are
+unreferenced garbage that the next GC pass reclaims, and the client never got
+an OK. Safe.
+
+**What the WAL record must carry.** A 10-field pipe-delimited line:
+
+```
+timestamp|tombstone|key|valueLen|crc32hex|version|vlogOffset|packed|diskLen|xflags
+```
+
+Fields 9 and 10 are the ones that were missing before v1.1.0. `valueLen` is
+the **plaintext** length; `diskLen` is what actually sits on disk after
+compression and encryption; `xflags` carries the transform bits. Replay needs
+all three or it rebuilds an entry that reads back ciphertext. Fields 9–10 are
+emitted only when they differ from the defaults, so an untransformed record
+still writes 8 fields and older binaries can still read it.
 
 ---
 
 ## Read Path
 
+```mermaid
+flowchart TD
+    A["GET user:42"] --> B["hash once: h = FNV-1a(key)"]
+    B --> C{"LIRS cache<br/>(shard = high bits of h)"}
+    C -->|hit| Z(["return value — no disk I/O<br/><b>~92 ns</b>"])
+    C -->|miss| D{"Bloom filter<br/>(shard = low 13 bits)"}
+    D -->|"definitely absent"| N(["ErrKeyNotFound<br/><b>zero-allocation</b>"])
+    D -->|"maybe present"| E["RLock shard, look up IndexEntry"]
+    E -->|absent| N
+    E -->|"expired TTL"| X(["ErrKeyExpired"])
+    E -->|found| F["VLog ReadValue at DiskOffset<br/>4 KB-aligned pread<br/>verify magic + CRC32C"]
+    F --> G["decrypt → decompress → migrate-on-read"]
+    G --> H["insert into cache"]
+    H --> Z
+
+    style Z fill:#1b5e20,color:#fff
+    style N fill:#4a148c,color:#fff
+    style X fill:#4a148c,color:#fff
 ```
-GET "user:42"
-  1. Hash key → shard 307
-  2. LIRS cache hit → return value (no disk I/O)
-  3. Cache miss → lock shard (read), look up index entry
-  4. Not in index → NOT_FOUND
-  5. In index → read blob from VLog at DiskOffset (magic + CRC32C checked)
-  6. Decrypt, then decompress, then apply any pending schema migration
-  7. Insert into cache
-  8. Return value
-```
+
+The hash is computed **once** and threaded through both the cache and the
+index lookup. The cache shards on the **high** bits and the index on the low
+13, so the two placements stay independent.
+
+Both terminal misses return package-level sentinels (`ErrKeyNotFound`,
+`ErrKeyExpired`) rather than `fmt.Errorf`, because formatting the key
+allocated on every negative lookup — which dominated the bloom-accelerated
+miss path. Match with `errors.Is`.
+
+---
+
+## Durability — and the macOS caveat
+
+`fdatasync` is platform-split, and the two halves are not equivalent:
+
+| Platform | File | Call | Measured cost |
+|---|---|---|---|
+| Linux | `storage/fdatasync_linux.go` | `syscall.Fdatasync` | real round trip to the device |
+| macOS / other | `storage/fdatasync_other.go` | `syscall.Fsync` | **0.020 ms** |
+| *(not used anywhere)* | — | `fcntl(F_FULLFSYNC)` | **3.098 ms** |
+
+**On macOS, plain `fsync(2)` returns once the data reaches the drive's
+volatile cache — it does not flush that cache.** A macOS build is therefore
+*not* crash-safe against power loss, only against process death. Several
+comments in this repo used to claim the engine pays `F_FULLFSYNC` at
+7–10 ms per sync; it never calls it. Those numbers were quoted in sizing
+guidance, so treat any macOS write-throughput figure older than v1.1.0 as
+measuring an fsync that did substantially less work than advertised.
+
+This is a **dev-only** concern — the target platform is Linux — but it has
+bitten twice. It is why the test suite runs in ~13 s on a laptop and once
+took 45 minutes on a CI runner, where `fdatasync` is real (see invariant 40).
 
 ---
 

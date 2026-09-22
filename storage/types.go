@@ -546,7 +546,12 @@ type StorageConfig struct {
 	// Effect on P99 write latency (KV-separation path, concurrent WAL+VLog):
 	//   P99 ≈ max(WALWindow, VLogWindow) + fdatasync_cost
 	//   Linux NVMe (fdatasync ≈ 0.2 ms): 10 ms window → ~10.2 ms P99
-	//   macOS    (F_FULLFSYNC ≈ 9 ms):   10 ms window → ~19 ms P99
+	//   macOS      (fsync ≈ 0.02 ms):    10 ms window → ~10 ms P99
+	//
+	// macOS is NOT the conservative case, despite what this comment used to
+	// say. Darwin's fsync(2) returns at the drive cache without flushing it
+	// (~0.02 ms measured); F_FULLFSYNC would flush it at ~3 ms but is never
+	// called. Size against Linux.
 	//
 	// Set to 0 for immediate flush (one fdatasync per burst, low latency at
 	// the cost of very small batch sizes under moderate concurrency).

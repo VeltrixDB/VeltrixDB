@@ -41,9 +41,11 @@ var walRespPool = sync.Pool{
 //	write latency ≈ window + fdatasync = ~2.2 ms while amortising the sync
 //	across all writers that arrive during the window.
 //
-//	On macOS (F_FULLFSYNC ≈ 7–10 ms), the same 2 ms window reduces
-//	effective latency from one-fsync-per-write (~10 ms each) to one fsync
-//	per window period — measured P99 drops from ~122 ms to ~10 ms at low
+//	NOTE: on macOS this is plain fsync(2) (fdatasync_other.go), measured at
+//	~0.02 ms because Darwin's fsync returns at the drive cache without
+//	flushing it. F_FULLFSYNC, which would flush it, costs ~3 ms and is NOT
+//	called anywhere — so a macOS build is not power-loss safe, and macOS
+//	write timings do not predict Linux. The window still reduces P99 at low
 //	concurrency and sub-5 ms at ≥8 concurrent writers.
 type WriteAheadLog struct {
 	file     *os.File

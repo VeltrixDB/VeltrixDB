@@ -1089,7 +1089,7 @@ func (se *StorageEngine) DeleteNS(ns, key string) error {
 }
 
 // DropNamespace deletes every key that belongs to namespace ns.
-// It scans all 1024 shards in parallel (one goroutine per shard group),
+// It scans all 8192 shards in parallel (one goroutine per shard group),
 // collects matching keys, then calls Delete on each.
 // Returns the number of keys deleted.
 func (se *StorageEngine) DropNamespace(ns string) (int, error) {

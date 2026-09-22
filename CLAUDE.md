@@ -101,13 +101,18 @@ curl http://localhost:2112/readyz
 | `cmd/kubectl-veltrix/main.go` | kubectl plugin; auto port-forwards to a matching pod and hits `/admin/*` |
 | `Veltrixdb-client/rust/src/lib.rs` | Blocking, stdlib-only Rust client; full atomic-op surface — lives in the **Veltrixdb-client** repo, not this repo |
 | `Veltrixdb-client/cpp/include/veltrixdb.hpp` | Header-only POSIX-sockets C++17 client — lives in the **Veltrixdb-client** repo, not this repo |
-| `storage/wal.go` | Group-commit `WriteAheadLog`: channel → flusher goroutine → single fdatasync; 7-field WAL format with `vlogOffset`; `truncate()` for clean shutdown |
-| `storage/wal_replay.go` | `replayWAL()` parses on-disk WAL (6-field or 7-field); `applyWALReplay()` rebuilds `shardedIndex` and restores `se.version` on startup; `walPathForDir()` mirrors `newWriteAheadLog` path |
+| `storage/wal.go` | Group-commit `WriteAheadLog`: channel → flusher goroutine → single fdatasync; **10-field** WAL format (invariant 21); `walItemPool`; bounded `close()` via `flusherDone` + 30 s grace; `truncate()` for clean shutdown |
+| `storage/wal_replay.go` | `replayWAL()` parses on-disk WAL (10-field; 6/7/8-field still accepted); `applyWALReplay()` rebuilds `shardedIndex` and restores `se.version`; `maxVLogEndFromWAL()` seeds `vl.end` synchronously before serving (invariant 27); `walPathForDir()` mirrors `newWriteAheadLog` path |
 | `storage/segment.go` | `SegmentWriter`: O_DIRECT binary record format, `ioPool` usage |
 | `storage/segment_linux.go` | `openSegmentFile` (O_DIRECT), `newAlignedBuf`, `ioPool` (Linux) |
 | `storage/segment_other.go` | `openSegmentFile` (buffered), `ioPool` (macOS/Windows dev) |
 | `storage/shard.go` | `indexShard`: per-shard RWMutex + in-memory index map |
 | `storage/cache.go` | LIRS cache; value-aware eviction: `priority=2` for ≤256 B values; 16-entry scan window picks largest cold victim |
+| `storage/cache_sharded.go` | `shardedLIRSCache`: up to 256 independent `LIRSCache` instances keyed on the **high** bits of `fnv64a(key)`; `cacheShardCountFor` falls back to a single cache below 2 MB. See invariant 36 |
+| `storage/repair.go` + `cmd/veltrix-repair` | Exact repair of value-transform metadata lost by pre-v1.1.0 WALs: `IndexEntry.CRC32C` is the plaintext CRC and acts as the oracle; `CheckTransformMetadataHealth()` samples 512 records at startup |
+| `storage/cgo_toggle.go` | `VELTRIXDB_DISABLE_CGO_ENGINE=1` → `cgoEngineDisabled()`; skips the io_uring bridge and C++ batch engine on a cgo build |
+| `storage/fdatasync_linux.go` / `storage/fdatasync_other.go` | `syscall.Fdatasync` on Linux; plain `syscall.Fsync` elsewhere. **Not equivalent** — Darwin's fsync returns at the drive cache (0.020 ms measured) and never flushes it. `F_FULLFSYNC` (3.098 ms) is not called anywhere |
+| `storage/testconfig_test.go` | `testStorageConfig()` — the single source of test engine config. New test helpers must call it (invariant 39) |
 | `storage/defrag.go` | Defragmenter: physical-order compaction; also drives VLog GC via `VLog.GCRatio()` |
 | `storage/vlog.go` | `VLog`: append-only per-disk Value Log (WiscKey KV separation); magic=0x564C5402; 24-byte header + sector-aligned payload; `VLogBatcher` for group-append; `MarkDead` for GC accounting |
 | `storage/batcher.go` | `WriteBatcher`: 2 MB / **4096-entry** / 5 ms flush windows; batchBufPool pre-sized 4096; channel depth 65536; falls back to sync Put when saturated |
@@ -351,7 +356,7 @@ When reading load test output or Prometheus metrics, keep these in mind:
 
 **`--safe-reads` loadtest flag eliminates false "not found" errors during ingestion.** A `writtenHWM atomic.Int64` high-water mark tracks how many keys have been written. Writers claim sequential slots via `Add(1)-1`; readers pick from `[0, hwm)`. Use `--safe-reads` during mixed-mode benchmarks where the keyspace isn't yet fully populated.
 
-**macOS write throughput is hardware-limited, not code-limited.** `F_FULLFSYNC` costs ~7–10 ms on macOS vs ~0.2–0.5 ms on Linux NVMe. Even with the flush window, macOS individual `Put` achieves ~21K writes/s and `MultiPut-1024` achieves ~108K writes/s (1024 entries / 9.44 ms per fdatasync). On Linux NVMe (n2-highmem-64, ~2.4 ms fdatasync) the same `MultiPut-1024` projects to ~426K writes/s; with 8-disk striping the engine targets 500K+ writes/s. Cache-hit `GET` on macOS measured at 1.44M reads/s (693 ns/op).
+**macOS write throughput is NOT a conservative proxy for Linux — it is the opposite.** This paragraph used to claim the engine pays `F_FULLFSYNC` at ~7–10 ms on macOS. It does not: `storage/fdatasync_other.go` calls plain `syscall.Fsync`, and Darwin's `fsync(2)` returns at the drive cache **without flushing it** — measured **0.020 ms**, against **3.098 ms** for an actual `F_FULLFSYNC`, which is never called anywhere in the tree. Two consequences: a macOS build is crash safe but **not power-loss safe**, and any macOS write benchmark measures an fsync doing far less work than Linux `fdatasync` (~0.2–0.5 ms on NVMe). This is why the suite runs in ~13 s on a laptop and once took 45 min in CI — see invariant 40. The historic figures that follow were taken under the old misunderstanding and are kept only for continuity. Even with the flush window, macOS individual `Put` achieves ~21K writes/s and `MultiPut-1024` achieves ~108K writes/s (1024 entries / 9.44 ms per fdatasync). On Linux NVMe (n2-highmem-64, ~2.4 ms fdatasync) the same `MultiPut-1024` projects to ~426K writes/s; with 8-disk striping the engine targets 500K+ writes/s. Cache-hit `GET` on macOS measured at 1.44M reads/s (693 ns/op).
 
 **`veltrixdb_cache_misses_total` includes key-not-found.** In a load test where `--num-keys=1000000` and only 30% of operations are writes, the keyspace is ~36% populated by end of test. ~78% of all GETs hit keys that don't exist → all counted as misses. To measure true cache behavior, use `--num-keys=100000` or run a dedicated write phase before reading.
 

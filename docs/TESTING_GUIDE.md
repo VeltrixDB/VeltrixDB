@@ -15,7 +15,34 @@ go test -v ./storage/... -timeout 120s
 go test ./consensus/...    # Raft election, log replication
 go test ./cluster/...      # failure detection, partition map
 go test ./replication/...  # async, quorum, strong modes
+
+# Race detector — CI runs this as a blocking gate across four groups
+go test -race -timeout 600s -count=1 ./storage/...
 ```
+
+### Writing a new test that needs an engine
+
+Build the config with **`testStorageConfig()`** (`storage/testconfig_test.go`),
+never `DefaultStorageConfig()` directly. The production defaults are sized for
+a 64-core box with NVMe, and a test inheriting them pays:
+
+- **256 MB+ of Bloom filter, eagerly, per engine** — it is
+  `BloomFilterShardBits / 8 × 8192`. Three helpers once got this wrong and
+  took the suite to 8 GB peak RSS, which is what killed CI.
+- **A 15 ms group-commit window** per write, with nothing to batch, because
+  tests write sequentially.
+- **A scrubber goroutine per VLog** doing real I/O for the second the engine
+  is alive.
+
+If you need a knob the helper doesn't set, set it on the returned config
+rather than starting from `DefaultStorageConfig()` again.
+
+### Timings are platform-dependent in a way that matters
+
+The suite runs in ~13 s on macOS and needs tmpfs to run acceptably on Linux
+CI. Darwin's `fsync(2)` returns at the drive cache in ~0.02 ms; Linux
+`fdatasync` against a real disk is a genuine round trip, and every `Put` does
+two. Do not read a local pass as evidence that a test is fast in CI.
 
 ---
 

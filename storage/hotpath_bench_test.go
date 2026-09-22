@@ -40,9 +40,11 @@ func init() {
 
 // Benchmarks for the paths that actually run per client request.
 //
-// Scope note: on macOS every fdatasync is F_FULLFSYNC (~7–10 ms vs ~0.2 ms on
-// Linux NVMe), so the write benchmarks here are dominated by the group-commit
-// window and say nothing useful about Linux throughput. What IS portable is
+// Scope note: on macOS fdatasync is plain fsync(2), which returns at the drive
+// cache in ~0.02 ms without flushing it — so the write benchmarks here are
+// dominated by the group-commit window and, if anything, FLATTER than Linux
+// NVMe (~0.2 ms of real round trip). They say nothing useful about Linux
+// write throughput in either direction. What IS portable is
 // everything CPU-bound: cache lookups, index lookups, hashing, and the
 // allocation behaviour of each path. Those are what these measure.
 
@@ -86,8 +88,8 @@ func benchKeys(n int) []string {
 }
 
 // seed loads keys through MultiPut. Seeding with individual Put costs one
-// fdatasync per key, which on macOS (F_FULLFSYNC) makes setup dwarf the
-// measurement; MultiPut amortises them into one flush per batch.
+// fdatasync per key, which makes setup dwarf the measurement; MultiPut
+// amortises them into one flush per batch.
 func seed(b *testing.B, se *StorageEngine, keys []string, val []byte) {
 	b.Helper()
 	const chunk = 2048

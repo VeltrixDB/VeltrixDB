@@ -9,7 +9,8 @@ import (
 )
 
 // newFSMTestEngine boots a storage engine on a fresh temp dir with short flush
-// windows (macOS F_FULLFSYNC is slow) and waits for WAL replay.
+// windows (tests write sequentially, so the production window only adds
+// latency) and waits for WAL replay.
 func newFSMTestEngine(t *testing.T) *storage.StorageEngine {
 	t.Helper()
 	cfg := storage.DefaultStorageConfig()
