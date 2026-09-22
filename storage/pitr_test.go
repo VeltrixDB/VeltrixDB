@@ -13,14 +13,7 @@ import (
 // archiving into archiveDir (fast 10 ms archive interval for tests).
 func newPITRTestEngine(t *testing.T, dir, archiveDir string) (*StorageEngine, *WALArchiver) {
 	t.Helper()
-	cfg := DefaultStorageConfig()
-	cfg.DataDirPath = dir
-	cfg.DataDirPaths = nil
-	cfg.CacheMaxSizeMB = 16
-	cfg.WALFlushWindowMs = 1
-	cfg.VLogFlushWindowMs = 1
-	cfg.ScrubEnabled = false
-	cfg.BloomFilterShardBits = 1 << 18
+	cfg := testStorageConfig(dir)
 	cfg.ArchiveDir = archiveDir
 	cfg.ArchiveIntervalMs = 10
 

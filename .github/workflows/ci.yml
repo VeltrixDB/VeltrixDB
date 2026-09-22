@@ -58,10 +58,13 @@ jobs:
       # t.TempDir() honours TMPDIR, so pointing it at tmpfs makes those syncs
       # memory-speed. Durability semantics are unchanged — the code still
       # calls fdatasync, it just lands on a RAM-backed filesystem.
+      # 1G, not 6G: tmpfs pages are RAM. Measured peak scratch usage is 4.9 MB
+      # for the storage suite and 10.2 MB for integration, so 1G is ~100x
+      # headroom, and the 5G it gives back matters on a 16 GB runner.
       - name: mount tmpfs for test scratch
         run: |
           sudo mkdir -p /mnt/veltrix-tmp
-          sudo mount -t tmpfs -o size=6G,mode=1777 tmpfs /mnt/veltrix-tmp
+          sudo mount -t tmpfs -o size=1G,mode=1777 tmpfs /mnt/veltrix-tmp
           df -h /mnt/veltrix-tmp
 
       - name: storage + adminapi tests
@@ -155,10 +158,13 @@ jobs:
       # t.TempDir() honours TMPDIR, so pointing it at tmpfs makes those syncs
       # memory-speed. Durability semantics are unchanged — the code still
       # calls fdatasync, it just lands on a RAM-backed filesystem.
+      # 1G, not 6G: tmpfs pages are RAM. Measured peak scratch usage is 4.9 MB
+      # for the storage suite and 10.2 MB for integration, so 1G is ~100x
+      # headroom, and the 5G it gives back matters on a 16 GB runner.
       - name: mount tmpfs for test scratch
         run: |
           sudo mkdir -p /mnt/veltrix-tmp
-          sudo mount -t tmpfs -o size=6G,mode=1777 tmpfs /mnt/veltrix-tmp
+          sudo mount -t tmpfs -o size=1G,mode=1777 tmpfs /mnt/veltrix-tmp
           df -h /mnt/veltrix-tmp
 
       - name: build server binary
@@ -334,10 +340,13 @@ jobs:
       # t.TempDir() honours TMPDIR, so pointing it at tmpfs makes those syncs
       # memory-speed. Durability semantics are unchanged — the code still
       # calls fdatasync, it just lands on a RAM-backed filesystem.
+      # 1G, not 6G: tmpfs pages are RAM. Measured peak scratch usage is 4.9 MB
+      # for the storage suite and 10.2 MB for integration, so 1G is ~100x
+      # headroom, and the 5G it gives back matters on a 16 GB runner.
       - name: mount tmpfs for test scratch
         run: |
           sudo mkdir -p /mnt/veltrix-tmp
-          sudo mount -t tmpfs -o size=6G,mode=1777 tmpfs /mnt/veltrix-tmp
+          sudo mount -t tmpfs -o size=1G,mode=1777 tmpfs /mnt/veltrix-tmp
           df -h /mnt/veltrix-tmp
 
       # cgo on Linux compiles the storage package's C++ shims, which include

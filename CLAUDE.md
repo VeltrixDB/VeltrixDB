@@ -244,6 +244,10 @@ curl http://localhost:2112/readyz
 
 38. **`StorageEngine.Get` returns `ErrKeyNotFound` / `ErrKeyExpired` sentinels, not `fmt.Errorf`.** Formatting the key allocated on every negative lookup, which dominated the bloom-accelerated miss path. Match with `errors.Is`; the miss path is now zero-allocation. Never reintroduce a formatted error here.
 
+39. **Bloom memory is `BloomFilterShardBits / 8 x 8192`, allocated eagerly per engine — and every test config must come from `testStorageConfig`.** The same stale arithmetic has produced three separate bugs, all of it comments and constants sized when `numShards` was 1024: the production default was `1<<22` ("512 MB", actually **4 GB**), and `storage/backup_test.go`, `storage/pitr_test.go` and `storage/property_test.go` each used `1<<18` ("~32 MB", actually **256 MB per engine**). The storage suite builds ~105 engines, so under `-race` that alone put peak RSS at **8.07 GB** against a 16 GB CI runner; at `1<<12` (4 MB/engine) it is **1.14 GB**. Measured at `GOMAXPROCS=4`. Three near-identical helpers each carried their own copy of the config block, which is how two of them drifted — `storage/testconfig_test.go` is now the single source and new test helpers must call it rather than building a `StorageConfig` by hand.
+
+40. **CI test scratch goes on tmpfs, and tmpfs is RAM.** `syscall.Fsync` on Darwin returns at the drive cache and is effectively free; `syscall.Fdatasync` on a Linux runner's network-backed disk is a real round trip, and every `Put` does two (WAL + VLog). That is the whole reason the suite ran in ~18 s locally and timed out at 45 min in CI — no `-timeout` value was ever going to close it. Mount size is **1G**: measured peak scratch is 4.9 MB (storage) and 10.2 MB (integration), and the pages come out of the same 16 GB the tests need. Set `TMPDIR` on the **test step**, never at job level — `actions/setup-go` runs `go env` before the mount step exists, and the toolchain builds its work dir under `TMPDIR`, so a job-level value fails setup with `creating work dir: stat /mnt/veltrix-tmp: no such file or directory`.
+
 ## Performance Hotspots
 
 | Hotspot | File:Line | What matters |
