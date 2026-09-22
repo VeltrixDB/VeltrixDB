@@ -303,7 +303,11 @@ jobs:
     env:
       CGO_ENABLED: "1"
       VELTRIXDB_DISABLE_CGO_ENGINE: "1"
-      TMPDIR: /mnt/veltrix-tmp
+      # TMPDIR is deliberately NOT set at job level: actions/setup-go runs
+      # `go env` during its own setup, before the mount step below exists, and
+      # the Go toolchain creates its work dir under TMPDIR — so a job-level
+      # value fails the whole job with "creating work dir: stat
+      # /mnt/veltrix-tmp: no such file or directory". Set it on the test step.
     steps:
       - uses: actions/checkout@v4
 
@@ -355,6 +359,8 @@ jobs:
       # ~20x headroom. If a group exceeds it, we want the stack dump, not a
       # silent kill. -v so the last "=== RUN" identifies the offending test.
       - name: "${{ matrix.group }} under -race"
+        env:
+          TMPDIR: /mnt/veltrix-tmp
         run: |
           set -o pipefail
           go test -race -v -timeout 600s -count=1 ${{ matrix.pkgs }} \
