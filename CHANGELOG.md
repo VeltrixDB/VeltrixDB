@@ -9,6 +9,38 @@ Types: `Added`, `Changed`, `Fixed`, `Performance`, `Breaking`
 
 ## [Unreleased]
 
+### Performance
+
+- **Batch write latency cut ~2x: the WAL flusher now issues one `write(2)` per
+  group-commit batch instead of one per entry.** Group commit amortised the
+  `fdatasync` but not the writes, so a 1024-key `MultiPut` from 8 concurrent
+  clients cost ~8 K write syscalls before a single sync.
+
+  | | before | after | |
+  |---|---|---|---|
+  | `loadtest --batch-size=1024 --concurrency=8` P50 | 13.24 ms | **7.44 ms** | |
+  | same, P99 | 23.67 ms | **14.04 ms** | **-41%** |
+  | same, throughput | 596,819 ops/s | **1,065,175 ops/s** | **1.79x** |
+  | `MultiPut_Concurrent/workers=8` | 12.56 ms | **4.25 ms** | **-66%** |
+  | `MultiPut_1024` | 3.44 ms | 2.53 ms | -26% |
+  | `Put` (single key) | 78.4 us | 77.0 us | unchanged |
+
+  benchstat, n=6, p=0.002 on every changed row.
+
+  **The flush window was not the cause**, contrary to the obvious reading.
+  Sweeping `--wal-flush-window-ms` across 0 / 1 / 5 / 15 / 30 ms moved batch
+  P50 by ~1% — turning group commit off entirely did not help. Profiling
+  showed `syscall.write` at 27% of CPU and `syscall.Fsync` at 1.2%.
+
+  **Durability is unchanged**: identical bytes, identical order, still exactly
+  one `fdatasync` covering the batch before any waiter is ACKed. Verified by
+  SIGKILLing a server after 3000 ACKed writes and restarting — `missing=0
+  wrong=0`, with the WAL intact at 190 KB (i.e. the replay path really ran).
+
+- **One fewer allocation per WAL entry.** `serialize` borrowed a scratch buffer
+  and then allocated a second one to return; it now builds directly into a
+  pooled buffer that the flusher recycles. `MultiPut_1024` allocations -11%.
+
 ### Fixed
 
 - **Test bloom filters allocated 256 MB per engine, taking the suite to
