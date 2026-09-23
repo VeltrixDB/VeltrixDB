@@ -74,6 +74,10 @@ type WriteAheadLog struct {
 
 type walItem struct {
 	data []byte
+	// n is how many WAL records `data` holds. It is 1 for append/beginAppend
+	// and len(entries) for appendAll, which packs a whole MultiPut batch into
+	// one item. The flusher counts records, not items, towards maxBatch.
+	n int
 	// rec is the pooled backing buffer for data. The flusher returns it to
 	// walRecPool once it has copied the bytes into the batch buffer, which is
 	// the last read of them.
@@ -150,39 +154,55 @@ func (wal *WriteAheadLog) beginAppend(entry *WALEntry) *chan error {
 	item := walItemPool.Get().(*walItem)
 	item.rec = rec
 	item.data = *rec
+	item.n = 1
 	item.resp = *rp
 	wal.appendCh <- item
 	return rp
 }
 
-// appendAll sends all entries to the WAL channel without blocking, then waits
-// for all responses at once.  Because all N items are enqueued before any
-// response is awaited, the WAL flusher sees all N items in a single drain and
-// covers them with ONE fdatasync — regardless of the flush window.
+// appendAll writes a whole batch of entries as ONE group-commit item: every
+// record is serialized back-to-back into a single pooled buffer, sent to the
+// flusher with one channel send, and answered by one response.
 //
-// This is the correct path for MultiPut: N sequential wal.append calls would
-// produce N fdatasyncs; appendAll produces 1.
+// It used to enqueue one item per entry — 1024 channel sends, 1024 pooled
+// envelopes, 1024 response channels and 1024 receives for a single 1024-key
+// MultiPut. With 64 concurrent batches hammering one appendCh, profiling
+// measured runtime.chansend (almost entirely runtime.lock2 → osyield spinning
+// on the channel's mutex) at 12.8% of total CPU, and the contention scaled
+// with concurrency — which is what turned a fast batch path into a convoy.
+//
+// One item is also more honest about errors than the old per-entry []error
+// was: the flusher writes the batch with one write(2) and covers it with one
+// fdatasync, so every entry in a flush group already shared a single outcome.
+// Each caller still gets a slice of the right length, with that outcome
+// repeated, so the signature is unchanged.
 func (wal *WriteAheadLog) appendAll(entries []*WALEntry) []error {
 	if len(entries) == 0 {
 		return nil
 	}
-	type pending struct {
-		respPtr *chan error
-	}
-	ps := make([]pending, len(entries))
-	for i, e := range entries {
-		rp := walRespPool.Get().(*chan error)
-		ps[i] = pending{respPtr: rp}
-		item := walItemPool.Get().(*walItem)
-		item.rec = wal.serialize(e)
-		item.data = *item.rec
-		item.resp = *rp
-		wal.appendCh <- item
-	}
 	errs := make([]error, len(entries))
-	for i, p := range ps {
-		errs[i] = <-(*p.respPtr)
-		walRespPool.Put(p.respPtr)
+
+	bufPtr := walRecPool.Get().(*[]byte)
+	buf := (*bufPtr)[:0]
+	for _, e := range entries {
+		buf = appendWALRecord(buf, e)
+	}
+	*bufPtr = buf
+
+	rp := walRespPool.Get().(*chan error)
+	item := walItemPool.Get().(*walItem)
+	item.rec = bufPtr
+	item.data = buf
+	item.n = len(entries)
+	item.resp = *rp
+	wal.appendCh <- item
+
+	err := <-*rp
+	walRespPool.Put(rp)
+	if err != nil {
+		for i := range errs {
+			errs[i] = err
+		}
 	}
 	return errs
 }
@@ -196,12 +216,23 @@ func (wal *WriteAheadLog) appendAll(entries []*WALEntry) []error {
 // 160 B covers a 10-field header for a ~16 B key without growing.
 var walRecPool = sync.Pool{New: func() any { b := make([]byte, 0, 160); return &b }}
 
+// walRecMaxPooled caps what the flusher returns to walRecPool. appendAll
+// builds a whole batch in one of these buffers, so they no longer all hold a
+// single ~160 B record; without a cap a rare huge batch would keep a
+// multi-megabyte buffer alive in the pool indefinitely.
+const walRecMaxPooled = 1 << 20
+
 // serialize renders entry into a pooled buffer and returns that buffer. The
 // caller must hand the pointer to the flusher, which owns returning it.
 func (wal *WriteAheadLog) serialize(entry *WALEntry) *[]byte {
 	bufPtr := walRecPool.Get().(*[]byte)
-	buf := (*bufPtr)[:0]
+	*bufPtr = appendWALRecord((*bufPtr)[:0], entry)
+	return bufPtr
+}
 
+// appendWALRecord appends one on-disk WAL record to buf and returns the grown
+// buffer, so a batch of records can be built into a single allocation.
+func appendWALRecord(buf []byte, entry *WALEntry) []byte {
 	// Header: timestamp|tombstone|key|valueLen|crc32hex|version|vlogOffset|packed|diskLen|xflags\n
 	// 10-field format. vlogOffset=0 means value bytes follow on the next line
 	// (non-KV-sep mode or old-format compatibility). vlogOffset>0 means the
@@ -274,8 +305,7 @@ func (wal *WriteAheadLog) serialize(entry *WALEntry) *[]byte {
 		buf = append(buf, '\n')
 	}
 
-	*bufPtr = buf
-	return bufPtr
+	return buf
 }
 
 // flusher is the single goroutine that owns file I/O for this WAL.
@@ -292,6 +322,9 @@ func (wal *WriteAheadLog) serialize(entry *WALEntry) *[]byte {
 func (wal *WriteAheadLog) flusher() {
 	defer close(wal.flusherDone)
 	pending := make([]*walItem, 0, 1024)
+	// pendingRecords counts WAL RECORDS, not items: appendAll packs a whole
+	// MultiPut batch into one item, so maxBatch would otherwise never bind.
+	pendingRecords := 0
 
 	// batch is the coalescing buffer: every record in a group-commit batch is
 	// concatenated here and written with ONE write(2).
@@ -312,31 +345,42 @@ func (wal *WriteAheadLog) flusher() {
 			return
 		}
 
-		batch = batch[:0]
-		for _, item := range pending {
-			batch = append(batch, item.data...)
+		// One item already holds a contiguous run of records (appendAll packs a
+		// whole batch into one), so when it is the only item in the group its
+		// buffer IS the batch — write it directly rather than copying it.
+		out := pending[0].data
+		if len(pending) > 1 {
+			batch = batch[:0]
+			for _, item := range pending {
+				batch = append(batch, item.data...)
+			}
+			out = batch
 		}
 
 		var writeErr error
-		batchBytes := int64(len(batch))
-		if len(batch) > 0 {
-			if _, err := wal.file.Write(batch); err != nil {
+		batchBytes := int64(len(out))
+		if len(out) > 0 {
+			if _, err := wal.file.Write(out); err != nil {
 				writeErr = err
 			}
 		}
 		if writeErr == nil {
 			wal.bytesWritten.Add(uint64(batchBytes))
-			wal.entriesWritten.Add(uint64(len(pending)))
+			wal.entriesWritten.Add(uint64(pendingRecords))
 		}
 
 		if writeErr == nil {
 			writeErr = fdatasync(int(wal.file.Fd()))
 		}
 
-		// Give the record buffers back now that their bytes are in `batch`.
+		// Give the record buffers back now that their bytes have been written.
+		// A buffer that grew to hold an unusually large batch is dropped rather
+		// than pooled, so one outsized MultiPut does not pin it forever.
 		for _, item := range pending {
 			if item.rec != nil {
-				walRecPool.Put(item.rec)
+				if cap(*item.rec) <= walRecMaxPooled {
+					walRecPool.Put(item.rec)
+				}
 				item.rec = nil
 			}
 		}
@@ -362,24 +406,27 @@ func (wal *WriteAheadLog) flusher() {
 			// channel, never the envelope. Safe to recycle.
 			item.data = nil
 			item.resp = nil
+			item.n = 0
 			walItemPool.Put(item)
 		}
 		pending = pending[:0]
+		pendingRecords = 0
 	}
 
 	// drain drains all immediately available items from appendCh into pending.
 	// Returns true if maxBatch was reached (signals an early flush is needed).
 	drain := func() bool {
 	drainLoop:
-		for len(pending) < wal.maxBatch {
+		for pendingRecords < wal.maxBatch {
 			select {
 			case item := <-wal.appendCh:
 				pending = append(pending, item)
+				pendingRecords += item.n
 			default:
 				break drainLoop
 			}
 		}
-		return len(pending) >= wal.maxBatch
+		return pendingRecords >= wal.maxBatch
 	}
 
 	var (
@@ -405,6 +452,7 @@ func (wal *WriteAheadLog) flusher() {
 		select {
 		case item := <-wal.appendCh:
 			pending = append(pending, item)
+			pendingRecords += item.n
 			// Start window timer on the first entry of a new batch.
 			startTimer()
 			// Drain whatever is already in the channel without blocking.
@@ -431,6 +479,7 @@ func (wal *WriteAheadLog) flusher() {
 				select {
 				case item := <-wal.appendCh:
 					pending = append(pending, item)
+					pendingRecords += item.n
 				default:
 					break drainFinal
 				}

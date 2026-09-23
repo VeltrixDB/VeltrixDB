@@ -439,7 +439,7 @@ func (d *Defragmenter) compactVLog(diskIdx int, vl *VLog) {
 	type gcReloc struct {
 		key       string
 		oldOffset uint64
-		newOffset int64
+		newOffset int64  // relative to the batch extent until flushBatch commits
 		valueSize uint32 // used for MarkDead on both success and CAS-fail paths
 		oldPacked bool   // packed flag of the record being relocated (for MarkDead)
 		newPacked bool   // whether the relocated copy was packed (as reported by Stage)
@@ -454,6 +454,14 @@ func (d *Defragmenter) compactVLog(diskIdx int, vl *VLog) {
 	flushBatch := func() {
 		if len(batch) == 0 {
 			return
+		}
+		// Stage handed out offsets relative to this generation's extent;
+		// Commit reserves the extent and makes them absolute. Every entry in
+		// `batch` belongs to the current generation (the slice is reset after
+		// each flush), so one base applies to all of them.
+		base := batcher.Commit()
+		for i := range batch {
+			batch[i].newOffset += base
 		}
 		if err := batcher.Flush(); err != nil {
 			log.Printf("[gc] disk=%d batch-flush error: %v  abandoning %d relocations",
@@ -587,8 +595,10 @@ func (d *Defragmenter) compactVLog(diskIdx int, vl *VLog) {
 			continue
 		}
 
-		// Stage: reserve a new offset and buffer the record.  No disk I/O yet —
-		// the fdatasync happens only at Flush, shared across gcBatchSize records.
+		// Stage: buffer the record in the batch extent.  No disk I/O and no
+		// offset reservation yet — flushBatch commits the extent (one
+		// vl.end.Add) and issues one pwrite + one fdatasync for all
+		// gcBatchSize records.
 		newOffset, newPacked, err := batcher.Stage(value)
 		if err != nil {
 			deferIOErr++
