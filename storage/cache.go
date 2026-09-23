@@ -19,6 +19,12 @@ type hashedGetter interface {
 type Cache interface {
 	Get(key string) ([]byte, bool)
 	Put(key string, value []byte)
+	// PutIfPresent refreshes an already-resident key and reports whether it
+	// did. It is the write-around counterpart to Put: a caller that must not
+	// serve a stale value, but has no reason to believe the key will be read
+	// soon, uses it so bulk writes neither insert into the cache nor evict
+	// what is already there. See its use in multiPutKVSep.
+	PutIfPresent(key string, value []byte) bool
 	Evict(key string)
 	Size() uint64
 	Stats() CacheStats
@@ -189,6 +195,48 @@ func (c *LIRSCache) Put(key string, value []byte) {
 
 	c.pruneS()
 	c.evictHIRIfNeeded()
+}
+
+// PutIfPresent updates key's cached value only when the key is already
+// resident, and reports whether it did.
+//
+// Two things make this cheaper than Put for a key that is NOT cached, which is
+// the common case on a bulk write:
+//
+//   - It never inserts, so it never allocates a node, never pushes onto S or Q
+//     and never runs pruneS/evictHIRIfNeeded. Put's insert path is most of the
+//     work it does under the lock, and eviction scans a 16-entry window.
+//   - The shard mutex is therefore held for a map lookup rather than for an
+//     insert plus an eviction scan. LIRSCache.Get has to take that same mutex
+//     EXCLUSIVELY (a read mutates the LIRS state machine — invariant 36), so
+//     hold time on the write path is directly read latency on the read path.
+//
+// A non-resident node that exists only as LIRS history is left non-resident:
+// it carries no value, so it cannot go stale.
+func (c *LIRSCache) PutIfPresent(key string, value []byte) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	node, ok := c.index[key]
+	if !ok || !node.resident {
+		return false
+	}
+
+	size := uint64(len(value))
+	delta := int64(size) - int64(node.size)
+	node.value = value
+	node.size = size
+	if node.isLIR {
+		c.lirBytes = addDelta(c.lirBytes, delta)
+	} else {
+		c.hirBytes = addDelta(c.hirBytes, delta)
+	}
+	c.access(node)
+
+	// A value that grew can push the shard over budget.
+	c.pruneS()
+	c.evictHIRIfNeeded()
+	return true
 }
 
 // Evict forcibly removes a key from the cache.

@@ -112,7 +112,11 @@ func (c *shardedLIRSCache) getHashed(key string, h uint64) ([]byte, bool) {
 	return c.shards[h>>c.shift].Get(key)
 }
 func (c *shardedLIRSCache) Put(key string, value []byte) { c.shardFor(key).Put(key, value) }
-func (c *shardedLIRSCache) Evict(key string)             { c.shardFor(key).Evict(key) }
+
+func (c *shardedLIRSCache) PutIfPresent(key string, value []byte) bool {
+	return c.shardFor(key).PutIfPresent(key, value)
+}
+func (c *shardedLIRSCache) Evict(key string) { c.shardFor(key).Evict(key) }
 
 func (c *shardedLIRSCache) Size() uint64 {
 	var total uint64

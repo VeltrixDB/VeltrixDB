@@ -245,7 +245,7 @@ curl http://localhost:2112/readyz
 
 ---
 
-36. **The LIRS cache is SHARDED — never reintroduce a single cache-wide mutex.** `LIRSCache.Get` must take its lock exclusively (a read mutates the LIRS state machine via `access()`), so one global mutex serialises every read in the engine and negates the 8192-way index sharding. Profiling measured that lock at 21.7% of total CPU, 98.98% of it in `LIRSCache.Get`; sharding it took a cache hit from 711 ns to 113 ns. `NewShardedLIRSCache` splits the budget across up to 256 `LIRSCache` instances (`maxCacheShards`), each with its own mutex, chosen by the **high** bits of `fnv64a(key)` — the index uses the low 13 bits, so high bits keep the two placements independent. Budgets below 2 MB fall back to a single cache (`cacheShardCountFor`). The cost is that per-shard budgets are not a global budget: skewed keys can evict from a hot shard while a cold one has room. That is the accepted trade.
+36. **The LIRS cache is SHARDED — never reintroduce a single cache-wide mutex.** `LIRSCache.Get` must take its lock exclusively (a read mutates the LIRS state machine via `access()`), so one global mutex serialises every read in the engine and negates the 8192-way index sharding. Profiling measured that lock at 21.7% of total CPU, 98.98% of it in `LIRSCache.Get`; sharding it took a cache hit from 711 ns to 113 ns. `NewShardedLIRSCache` splits the budget across up to 256 `LIRSCache` instances (`maxCacheShards`), each with its own mutex, chosen by the **high** bits of `fnv64a(key)` — the index uses the low 13 bits, so high bits keep the two placements independent. Budgets below 2 MB fall back to a single cache (`cacheShardCountFor`). The cost is that per-shard budgets are not a global budget: skewed keys can evict from a hot shard while a cold one has room. That is the accepted trade. The other consequence is that `Get`'s exclusive lock couples reads to writes wherever the write path also touches the cache — see invariant 43.
 
 37. **Hot paths must not pay for disabled tracing.** `tracing.Start` returns a single shared `noopSpan` for unsampled spans — at the server's `RateSampler(0.01)` that is 99% of every Get and Put, and allocating a span there was among the largest allocation sources on the read path. `span.End()` checks `s.noop` **before** taking its mutex, because the shared instance would otherwise become a global contention point. Guard every hot-path `SetAttribute` with `if span.IsRecording()`: the `value any` parameter boxes its argument at the **call site**, so the allocation happens even when the span discards it.
 
@@ -264,6 +264,22 @@ curl http://localhost:2112/readyz
 
     `appendAll` returning one shared error for the whole batch is not a loss of precision: the flusher already covered every entry in a flush group with one `write(2)` and one `fdatasync`, so they always shared an outcome. Durability is unchanged throughout — same bytes, same order, still exactly one `fdatasync` per group before any waiter is answered. What remains on this path is index and cache allocation (`orderedKeyIndex.Insert` ~2 allocs/key, `LIRSCache.Put` ~3, `&IndexEntry` 1); the WAL and VLog write paths are now ~0.003 allocs/key combined. Guarded by `TestMultiPut_ConcurrentBatchExtents*` — under-reserving the extent in `Commit` makes both fail.
 
+43. **`MultiPut` refreshes the cache write-around (`PutIfPresent`), never `Put`. The single-key `Put` path stays write-through.** `LIRSCache.Get` must take its shard mutex EXCLUSIVELY, because a read mutates the LIRS state machine (invariant 36). Any cache write on the batch path therefore contends directly with every concurrent reader — and `Put`'s insert path is the expensive half of what it does under that lock (allocate a node, push onto S and Q, `pruneS`, then `evictHIRIfNeeded`, which scans a 16-entry window). Bulk ingestion also has no business inserting into the cache at all: it evicts the read working set with data nobody asked for.
+
+    Measured with 8 writers × 1024-key batches against 64 concurrent readers, and isolated by running the readers against a SEPARATE engine — identical CPU load, no shared locks — so CPU competition and lock contention could be told apart:
+
+    | arm | batch P50 | batch P99 |
+    |---|---|---|
+    | no readers | 1.91 ms | 6.19 ms |
+    | 64 readers, separate engine (CPU competition only) | 3.52 ms | 8.62 ms |
+    | 64 readers, shared engine (+ lock contention) | 5.72 ms | 13.75 ms |
+
+    So ~60% of the read-induced write slowdown was contention, not CPU, and a mutex profile attributed **75% of all contention delay to `LIRSCache.Get`** with `LIRSCache.Put` on the same mutex. `PutIfPresent` took no-readers P99 6.19 → 4.23 ms (−32%) and 64-reader P50 5.72 → 4.98 ms. It does NOT close the whole gap, because it still acquires the shard mutex once per key — deleting the cache write entirely reaches P50 3.22 / P99 9.21 ms, but that is not a legal configuration (see below). Closing the rest means batching the refreshes by cache shard so one acquisition covers several keys.
+
+    **`PutIfPresent` must update a resident key, not merely skip absent ones.** A cache hit returns before the index is ever consulted, so dropping the refresh leaves a reader serving the superseded value forever, and nothing else in the engine notices. `TestMultiPut_OverwriteOfCachedKeyIsNotStale` fails within one batch if it is removed. Non-resident LIRS history nodes are deliberately left non-resident: they carry no value, so they cannot go stale.
+
+    **Admission control is NOT the read→write coupling here.** Its threshold is 20 ms read EWMA (invariant 22); the EWMA in these runs stayed under 0.2 ms and `WriteThrottleActive` never fired. Reach for the cache mutex, not admission control, when reads appear to be slowing writes.
+
 ## Performance Hotspots
 
 | Hotspot | File:Line | What matters |
@@ -275,6 +291,7 @@ curl http://localhost:2112/readyz
 | ART lookup TLB | `cpp/include/art.hpp` | `ArtSlabAllocator` uses 2MB hugepages |
 | NVMe read priority | `cpp/src/scheduler.cpp:fill_sqe` | `sqe->ioprio = RT class` for reads |
 | Cache hit | `storage/cache_sharded.go:shardFor` | One hash + one per-shard mutex. NEVER collapse to a single cache-wide lock — see invariant 36 |
+| Batch cache refresh | `storage/batch.go` Phase 4 | `PutIfPresent`, not `Put` — bulk writes must not insert into the cache or hold the shard mutex for an eviction scan. See invariant 43 |
 | Pipeline coalescing | `cmd/server/main.go:tryCoalescePuts` | Opportunistic batching of buffered PUT/GET frames into MultiPut/MultiGet; cap=256; one Flush() per batch |
 | WriteBatcher flush | `storage/batcher.go:flush` | 2 MB **or 4096-entry** threshold + 5 ms timer; batchBufPool pre-sized 4096; channel depth 65536 |
 | CGO batch dispatch | `storage/cgo_bridge_pinner.go:batchPutViaCGO` | `runtime.Pinner` zero-copy; 1024-entry CGO call groups 1024 entries across 8192 shards on thread pool |

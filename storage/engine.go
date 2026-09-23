@@ -839,9 +839,10 @@ func (se *StorageEngine) Get(key string) ([]byte, error) {
 				break
 			}
 		}
-		// Admission control: cross 4ms EWMA → throttle writes + pause GC;
-		// cross back below 2ms → resume both.  Single relaxed store is safe
-		// here — the flag is only a hint (soft stall, not a mutex).
+		// Admission control: cross admissionThrottleNs (20 ms) EWMA → throttle
+		// writes + pause GC; cross back below admissionResumeNs (10 ms) →
+		// resume both.  Single relaxed store is safe here — the flag is only a
+		// hint (soft stall, not a mutex).
 		ac := se.metrics.Admission
 		if next > admissionThrottleNs {
 			ac.WriteThrottleActive.Store(true)
