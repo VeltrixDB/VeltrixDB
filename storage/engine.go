@@ -228,6 +228,16 @@ func NewStorageEngine(cfg *StorageConfig) (*StorageEngine, error) {
 	}
 
 	// One WAL per disk — parallel fdatasyncs, no shared serialisation point.
+	var legacyTextWAL bool
+	switch strings.ToLower(cfg.WALFormat) {
+	case "", "binary":
+	case "text":
+		legacyTextWAL = true
+		log.Printf("[wal] WARNING: --wal-format=text — writing the legacy text WAL for rollback. " +
+			"Keys containing '|' or newline are NOT crash-safe in this format.")
+	default:
+		return nil, fmt.Errorf("invalid WALFormat %q: want \"binary\" or \"text\"", cfg.WALFormat)
+	}
 	flushWindow := time.Duration(cfg.WALFlushWindowMs) * time.Millisecond
 	maxBatch := cfg.WALMaxBatchEntries
 
@@ -240,6 +250,7 @@ func NewStorageEngine(cfg *StorageConfig) (*StorageEngine, error) {
 			}
 			return nil, fmt.Errorf("disk %d WAL: %w", i, err)
 		}
+		w.legacyText = legacyTextWAL
 		wals[i] = w
 	}
 
@@ -566,6 +577,29 @@ func NewStorageEngine(cfg *StorageConfig) (*StorageEngine, error) {
 // it stores plaintext even when --encrypt-at-rest is on, and does so silently,
 // because FlagEncrypted is per-record and the read path simply won't decrypt
 // what was never marked encrypted.
+// untransformStored reverses transformForWrite for a blob read off the VLog:
+// decrypt, then decompress, per the record's xflags. plainLen is the
+// plaintext length (IndexEntry.UncompressedSize / WAL valueLen). Get has its
+// own copy of these steps inline, interleaved with metrics; this is for
+// readers that only have WAL metadata (the PITR archiver).
+func untransformStored(blob []byte, xflags uint8, plainLen uint32) ([]byte, error) {
+	if xflags&FlagEncrypted != 0 {
+		pt, err := Decrypt(blob)
+		if err != nil {
+			return nil, fmt.Errorf("decrypt: %w", err)
+		}
+		blob = pt
+	}
+	if xflags&FlagCompressed != 0 {
+		out, err := Decompress(blob, plainLen)
+		if err != nil {
+			return nil, fmt.Errorf("decompress: %w", err)
+		}
+		blob = out
+	}
+	return blob, nil
+}
+
 func (se *StorageEngine) transformForWrite(value []byte) ([]byte, uint8, error) {
 	out := value
 	var flags uint8

@@ -19,9 +19,10 @@ package storage
 //	│   └── seg-000000000002.json
 //	└── disk1/ ...
 //
-// Segment files hold records in the legacy 6-field inline-value WAL format
-// (timestamp|tombstone|key|valueLen|crc32hex|version\n[value\n]) that
-// replayWAL already parses. Records are SELF-CONTAINED: for KV-separation
+// Segment files hold ordinary WAL records (wal_format.go; binary unless the
+// engine runs --wal-format=text), each with its value inline and
+// untransformed, so replayWAL parses them directly. Records are
+// SELF-CONTAINED: for KV-separation
 // entries whose WAL record is header-only (value lives in the VLog), the
 // archiver resolves the VLog offset back into value bytes at archive time.
 // This is deliberate — VLog GC relocates and discards records, so archived
@@ -259,7 +260,16 @@ func (a *WALArchiver) archiveDisk(d *diskArchiver) error {
 				a.EntriesSkipped.Add(1)
 				continue
 			}
-			v, rerr := d.vlog.ReadValue(r.vlogOffset, r.valueLen)
+			// The VLog holds the STORED blob — diskLen bytes, compressed
+			// and/or encrypted per xflags. This used to read valueLen (the
+			// plaintext length) and embed the result as if it were
+			// plaintext: a transformed record either failed the VLog CRC and
+			// was counted as "skipped" (silently missing from the archive), or
+			// was archived as ciphertext that restore would then re-encrypt.
+			v, rerr := d.vlog.ReadValue(r.vlogOffset, r.diskLen)
+			if rerr == nil {
+				v, rerr = untransformStored(v, r.xflags, r.valueLen)
+			}
 			if rerr != nil {
 				// Already GC-reclaimed ⇒ superseded by a later WAL entry.
 				a.EntriesSkipped.Add(1)
@@ -267,14 +277,13 @@ func (a *WALArchiver) archiveDisk(d *diskArchiver) error {
 			}
 			val = v
 		}
-		// Recompute the CRC over the bytes we embed: for KV-sep records the
-		// WAL header CRC covers the pre-transform value, while the VLog holds
-		// the stored blob. replayWAL verifies inline values against this CRC.
+		// The embedded value is plaintext, so its CRC is the header's
+		// plaintext CRC; recompute anyway so a mismatch cannot be archived.
 		crc := r.crc
 		if len(val) > 0 {
 			crc = computeCRC32C(val)
 		}
-		seg = appendArchiveRecord(seg, r.timestampNs, r.isTombstone, r.key, val, crc, r.version)
+		seg = appendArchiveRecord(seg, r.timestampNs, r.isTombstone, r.key, val, crc, r.version, d.wal.legacyText)
 
 		if meta.Entries == 0 {
 			meta.FirstVersion, meta.LastVersion = r.version, r.version
@@ -456,123 +465,38 @@ func ListArchiveSegments(archiveDir string) ([]ArchiveSegmentMeta, error) {
 
 // ── WAL record parsing / serialization ────────────────────────────────────────
 
-// archivedWALRecord is one parsed record from a WAL byte buffer (live WAL or
-// archive segment — both use the same pipe-delimited framing).
-type archivedWALRecord struct {
-	timestampNs int64
-	isTombstone bool
-	key         string
-	valueLen    uint32
-	crc         uint32
-	version     uint64
-	vlogOffset  int64
-	value       []byte // inline value bytes, when present
+// parseWALBuffer decodes complete WAL records — binary or legacy text, in
+// any mix — from data and returns them with the number of bytes consumed. A
+// trailing partial record is left unconsumed (the archiver retries it on its
+// next pass). The same decoder as crash replay (wal_format.go), so the
+// archiver can never disagree with replay about where a record ends.
+func parseWALBuffer(data []byte) ([]walReplayEntry, int) {
+	r := newWALReader(bytes.NewReader(data))
+	var recs []walReplayEntry
+	for {
+		e, err := r.next()
+		if err != nil {
+			return recs, int(r.off)
+		}
+		recs = append(recs, e)
+	}
 }
 
-// parseWALBuffer parses complete 6/7/8-field WAL records from data and
-// returns them together with the number of bytes consumed. A trailing partial
-// record is left unconsumed (retried on the next pass). Mirrors replayWAL but
-// operates on an in-memory buffer instead of a file.
-func parseWALBuffer(data []byte) ([]archivedWALRecord, int) {
-	var recs []archivedWALRecord
-	pos := 0
-
-	for pos < len(data) {
-		nl := bytes.IndexByte(data[pos:], '\n')
-		if nl < 0 {
-			break
-		}
-		line := string(data[pos : pos+nl])
-		if line == "" {
-			pos += nl + 1
-			continue
-		}
-		parts := strings.SplitN(line, "|", 8)
-		if len(parts) < 6 {
-			break
-		}
-
-		ts, err := strconv.ParseInt(parts[0], 10, 64)
-		if err != nil {
-			break
-		}
-		isTombstone := parts[1] == "1"
-		key := parts[2]
-		valueLen, err := strconv.ParseUint(parts[3], 10, 32)
-		if err != nil {
-			break
-		}
-		crcU64, err := strconv.ParseUint(parts[4], 16, 32)
-		if err != nil {
-			break
-		}
-		version, err := strconv.ParseUint(parts[5], 10, 64)
-		if err != nil {
-			break
-		}
-		var vlogOffset int64
-		if len(parts) >= 7 {
-			vlogOffset, err = strconv.ParseInt(parts[6], 10, 64)
-			if err != nil {
-				break
-			}
-		}
-
-		recEnd := pos + nl + 1
-		var value []byte
-		if !isTombstone && valueLen > 0 && vlogOffset == 0 {
-			need := recEnd + int(valueLen) + 1 // value bytes + '\n'
-			if need > len(data) {
-				break // partial tail — leave for the next pass
-			}
-			value = data[recEnd : recEnd+int(valueLen)]
-			if data[recEnd+int(valueLen)] != '\n' {
-				break
-			}
-			recEnd = need
-		}
-
-		recs = append(recs, archivedWALRecord{
-			timestampNs: ts,
-			isTombstone: isTombstone,
-			key:         key,
-			valueLen:    uint32(valueLen),
-			crc:         uint32(crcU64),
-			version:     version,
-			vlogOffset:  vlogOffset,
-			value:       value,
-		})
-		pos = recEnd
+// appendArchiveRecord serialises one self-contained record: an inline,
+// untransformed value (or a tombstone), no VLog reference. legacyText picks
+// the encoding — see WriteAheadLog.legacyText.
+func appendArchiveRecord(buf []byte, tsNs int64, tombstone bool, key string, value []byte, crc uint32, version uint64, legacyText bool) []byte {
+	e := WALEntry{
+		Timestamp:   tsNs,
+		IsTombstone: tombstone,
+		Key:         key,
+		KeyLen:      uint32(len(key)),
+		Value:       value,
+		ValueLen:    uint32(len(value)),
+		Checksum:    crc,
+		Version:     version,
 	}
-
-	return recs, pos
-}
-
-// appendArchiveRecord serialises one self-contained record in the legacy
-// 6-field inline-value WAL format that replayWAL parses directly:
-// timestamp|tombstone|key|valueLen|crc32hex|version\n[value\n]
-func appendArchiveRecord(buf []byte, tsNs int64, tombstone bool, key string, value []byte, crc uint32, version uint64) []byte {
-	buf = strconv.AppendInt(buf, tsNs, 10)
-	buf = append(buf, '|')
-	if tombstone {
-		buf = append(buf, '1')
-	} else {
-		buf = append(buf, '0')
-	}
-	buf = append(buf, '|')
-	buf = append(buf, key...)
-	buf = append(buf, '|')
-	buf = strconv.AppendUint(buf, uint64(len(value)), 10)
-	buf = append(buf, '|')
-	buf = strconv.AppendUint(buf, uint64(crc), 16)
-	buf = append(buf, '|')
-	buf = strconv.AppendUint(buf, version, 10)
-	buf = append(buf, '\n')
-	if !tombstone && len(value) > 0 {
-		buf = append(buf, value...)
-		buf = append(buf, '\n')
-	}
-	return buf
+	return appendWALRecordFor(buf, &e, legacyText)
 }
 
 // ── point-in-time restore ─────────────────────────────────────────────────────
@@ -711,7 +635,9 @@ func RestorePITR(baseBackupDir, archiveDir string, target PITRTarget, destDirs [
 				if !target.Time.IsZero() && r.timestampNs > target.Time.UnixNano() {
 					continue
 				}
-				out = appendArchiveRecord(out[:0], r.timestampNs, r.isTombstone, r.key, r.value, r.crc, r.version)
+				// Binary: the restored dir is opened by this build, whose
+				// replay reads binary alongside any text in the base backup.
+				out = appendArchiveRecord(out[:0], r.timestampNs, r.isTombstone, r.key, r.value, r.crc, r.version, false)
 				if _, err := bw.Write(out); err != nil {
 					f.Close()
 					return applied, fmt.Errorf("pitr: append to restored wal disk %d: %w", diskIdx, err)

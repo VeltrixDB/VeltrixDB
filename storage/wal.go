@@ -70,6 +70,10 @@ type WriteAheadLog struct {
 	flushWindow  time.Duration // 0 = flush immediately after channel drain
 	maxBatch     int           // max entries per flush (safety cap)
 	diskIdx      int           // for log prefixes
+	// legacyText writes the pre-binary pipe-delimited records instead of the
+	// binary format (wal_format.go). Rollback insurance only: an older build
+	// cannot read binary records. Set before the first append.
+	legacyText bool
 }
 
 type walItem struct {
@@ -185,7 +189,7 @@ func (wal *WriteAheadLog) appendAll(entries []*WALEntry) []error {
 	bufPtr := walRecPool.Get().(*[]byte)
 	buf := (*bufPtr)[:0]
 	for _, e := range entries {
-		buf = appendWALRecord(buf, e)
+		buf = appendWALRecordFor(buf, e, wal.legacyText)
 	}
 	*bufPtr = buf
 
@@ -213,7 +217,8 @@ func (wal *WriteAheadLog) appendAll(entries []*WALEntry) []error {
 // allocated a second one to return — one guaranteed allocation per entry, i.e.
 // 1024 per 1024-entry MultiPut.
 //
-// 160 B covers a 10-field header for a ~16 B key without growing.
+// 160 B covers a binary record (48 B header + 4 B CRC) — or a 10-field text
+// header — for keys up to ~100 B without growing.
 var walRecPool = sync.Pool{New: func() any { b := make([]byte, 0, 160); return &b }}
 
 // walRecMaxPooled caps what the flusher returns to walRecPool. appendAll
@@ -226,13 +231,24 @@ const walRecMaxPooled = 1 << 20
 // caller must hand the pointer to the flusher, which owns returning it.
 func (wal *WriteAheadLog) serialize(entry *WALEntry) *[]byte {
 	bufPtr := walRecPool.Get().(*[]byte)
-	*bufPtr = appendWALRecord((*bufPtr)[:0], entry)
+	*bufPtr = appendWALRecordFor((*bufPtr)[:0], entry, wal.legacyText)
 	return bufPtr
 }
 
-// appendWALRecord appends one on-disk WAL record to buf and returns the grown
-// buffer, so a batch of records can be built into a single allocation.
-func appendWALRecord(buf []byte, entry *WALEntry) []byte {
+// appendWALRecordFor appends one on-disk WAL record to buf in the selected
+// encoding and returns the grown buffer, so a batch of records can be built
+// into a single allocation.
+func appendWALRecordFor(buf []byte, entry *WALEntry, legacyText bool) []byte {
+	if legacyText {
+		return appendWALRecordText(buf, entry)
+	}
+	return appendWALRecordBinary(buf, entry)
+}
+
+// appendWALRecordText appends one record in the legacy text encoding. Kept
+// for --wal-format=text; see wal_format.go for why binary replaced it — in
+// short, a key containing '|' or '\n' makes this format unreplayable.
+func appendWALRecordText(buf []byte, entry *WALEntry) []byte {
 	// Header: timestamp|tombstone|key|valueLen|crc32hex|version|vlogOffset|packed|diskLen|xflags\n
 	// 10-field format. vlogOffset=0 means value bytes follow on the next line
 	// (non-KV-sep mode or old-format compatibility). vlogOffset>0 means the
@@ -522,5 +538,5 @@ func (wal *WriteAheadLog) close() error {
 // checkpoint writes a compacted WAL (one record per live key) via an atomic
 // rename so keys survive a clean restart.  Must be called after close().
 func (wal *WriteAheadLog) checkpoint(index *shardedIndex, numDisks int, kvSep bool, version uint64) error {
-	return writeWALCheckpoint(wal.walPath, index, wal.diskIdx, numDisks, kvSep, version)
+	return writeWALCheckpoint(wal.walPath, index, wal.diskIdx, numDisks, kvSep, version, wal.legacyText)
 }

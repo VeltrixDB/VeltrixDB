@@ -129,46 +129,50 @@ func TestWAL_ImmediateMode(t *testing.T) {
 	}
 }
 
-// TestWAL_Serialization writes a single entry and verifies the WAL file
-// contains the expected pipe-delimited fields.
+// TestWAL_Serialization round-trips every record shape through both
+// encodings: what the flusher writes, the replay decoder must return field
+// for field.
 func TestWAL_Serialization(t *testing.T) {
-	wal, dir := newTestWAL(t, 0 /*immediate*/, 1024)
-
-	key := "serialize-test-key"
-	value := []byte("hello-world")
-	entry := &WALEntry{
-		Timestamp:   12345678,
-		Key:         key,
-		KeyLen:      uint32(len(key)),
-		Value:       value,
-		ValueLen:    uint32(len(value)),
-		Checksum:    computeCRC32C(value),
-		Version:     7,
-		IsTombstone: false,
+	entries := []*WALEntry{
+		{Timestamp: 12345678, Key: "inline", Value: []byte("hello-world"), ValueLen: 11,
+			Checksum: computeCRC32C([]byte("hello-world")), Version: 7},
+		{Timestamp: 2, Key: "kvsep", ValueLen: 300, Checksum: 0xABCD, Version: 8,
+			VLogOffset: 1 << 40, Packed: true, DiskValueLen: 120, XformFlags: FlagCompressed | FlagEncrypted},
+		{Timestamp: 3, Key: "gone", IsTombstone: true, Version: 9},
+		{Timestamp: 4, Key: "", Value: []byte("empty key"), ValueLen: 9,
+			Checksum: computeCRC32C([]byte("empty key")), Version: 10},
 	}
-	if err := wal.append(entry); err != nil {
-		t.Fatalf("append: %v", err)
-	}
-
-	walPath := filepath.Join(dir, "wal.log")
-	data, err := os.ReadFile(walPath)
-	if err != nil {
-		t.Fatalf("read wal: %v", err)
-	}
-
-	content := string(data)
-	// The WAL file must contain the key and the "7|" version.
-	for _, want := range []string{key, "|7|"} {
-		found := false
-		for i := 0; i <= len(content)-len(want); i++ {
-			if content[i:i+len(want)] == want {
-				found = true
-				break
+	for _, text := range []bool{false, true} {
+		t.Run(fmt.Sprintf("legacyText=%v", text), func(t *testing.T) {
+			wal, dir := newTestWAL(t, 0 /*immediate*/, 1024)
+			wal.legacyText = text
+			for _, e := range entries {
+				e.KeyLen = uint32(len(e.Key))
+				if err := wal.append(e); err != nil {
+					t.Fatalf("append: %v", err)
+				}
 			}
-		}
-		if !found {
-			t.Errorf("WAL missing %q in:\n%s", want, content)
-		}
+			got, err := replayWAL(filepath.Join(dir, "wal.log"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(got) != len(entries) {
+				t.Fatalf("replayed %d records, want %d", len(got), len(entries))
+			}
+			for i, e := range entries {
+				g := got[i]
+				wantDisk := e.DiskValueLen
+				if wantDisk == 0 {
+					wantDisk = e.ValueLen
+				}
+				if g.key != e.Key || g.isTombstone != e.IsTombstone || g.version != e.Version ||
+					g.timestampNs != e.Timestamp || g.crc != e.Checksum || g.valueLen != e.ValueLen ||
+					g.vlogOffset != e.VLogOffset || g.packed != e.Packed || g.diskLen != wantDisk ||
+					g.xflags != e.XformFlags || string(g.value) != string(e.Value) {
+					t.Errorf("record %d:\n got %+v\nwant %+v", i, g, e)
+				}
+			}
+		})
 	}
 }
 
