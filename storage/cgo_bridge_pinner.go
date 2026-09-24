@@ -3,7 +3,14 @@
 package storage
 
 /*
-#cgo linux CXXFLAGS: -std=c++17 -O3 -march=native -I${SRCDIR}/../cpp/include
+#cgo linux CXXFLAGS: -std=c++17 -O3 -I${SRCDIR}/../cpp/include
+// Portable ISA baseline, NOT -march=native. cgo applies these flags to every
+// C++ file in the package, and -march=native bakes in the BUILD host's ISA:
+// an image built on a CI runner with AVX-512 dies with SIGILL on a node
+// without it. x86-64-v2 still has the SSE4.2 CRC32 instructions the C++
+// code uses. scripts/build.sh, which builds on the target host, adds
+// -march=native back through CGO_CXXFLAGS.
+#cgo linux,amd64 CXXFLAGS: -march=x86-64-v2
 #cgo linux LDFLAGS:  -lstdc++ -luring -lpthread
 #include "../cpp/include/batch_engine.hpp"
 #include <stdlib.h>

@@ -3,7 +3,9 @@
 package storage
 
 /*
-#cgo CXXFLAGS: -std=c++17 -O3 -march=native -I${SRCDIR}/../cpp/include
+#cgo CXXFLAGS: -std=c++17 -O3 -I${SRCDIR}/../cpp/include
+// Portable baseline, not -march=native — see cgo_bridge_pinner.go.
+#cgo amd64 CXXFLAGS: -march=x86-64-v2
 #cgo LDFLAGS: -lstdc++
 #include "../cpp/include/batch_engine.hpp"
 #include <stdlib.h>

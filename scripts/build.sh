@@ -97,6 +97,13 @@ if [[ "${GO_ONLY}" == "false" && "${GOOS}" == "linux" && -d "${CPP_BUILD_DIR:-}"
   fi
 fi
 
+# The cgo directives in storage/ use a portable ISA baseline so that images
+# built on CI run anywhere. This script builds on the machine that will run
+# the binary, so tune for it unless the caller already chose flags.
+if [[ "${CGO_ENABLED}" == "1" ]]; then
+  export CGO_CXXFLAGS="${CGO_CXXFLAGS:--O3 -march=native}"
+fi
+
 GO_BINARY="${OUTPUT_DIR}/veltrixdb"
 
 ( cd "${REPO_ROOT}" && \

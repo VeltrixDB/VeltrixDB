@@ -309,6 +309,11 @@ jobs:
     env:
       CGO_ENABLED: "1"
       VELTRIXDB_DISABLE_CGO_ENGINE: "1"
+      # ...but keep the native (C++) Index Vault ON. Disabling the C++ engine
+      # would otherwise fall back to the Go map index too, and then no race
+      # job would ever run the native index under concurrent access. It
+      # starts no threads and no io_uring rings, so it costs this job nothing.
+      VELTRIXDB_INDEX: native
       # TMPDIR is deliberately NOT set at job level: actions/setup-go runs
       # `go env` during its own setup, before the mount step below exists, and
       # the Go toolchain creates its work dir under TMPDIR — so a job-level
@@ -466,6 +471,9 @@ jobs:
       - name: cgo vet
         run: CGO_ENABLED=1 go vet ./storage/...
 
+      # C++ engine fully on: native index + io_uring bridge on every engine.
+      # This is the only job where concurrent MultiPut batches reach the
+      # bridge's per-ring submit path (TestMultiPut_ConcurrentBatchExtents*).
       - name: storage tests with cgo enabled
         run: CGO_ENABLED=1 go test -timeout 300s -count=1 ./storage/...
 
