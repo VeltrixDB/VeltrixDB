@@ -48,6 +48,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <sys/uio.h>
 #include <vector>
 
@@ -133,6 +134,19 @@ struct DiskRing {
     std::vector<iovec>    fixed_iovecs;
     std::vector<void*>    buf_ptrs;
     size_t                buf_size{0};
+
+    // Serialises submit + reap on this ring. liburing rings are not
+    // thread-safe, and Go calls submitVLogBatch from every goroutine whose
+    // MultiPut flushes a batch — concurrently, for the same disk. Without
+    // this, two callers interleaved io_uring_get_sqe on one SQ and reaped
+    // each other's CQEs; user_data is only an index into the CALLER's array,
+    // so a CQE landed on the wrong request and one batch's failed write
+    // could be reported as another's success.
+    std::mutex            mu;
+    // Set when the ring is left in an unknown state (submit or wait failed
+    // mid-batch). A failed ring is never used again: callers get 0 and the
+    // Go side falls back to pwrite.
+    bool                  failed{false};
 
     // Monotonic counters (relaxed ordering — monitoring only).
     std::atomic<uint64_t> submits{0};

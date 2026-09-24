@@ -134,14 +134,15 @@ func (se *StorageEngine) LookupBySecondary(rule, value string) []string {
 	for i := range se.index.shards {
 		shard := &se.index.shards[i]
 		shard.mu.RLock()
-		for k, entry := range shard.entries {
+		shard.entries.rangeAll(func(k string, entry *IndexEntry) bool {
 			if entry.IsTombstone() {
-				continue
+				return true
 			}
 			if strings.HasPrefix(k, prefix) {
 				out = append(out, k[len(prefix):])
 			}
-		}
+			return true
+		})
 		shard.mu.RUnlock()
 	}
 	return out

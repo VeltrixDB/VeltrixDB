@@ -195,6 +195,8 @@ func NewStorageEngine(cfg *StorageConfig) (*StorageEngine, error) {
 	// index shards. Profiling put 21.7% of CPU in that one lock.
 	cache := NewShardedLIRSCache(cfg.CacheMaxSizeMB, lirRatio)
 	index := newShardedIndex()
+	log.Printf("[index] implementation=%s (native = off-heap C++ table, invisible to the Go GC; set %s=map to opt out)",
+		IndexImpl(), IndexImplEnv)
 	if cfg.DisableOrderedIndex {
 		// Drop the ordered key view: the shard-lock hooks become no-ops and
 		// RangeScan / ScanCursor return ErrOrderedIndexDisabled.
@@ -226,6 +228,16 @@ func NewStorageEngine(cfg *StorageConfig) (*StorageEngine, error) {
 	}
 
 	// One WAL per disk — parallel fdatasyncs, no shared serialisation point.
+	var legacyTextWAL bool
+	switch strings.ToLower(cfg.WALFormat) {
+	case "", "binary":
+	case "text":
+		legacyTextWAL = true
+		log.Printf("[wal] WARNING: --wal-format=text — writing the legacy text WAL for rollback. " +
+			"Keys containing '|' or newline are NOT crash-safe in this format.")
+	default:
+		return nil, fmt.Errorf("invalid WALFormat %q: want \"binary\" or \"text\"", cfg.WALFormat)
+	}
 	flushWindow := time.Duration(cfg.WALFlushWindowMs) * time.Millisecond
 	maxBatch := cfg.WALMaxBatchEntries
 
@@ -238,6 +250,7 @@ func NewStorageEngine(cfg *StorageConfig) (*StorageEngine, error) {
 			}
 			return nil, fmt.Errorf("disk %d WAL: %w", i, err)
 		}
+		w.legacyText = legacyTextWAL
 		wals[i] = w
 	}
 
@@ -564,6 +577,29 @@ func NewStorageEngine(cfg *StorageConfig) (*StorageEngine, error) {
 // it stores plaintext even when --encrypt-at-rest is on, and does so silently,
 // because FlagEncrypted is per-record and the read path simply won't decrypt
 // what was never marked encrypted.
+// untransformStored reverses transformForWrite for a blob read off the VLog:
+// decrypt, then decompress, per the record's xflags. plainLen is the
+// plaintext length (IndexEntry.UncompressedSize / WAL valueLen). Get has its
+// own copy of these steps inline, interleaved with metrics; this is for
+// readers that only have WAL metadata (the PITR archiver).
+func untransformStored(blob []byte, xflags uint8, plainLen uint32) ([]byte, error) {
+	if xflags&FlagEncrypted != 0 {
+		pt, err := Decrypt(blob)
+		if err != nil {
+			return nil, fmt.Errorf("decrypt: %w", err)
+		}
+		blob = pt
+	}
+	if xflags&FlagCompressed != 0 {
+		out, err := Decompress(blob, plainLen)
+		if err != nil {
+			return nil, fmt.Errorf("decompress: %w", err)
+		}
+		blob = out
+	}
+	return blob, nil
+}
+
 func (se *StorageEngine) transformForWrite(value []byte) ([]byte, uint8, error) {
 	out := value
 	var flags uint8
@@ -839,9 +875,10 @@ func (se *StorageEngine) Get(key string) ([]byte, error) {
 				break
 			}
 		}
-		// Admission control: cross 4ms EWMA → throttle writes + pause GC;
-		// cross back below 2ms → resume both.  Single relaxed store is safe
-		// here — the flag is only a hint (soft stall, not a mutex).
+		// Admission control: cross admissionThrottleNs (20 ms) EWMA → throttle
+		// writes + pause GC; cross back below admissionResumeNs (10 ms) →
+		// resume both.  Single relaxed store is safe here — the flag is only a
+		// hint (soft stall, not a mutex).
 		ac := se.metrics.Admission
 		if next > admissionThrottleNs {
 			ac.WriteThrottleActive.Store(true)
@@ -1099,11 +1136,12 @@ func (se *StorageEngine) DropNamespace(ns string) (int, error) {
 	for i := range se.index.shards {
 		shard := &se.index.shards[i]
 		shard.mu.RLock()
-		for k, entry := range shard.entries {
+		shard.entries.rangeAll(func(k string, entry *IndexEntry) bool {
 			if !entry.IsTombstone() && !entry.IsExpired(nowUs) && len(k) > len(prefix) && k[:len(prefix)] == prefix {
 				keys = append(keys, k)
 			}
-		}
+			return true
+		})
 		shard.mu.RUnlock()
 	}
 	for _, k := range keys {
@@ -1132,12 +1170,12 @@ func (se *StorageEngine) ScanNamespace(ns, prefix string, limit int) ([]NSEntry,
 	for i := range se.index.shards {
 		shard := &se.index.shards[i]
 		shard.mu.RLock()
-		for k, entry := range shard.entries {
+		shard.entries.rangeAll(func(k string, entry *IndexEntry) bool {
 			if entry.IsTombstone() || entry.IsExpired(nowUs) {
-				continue
+				return true
 			}
 			if len(k) < len(internalPrefix) || k[:len(internalPrefix)] != internalPrefix {
-				continue
+				return true
 			}
 			candidates = append(candidates, candidate{
 				internalKey: k,
@@ -1146,9 +1184,10 @@ func (se *StorageEngine) ScanNamespace(ns, prefix string, limit int) ([]NSEntry,
 				valueSize:   entry.ValueSize,
 			})
 			if limit > 0 && len(candidates) >= limit {
-				break
+				return false
 			}
-		}
+			return true
+		})
 		shard.mu.RUnlock()
 		if limit > 0 && len(candidates) >= limit {
 			break
@@ -1178,16 +1217,17 @@ func (se *StorageEngine) ListNamespaces() []NSInfo {
 	for i := range se.index.shards {
 		shard := &se.index.shards[i]
 		shard.mu.RLock()
-		for k, entry := range shard.entries {
+		shard.entries.rangeAll(func(k string, entry *IndexEntry) bool {
 			if entry.IsTombstone() || entry.IsExpired(nowUs) {
-				continue
+				return true
 			}
 			idx := strings.Index(k, nsSep)
 			if idx <= 0 {
-				continue // not a namespaced key
+				return true // not a namespaced key
 			}
 			counts[k[:idx]]++
-		}
+			return true
+		})
 		shard.mu.RUnlock()
 	}
 	result := make([]NSInfo, 0, len(counts))
@@ -1243,11 +1283,12 @@ func (se *StorageEngine) HGetAll(key string) ([]HashField, error) {
 	for i := range se.index.shards {
 		shard := &se.index.shards[i]
 		shard.mu.RLock()
-		for k, entry := range shard.entries {
+		shard.entries.rangeAll(func(k string, entry *IndexEntry) bool {
 			if !entry.IsTombstone() && !entry.IsExpired(nowUs) && strings.HasPrefix(k, prefix) {
 				internalKeys = append(internalKeys, k)
 			}
-		}
+			return true
+		})
 		shard.mu.RUnlock()
 	}
 	results := make([]HashField, 0, len(internalKeys))
@@ -1269,11 +1310,12 @@ func (se *StorageEngine) HKeys(key string) []string {
 	for i := range se.index.shards {
 		shard := &se.index.shards[i]
 		shard.mu.RLock()
-		for k, entry := range shard.entries {
+		shard.entries.rangeAll(func(k string, entry *IndexEntry) bool {
 			if !entry.IsTombstone() && !entry.IsExpired(nowUs) && strings.HasPrefix(k, prefix) {
 				fields = append(fields, k[len(prefix):])
 			}
-		}
+			return true
+		})
 		shard.mu.RUnlock()
 	}
 	return fields
@@ -1287,11 +1329,12 @@ func (se *StorageEngine) HLen(key string) int {
 	for i := range se.index.shards {
 		shard := &se.index.shards[i]
 		shard.mu.RLock()
-		for k, entry := range shard.entries {
+		shard.entries.rangeAll(func(k string, entry *IndexEntry) bool {
 			if !entry.IsTombstone() && !entry.IsExpired(nowUs) && strings.HasPrefix(k, prefix) {
 				count++
 			}
-		}
+			return true
+		})
 		shard.mu.RUnlock()
 	}
 	return count
@@ -1390,11 +1433,12 @@ func (se *StorageEngine) ScanKeys() []string {
 	for i := range se.index.shards {
 		shard := &se.index.shards[i]
 		shard.mu.RLock()
-		for k, entry := range shard.entries {
+		shard.entries.rangeAll(func(k string, entry *IndexEntry) bool {
 			if !entry.IsTombstone() && !entry.IsExpired(nowUs) {
 				keys = append(keys, k)
 			}
-		}
+			return true
+		})
 		shard.mu.RUnlock()
 	}
 	return keys
@@ -1568,6 +1612,9 @@ func (se *StorageEngine) Close() error {
 			firstErr = err
 		}
 	}
+	// Last: the checkpoint above is the final reader. The native index lives
+	// off the Go heap, so nothing else would ever return its memory.
+	se.index.close()
 	return firstErr
 }
 
@@ -1623,8 +1670,8 @@ func (se *StorageEngine) compactDiskShards(diskIdx int, _ CompactionRequest) {
 		}
 		snap := make([]pending, 0, len(shard.dirtyValues))
 		for key, val := range shard.dirtyValues {
-			entry := shard.entries[key]
-			if entry == nil || entry.IsTombstone() {
+			entry, ok := shard.entries.get(key, fnv64a(key))
+			if !ok || entry.IsTombstone() {
 				delete(shard.dirtyValues, key)
 				se.index.dirtyCount.Add(-1)
 				continue
@@ -1642,12 +1689,16 @@ func (se *StorageEngine) compactDiskShards(diskIdx int, _ CompactionRequest) {
 
 			// 3. Update DiskOffset only if the entry hasn't been overwritten.
 			shard.mu.Lock()
-			if live := shard.entries[p.key]; live != nil && !live.IsTombstone() {
+			shard.entries.update(p.key, fnv64a(p.key), func(live *IndexEntry) bool {
+				if live.IsTombstone() {
+					return false
+				}
 				live.DiskOffset = uint64(diskOffset)
 				live.SegmentID = uint32(diskIdx)
 				delete(shard.dirtyValues, p.key)
 				se.index.dirtyCount.Add(-1)
-			}
+				return true
+			})
 			shard.mu.Unlock()
 		}
 	}

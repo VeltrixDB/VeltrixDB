@@ -323,8 +323,11 @@ func (vl *VLog) beginAppend(value []byte) (int64, *chan error, error) {
 	binary.LittleEndian.PutUint32(buf[vhdrOffCRC:], crc)
 	binary.LittleEndian.PutUint64(buf[vhdrOffWriteUs:], uint64(time.Now().UnixMicro()))
 	copy(buf[vlogHeaderBytes:], value)
-	for i := vlogHeaderBytes + len(value); i < alignedLen; i++ {
-		buf[i] = 0
+	// Range form so the compiler emits a memclr; the indexed form it replaced
+	// is not the recognised idiom and compiled to a byte-at-a-time loop.
+	pad := buf[vlogHeaderBytes+len(value) : alignedLen]
+	for i := range pad {
+		pad[i] = 0
 	}
 
 	// Atomically claim [offset, offset+alignedLen) — no mutex required.
@@ -753,46 +756,87 @@ func (vl *VLog) flusher(window time.Duration) {
 // block(s) with the legacy unpacked layout — uncommon for typical KV
 // workloads.
 //
-// On Linux with CGO enabled, Flush routes writes through the io_uring
-// storage bridge: N pwrites → 1 io_uring_submit. The bridge sees the same
-// (offset, buf) pairs it always saw — a packed block is just a 4 KB write
-// at a 4 KB-aligned offset. No bridge changes needed.
+// All blocks of one batch live in a single contiguous extent, so Flush is one
+// pwrite (or one io_uring submission) plus one fdatasync, regardless of how
+// many records the batch holds.
 //
-// Usage:
+// Usage — Stage returns offsets RELATIVE to the extent; Commit reserves the
+// extent and returns the absolute base to add to them:
 //
 //	b := vl.NewBatcher()
-//	off1, packed1, _ := b.Stage(val1)   // → e.g. blockOff + 0
-//	off2, packed2, _ := b.Stage(val2)   // → e.g. blockOff + 152
-//	off3, packed3, _ := b.Stage(val3)   // → e.g. blockOff + 304
-//	b.Flush()                  // single fdatasync covers all 3
+//	rel1, packed1, _ := b.Stage(val1)   // → 0
+//	rel2, packed2, _ := b.Stage(val2)   // → 152
+//	rel3, packed3, _ := b.Stage(val3)   // → 304
+//	base := b.Commit()                  // one vl.end.Add for the whole extent
+//	off1 := base + rel1                 // absolute VLog offsets
+//	b.Flush()                           // one pwrite + one fdatasync
 type VLogBatcher struct {
-	vl     *VLog
-	blocks []*packBlock
+	vl *VLog
+
+	// buf is ONE contiguous 4 KB-aligned staging extent holding every block
+	// this batch will write. Staging fills it; Flush writes it with a single
+	// pwrite.
+	//
+	// It used to be a []*packBlock, each with its own 4 KB buffer obtained
+	// from vlogIOPool and its own vl.end.Add reservation, and Flush looped
+	// WriteAt over them. A 1024-key batch of 128 B values packs into ~40
+	// blocks, so that was ~40 pwrite(2) calls per batch per disk; profiling
+	// `MultiPut` at 64 concurrent batches measured syscall.pwrite at 43% of
+	// total CPU, all of it from this loop. It is the same mistake the WAL
+	// flusher made before it started concatenating its group-commit batch
+	// into one write(2).
+	//
+	// Because the blocks are contiguous in the extent they are also
+	// contiguous on disk, which is what makes the single write possible: the
+	// extent is reserved in ONE vl.end.Add at Commit time, once the total
+	// size is known, instead of one Add per block.
+	buf  []byte
+	used int // bytes of buf allocated to blocks; always a multiple of vlogBlockSize
+
+	// openBlock is the offset in buf of the block currently accepting packed
+	// records, or -1 when there is none (start of batch, or the last stage was
+	// an oversized record that consumed whole blocks).
+	openBlock int
+	blockUsed int // bytes filled in the open block (header+value sum, no pad)
+
 	// Total live bytes added by this batch (sum of header+value over all
 	// records). Used to advance vl.liveBytes once on Flush.
 	rawLive int64
+
+	// base is the absolute VLog offset that buf[0] maps to, assigned by
+	// Commit. Stage returns offsets RELATIVE to buf[0]; they only become
+	// absolute once Commit has run.
+	base      int64
+	committed bool
 }
 
-// packBlock is a 4 KB buffer being filled with sequential records.
-type packBlock struct {
-	offset int64  // 4 KB-aligned offset in the VLog
-	buf    []byte // exactly vlogBlockSize bytes (from vlogIOPool); for oversized records, a multiple of vlogBlockSize
-	used   int    // bytes filled so far (header+value sum, no internal pad)
-}
-
-// stagedRecord is the thin record passed to the io_uring bridge. The bridge
-// wants (offset, length, buffer-pointer) tuples — it doesn't care whether
-// each tuple is one packed block or one oversized record's full extent. Kept
-// as a separate type so the C++ bridge layer doesn't have to know about
-// packBlock semantics.
+// stagedRecord is the thin record passed to the io_uring bridge: an
+// (offset, length, buffer) tuple. Since the batcher stages into one
+// contiguous extent there is normally exactly one of these per Flush, but the
+// type is kept separate so the C++ bridge layer does not have to know about
+// batcher internals.
 type stagedRecord struct {
 	offset    int64
 	alignedSz int
 	buf       []byte
 }
 
+// vlogExtentPool holds the batcher's staging extents. Deliberately separate
+// from vlogIOPool: that pool is dominated by single 4 KB read buffers, and
+// vlog4kBufPool.get DROPS a popped buffer that is too small, so mixing
+// ~160 KB extent requests into it would evict read buffers on every batch.
+var vlogExtentPool = &vlog4kBufPool{}
+
+// vlogExtentMinBytes is the initial staging extent. 64 KB = 16 packed blocks,
+// which already covers a ~400-record batch of 128 B values without a regrow.
+const vlogExtentMinBytes = 64 << 10
+
+// vlogExtentMaxPooled caps what goes back into vlogExtentPool, so one
+// pathological batch does not pin megabytes of aligned memory forever.
+const vlogExtentMaxPooled = 8 << 20
+
 // SetStorageBridge wires the io_uring bridge so that VLogBatcher.Flush
-// routes writes through io_uring on Linux instead of N separate WriteAt calls.
+// routes writes through io_uring on Linux instead of a plain WriteAt.
 // Must be called before any writes; nil disables the bridge (WriteAt fallback).
 func (vl *VLog) SetStorageBridge(b *cgoStorageBridge) {
 	vl.bridge = b
@@ -800,14 +844,45 @@ func (vl *VLog) SetStorageBridge(b *cgoStorageBridge) {
 
 // NewBatcher creates a group-append batcher for this VLog.
 func (vl *VLog) NewBatcher() *VLogBatcher {
-	return &VLogBatcher{vl: vl}
+	return &VLogBatcher{vl: vl, openBlock: -1}
+}
+
+// grow ensures the staging extent can hold `need` bytes.
+func (b *VLogBatcher) grow(need int) {
+	if cap(b.buf) >= need {
+		b.buf = b.buf[:cap(b.buf)]
+		return
+	}
+	size := vlogExtentMinBytes
+	for size < need {
+		size *= 2
+	}
+	nb := vlogExtentPool.get(size)
+	if b.buf != nil {
+		copy(nb, b.buf[:b.used])
+		vlogExtentPool.put(b.buf)
+	}
+	b.buf = nb
+}
+
+// zero clears buf[from:to]. Written as a range loop so the compiler emits a
+// memclr; the explicit `for i := 0; i < n; i++` form it replaced is not the
+// recognised idiom and compiled to a bounds-checked byte-at-a-time loop over
+// a full 4 KB block for every block staged.
+func (b *VLogBatcher) zero(from, to int) {
+	s := b.buf[from:to]
+	for i := range s {
+		s[i] = 0
+	}
 }
 
 // Stage assembles a record into the current packed block (or starts a new
-// block if it doesn't fit) but does NOT write to disk yet. Returns the offset
-// the record WILL occupy after Flush() — this offset is intra-block (not
-// 4 KB-aligned) when the block is shared with other records — and whether the
-// record was in fact packed.
+// block if it does not fit) but does NOT write to disk yet.
+//
+// The returned offset is RELATIVE to the start of this batch's extent. Add
+// Commit()'s base to get the absolute VLog offset. Flush calls Commit itself
+// if the caller has not, so a caller that never needs the offsets can ignore
+// it entirely.
 //
 // Callers MUST propagate the returned packed bool to IndexEntry.Flags
 // (FlagPacked) verbatim. Do not recompute it: a record larger than
@@ -817,129 +892,143 @@ func (vl *VLog) NewBatcher() *VLogBatcher {
 // under-report garbage. Do not infer it from offset alignment either — the
 // first packed record in a block sits at a 4 KB-aligned offset.
 func (b *VLogBatcher) Stage(value []byte) (offset int64, packed bool, err error) {
+	if b.committed {
+		return 0, false, fmt.Errorf("disk %d vlog batch: Stage after Commit", b.vl.diskIdx)
+	}
 	rawLen := vlogHeaderBytes + len(value)
 	if rawLen > vlogBlockSize {
 		off, serr := b.stageOversized(value)
 		return off, false, serr
 	}
 
-	// Try to fit into the last (open) block.
-	var blk *packBlock
-	if n := len(b.blocks); n > 0 {
-		last := b.blocks[n-1]
-		if last.used+rawLen <= vlogBlockSize {
-			blk = last
-		}
-	}
-	// No room — allocate a fresh 4 KB block.
-	if blk == nil {
-		offset := b.vl.end.Add(int64(vlogBlockSize)) - int64(vlogBlockSize)
-		buf := vlogIOPool.get(vlogBlockSize)
-		// Zero the unused tail explicitly so the on-disk block is well-defined
-		// for any future packed Stage call against this same buffer (vlogIOPool
-		// doesn't zero on get).
-		for i := 0; i < vlogBlockSize; i++ {
-			buf[i] = 0
-		}
-		blk = &packBlock{offset: offset, buf: buf, used: 0}
-		b.blocks = append(b.blocks, blk)
+	// Open a fresh block when there is none or the record does not fit.
+	if b.openBlock < 0 || b.blockUsed+rawLen > vlogBlockSize {
+		b.grow(b.used + vlogBlockSize)
+		b.openBlock = b.used
+		b.blockUsed = 0
+		b.used += vlogBlockSize
+		// vlogExtentPool does not zero on get, and the block's trailing pad
+		// must be well-defined on disk.
+		b.zero(b.openBlock, b.used)
 	}
 
-	// Serialize the record into the block at blk.used.
-	pos := blk.used
-	binary.LittleEndian.PutUint32(blk.buf[pos+vhdrOffMagic:], vlogMagic)
-	binary.LittleEndian.PutUint32(blk.buf[pos+vhdrOffValLen:], uint32(len(value)))
-	binary.LittleEndian.PutUint32(blk.buf[pos+vhdrOffCRC:], computeCRC32C(value))
-	binary.LittleEndian.PutUint64(blk.buf[pos+vhdrOffWriteUs:], uint64(time.Now().UnixMicro()))
-	copy(blk.buf[pos+vlogHeaderBytes:], value)
-	blk.used += rawLen
+	pos := b.openBlock + b.blockUsed
+	binary.LittleEndian.PutUint32(b.buf[pos+vhdrOffMagic:], vlogMagic)
+	binary.LittleEndian.PutUint32(b.buf[pos+vhdrOffValLen:], uint32(len(value)))
+	binary.LittleEndian.PutUint32(b.buf[pos+vhdrOffCRC:], computeCRC32C(value))
+	binary.LittleEndian.PutUint64(b.buf[pos+vhdrOffWriteUs:], uint64(time.Now().UnixMicro()))
+	copy(b.buf[pos+vlogHeaderBytes:], value)
+	b.blockUsed += rawLen
 	b.rawLive += int64(rawLen)
-	return blk.offset + int64(pos), true, nil
+	return int64(pos), true, nil
 }
 
 // stageOversized handles a record whose raw size exceeds vlogBlockSize. It
-// allocates a dedicated multi-block range and writes the record at the start
-// — same encoding as the legacy single-record path. The caller should NOT
-// set FlagPacked on the IndexEntry.
+// consumes a whole-block-aligned span of the extent and writes the record at
+// the start — same encoding as the legacy single-record path. The caller must
+// NOT set FlagPacked on the IndexEntry.
 func (b *VLogBatcher) stageOversized(value []byte) (int64, error) {
 	rawLen := vlogHeaderBytes + len(value)
 	alignedLen := (rawLen + vlogBlockSize - 1) &^ (vlogBlockSize - 1)
-	buf := vlogIOPool.get(alignedLen)
-	binary.LittleEndian.PutUint32(buf[vhdrOffMagic:], vlogMagic)
-	binary.LittleEndian.PutUint32(buf[vhdrOffValLen:], uint32(len(value)))
-	binary.LittleEndian.PutUint32(buf[vhdrOffCRC:], computeCRC32C(value))
-	binary.LittleEndian.PutUint64(buf[vhdrOffWriteUs:], uint64(time.Now().UnixMicro()))
-	copy(buf[vlogHeaderBytes:], value)
-	for i := vlogHeaderBytes + len(value); i < alignedLen; i++ {
-		buf[i] = 0
-	}
-	offset := b.vl.end.Add(int64(alignedLen)) - int64(alignedLen)
-	// Represent oversized records as a single "block" whose buf is alignedLen
-	// (multiple of vlogBlockSize). The Flush loop writes blk.buf[:len(buf)]
-	// not blk.buf[:vlogBlockSize], so this works for any size multiple.
-	b.blocks = append(b.blocks, &packBlock{offset: offset, buf: buf, used: alignedLen})
+	b.grow(b.used + alignedLen)
+	pos := b.used
+	b.used += alignedLen
+	binary.LittleEndian.PutUint32(b.buf[pos+vhdrOffMagic:], vlogMagic)
+	binary.LittleEndian.PutUint32(b.buf[pos+vhdrOffValLen:], uint32(len(value)))
+	binary.LittleEndian.PutUint32(b.buf[pos+vhdrOffCRC:], computeCRC32C(value))
+	binary.LittleEndian.PutUint64(b.buf[pos+vhdrOffWriteUs:], uint64(time.Now().UnixMicro()))
+	copy(b.buf[pos+vlogHeaderBytes:], value)
+	b.zero(pos+rawLen, b.used)
+	// An oversized record consumes its blocks whole; nothing may pack after it.
+	b.openBlock = -1
+	b.blockUsed = 0
 	b.rawLive += int64(rawLen)
-	return offset, nil
+	return int64(pos), nil
 }
 
-// Flush writes all staged blocks to disk in offset order and issues a single
-// fdatasync. Returns block buffers to vlogIOPool. Not safe to call
-// concurrently with another Flush on the same batcher.
+// Commit reserves this batch's extent in the VLog and returns the absolute
+// offset of its first byte. Every offset Stage returned is relative to that
+// base.
 //
-// On Linux with the io_uring storage bridge wired (vl.bridge != nil), all
-// blocks are dispatched in a single io_uring_submit call (linked SQEs +
-// IOSQE_IO_LINK for ordering), then one fdatasync. Replaces N separate
-// WriteAt syscalls with 1 io_uring_submit (zero-syscall on SQPOLL hot path).
+// This is the ONLY vl.end.Add the batch performs — one atomic reservation of
+// the exact total instead of one per 4 KB block. That is what makes the blocks
+// contiguous on disk and lets Flush issue a single write. Reserving the exact
+// total is also why the reservation has to wait until staging is done: the
+// size is not known before then, and over-reserving would leak VLog space that
+// only a GC pass could recover.
+//
+// Invariant 18 is preserved: b.used is always a multiple of vlogBlockSize, so
+// the offset handed out stays 4 KB-aligned with no mutex. Calling Commit twice
+// is a no-op.
+func (b *VLogBatcher) Commit() int64 {
+	if b.committed {
+		return b.base
+	}
+	b.committed = true
+	if b.used == 0 {
+		b.base = 0
+		return 0
+	}
+	b.base = b.vl.end.Add(int64(b.used)) - int64(b.used)
+	return b.base
+}
+
+// Flush writes the staged extent to disk with a single pwrite and issues one
+// fdatasync. Commits first if the caller has not. Returns the extent to the
+// pool. Not safe to call concurrently with another Flush on the same batcher.
+//
+// On Linux with the io_uring storage bridge wired (vl.bridge != nil) the write
+// is dispatched through io_uring instead.
 func (b *VLogBatcher) Flush() error {
-	if len(b.blocks) == 0 {
+	if b.used == 0 {
+		b.release()
 		return nil
 	}
+	base := b.Commit()
 	defer b.release()
 
-	fd := int(b.vl.file.Fd())
-
-	// ── io_uring fast path (Linux + bridge wired) ──────────────────────────
-	if ok := vlogFlushViaBridge(b, fd); ok {
-		var blockTotal int64
-		for _, blk := range b.blocks {
-			blockTotal += int64(len(blk.buf))
-		}
-		b.vl.totalBytes.Add(blockTotal)
-		b.vl.liveBytes.Add(b.rawLive)
-		return nil
+	if base%int64(vlogBlockSize) != 0 {
+		return fmt.Errorf("disk %d vlog batch: base offset %d not 4K-aligned", b.vl.diskIdx, base)
+	}
+	if b.used%vlogBlockSize != 0 {
+		return fmt.Errorf("disk %d vlog batch: extent len %d not 4K multiple", b.vl.diskIdx, b.used)
 	}
 
-	// ── Fallback: sequential WriteAt + one fdatasync ───────────────────────
-	for _, blk := range b.blocks {
-		if blk.offset%int64(vlogBlockSize) != 0 {
-			return fmt.Errorf("disk %d vlog batch: block offset %d not 4K-aligned", b.vl.diskIdx, blk.offset)
-		}
-		if len(blk.buf)%vlogBlockSize != 0 {
-			return fmt.Errorf("disk %d vlog batch: block buf len %d not 4K multiple", b.vl.diskIdx, len(blk.buf))
-		}
-		if _, err := b.vl.file.WriteAt(blk.buf, blk.offset); err != nil {
+	fd := int(b.vl.file.Fd())
+	if ok := vlogFlushViaBridge(b, fd); !ok {
+		if _, err := b.vl.file.WriteAt(b.buf[:b.used], base); err != nil {
 			return fmt.Errorf("disk %d vlog batch writeat: %w", b.vl.diskIdx, err)
 		}
-	}
-	if err := fdatasync(fd); err != nil {
-		return fmt.Errorf("disk %d vlog batch fdatasync: %w", b.vl.diskIdx, err)
+		if err := fdatasync(fd); err != nil {
+			return fmt.Errorf("disk %d vlog batch fdatasync: %w", b.vl.diskIdx, err)
+		}
 	}
 
-	var blockTotal int64
-	for _, blk := range b.blocks {
-		blockTotal += int64(len(blk.buf))
-	}
-	b.vl.totalBytes.Add(blockTotal)
+	b.vl.totalBytes.Add(int64(b.used))
 	b.vl.liveBytes.Add(b.rawLive)
 	return nil
 }
 
+// staged returns the extent as the single (offset, len, buf) tuple the
+// io_uring bridge consumes.
+func (b *VLogBatcher) staged() []stagedRecord {
+	return []stagedRecord{{offset: b.base, alignedSz: b.used, buf: b.buf[:b.used]}}
+}
+
+// release resets the batcher for reuse and returns the extent to the pool.
+// defrag.go reuses one batcher across many flush generations, so each
+// generation gets a fresh (pooled) extent and a fresh base.
 func (b *VLogBatcher) release() {
-	for _, blk := range b.blocks {
-		vlogIOPool.put(blk.buf)
+	if b.buf != nil && cap(b.buf) <= vlogExtentMaxPooled {
+		vlogExtentPool.put(b.buf)
 	}
-	b.blocks = b.blocks[:0]
+	b.buf = nil
+	b.used = 0
+	b.openBlock = -1
+	b.blockUsed = 0
 	b.rawLive = 0
+	b.base = 0
+	b.committed = false
 }
 
 // readRecordAtOffset reads the VLog record at offset, taking the payload

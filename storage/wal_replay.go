@@ -4,10 +4,9 @@ import (
 	"bufio"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
-	"strconv"
-	"strings"
 	"time"
 )
 
@@ -32,31 +31,12 @@ type walReplayEntry struct {
 }
 
 // replayWAL reads the WAL file at walPath and returns all valid, fully-written
-// entries in the order they were appended. A partial entry at the tail — from a
-// crash mid-write — is silently dropped; all entries before it are returned.
+// entries in the order they were appended. Binary and legacy text records
+// may be mixed in one file (see wal_format.go). A torn or corrupt record —
+// from a crash mid-write — ends the replay: everything before it is returned,
+// nothing after it is trusted, and the stop is logged with its offset.
 //
 // Returns nil, nil when the file does not exist (fresh install, nothing to replay).
-//
-// WAL record formats:
-//
-//	6-field (legacy): timestamp|tombstone|key|valueLen|crc32hex|version\n
-//	                  [raw value bytes]\n   ← present when !tombstone && valueLen>0
-//
-//	7-field (legacy KV-sep): timestamp|tombstone|key|valueLen|crc32hex|version|vlogOffset\n
-//	                         [raw value bytes]\n  ← present only when vlogOffset==0 && !tombstone && valueLen>0
-//
-//	8-field (legacy): timestamp|tombstone|key|valueLen|crc32hex|version|vlogOffset|packed\n
-//	                  [raw value bytes]\n  ← present only when vlogOffset==0 && !tombstone && valueLen>0
-//	The 'packed' field ('0' or '1') restores FlagPacked onto the rebuilt
-//	IndexEntry so MarkDead later subtracts the correct footprint.
-//
-//	10-field (current): ...|vlogOffset|packed|diskLen|xflags\n
-//	                    [raw value bytes]\n  ← same condition as above
-//	'diskLen' is the on-disk blob length after compression + encryption and
-//	'xflags' (hex) carries FlagCompressed|FlagEncrypted. valueLen remains the
-//	PLAINTEXT length. Shorter records parse with diskLen=valueLen and
-//	xflags=0 — correct for them, since those builds wrote values
-//	untransformed through this path.
 func replayWAL(walPath string) ([]walReplayEntry, error) {
 	f, err := os.Open(walPath)
 	if os.IsNotExist(err) {
@@ -67,116 +47,27 @@ func replayWAL(walPath string) ([]walReplayEntry, error) {
 	}
 	defer f.Close()
 
-	br := bufio.NewReaderSize(f, 1<<20) // 1 MB read buffer
+	r := newWALReader(f)
 	var entries []walReplayEntry
-
 	for {
-		line, err := br.ReadString('\n')
-		if err != nil {
-			// EOF or I/O error: entries parsed so far are valid.
-			break
-		}
-		line = strings.TrimRight(line, "\r\n")
-		if line == "" {
+		e, err := r.next()
+		if err == nil {
+			entries = append(entries, e)
 			continue
 		}
-
-		// SplitN with n=10 handles the 6-, 7-, 8- and 10-field formats:
-		// shorter lines just leave the higher indices unset.
-		parts := strings.SplitN(line, "|", 10)
-		if len(parts) < 6 {
-			break // malformed header — stop, treat remainder as corrupt tail
-		}
-
-		ts, err := strconv.ParseInt(parts[0], 10, 64)
-		if err != nil {
-			break
-		}
-		isTombstone := parts[1] == "1"
-		key := parts[2]
-		valueLen, err := strconv.ParseUint(parts[3], 10, 32)
-		if err != nil {
-			break
-		}
-		crcU64, err := strconv.ParseUint(parts[4], 16, 32)
-		if err != nil {
-			break
-		}
-		version, err := strconv.ParseUint(parts[5], 10, 64)
-		if err != nil {
-			break
-		}
-
-		var vlogOffset int64
-		if len(parts) >= 7 {
-			off, err := strconv.ParseInt(parts[6], 10, 64)
-			if err != nil {
-				break
+		if err != io.EOF {
+			// The text parser used to stop here silently. Say so: the bytes
+			// past this point are either a torn final write (expected after
+			// a crash, and small) or damage worth investigating (large).
+			var size int64 = -1
+			if fi, serr := f.Stat(); serr == nil {
+				size = fi.Size()
 			}
-			vlogOffset = off
+			log.Printf("[wal] replay of %s stopped at byte %d of %d after %d records: %v",
+				walPath, r.off, size, len(entries), err)
 		}
-		var packed bool
-		if len(parts) >= 8 {
-			// 8th field is "0" or "1"; anything else leaves packed=false.
-			packed = parts[7] == "1"
-		}
-
-		// Fields 9 and 10 (diskLen, xflags) describe the value transform.
-		// Absent in older WALs: default diskLen to the plaintext length and
-		// xflags to 0, which is exactly right for records written before the
-		// batched/replay paths applied transforms.
-		diskLen := uint32(valueLen)
-		var xflags uint8
-		if len(parts) >= 10 {
-			dl, err := strconv.ParseUint(parts[8], 10, 32)
-			if err != nil {
-				break
-			}
-			xf, err := strconv.ParseUint(parts[9], 16, 8)
-			if err != nil {
-				break
-			}
-			if dl > 0 {
-				diskLen = uint32(dl)
-			}
-			xflags = uint8(xf)
-		}
-
-		var value []byte
-		// Value bytes follow in the WAL when:
-		//   • not a tombstone
-		//   • valueLen > 0
-		//   • vlogOffset == 0  (KV-sep entries with vlogOffset>0 have no WAL bytes)
-		if !isTombstone && valueLen > 0 && vlogOffset == 0 {
-			value = make([]byte, valueLen)
-			if _, err := io.ReadFull(br, value); err != nil {
-				break // truncated — drop this entry and everything after
-			}
-			// Consume the '\n' delimiter that follows the value bytes.
-			if b, err := br.ReadByte(); err != nil || b != '\n' {
-				break
-			}
-			if computeCRC32C(value) != uint32(crcU64) {
-				break // corrupted entry
-			}
-		}
-
-		entries = append(entries, walReplayEntry{
-			key:         key,
-			value:       value,
-			isTombstone: isTombstone,
-			version:     version,
-			timestampNs: ts,
-			crc:         uint32(crcU64),
-			valueLen:    uint32(valueLen),
-			vlogOffset:  vlogOffset,
-			packed:      packed,
-			diskLen:     diskLen,
-			xflags:      xflags,
-		})
+		return entries, nil
 	}
-
-	return entries, nil
 }
 
 // vlogReplayPending tracks a single old-format WAL entry that needs a VLog
@@ -334,15 +225,19 @@ func walPathForDir(dir string) string {
 // live key assigned to diskIdx.  It is called by Close() instead of truncating
 // the WAL to zero, so keys are never lost across clean restarts.
 //
-// Format is identical to the normal 10-field WAL so replayWAL/applyWALReplay
-// can parse it without any changes.  For KV-sep entries the vlogOffset field
-// is set (no value bytes written); for non-KV-sep entries value bytes follow.
+// Records go through the same encoder as live WAL appends (appendWALRecordFor),
+// in the same format, so replayWAL needs nothing special for them. For KV-sep
+// entries the vlogOffset is set and no value bytes are written; for non-KV-sep
+// entries the dirty value is embedded.
+//
+// legacyText selects the pre-binary text encoding — what --wal-format=text
+// uses to make a clean shutdown leave a WAL an older build can read.
 //
 // The write is crash-safe: we write to walPath+".ckpt", fdatasync, then
 // rename to walPath — so a crash mid-write leaves the old WAL intact.
 //
 // Must be called after the WAL flusher goroutine has stopped (w.close()).
-func writeWALCheckpoint(walPath string, index *shardedIndex, diskIdx, numDisks int, kvSep bool, version uint64) error {
+func writeWALCheckpoint(walPath string, index *shardedIndex, diskIdx, numDisks int, kvSep bool, version uint64, legacyText bool) error {
 	tmpPath := walPath + ".ckpt"
 	f, err := os.Create(tmpPath)
 	if err != nil {
@@ -353,100 +248,57 @@ func writeWALCheckpoint(walPath string, index *shardedIndex, diskIdx, numDisks i
 	now := time.Now().UnixNano()
 	var writeErr error
 	var buf []byte // reused across entries to avoid per-entry allocation
+	var we WALEntry
 
 	for i := diskIdx; i < numShards && writeErr == nil; i += numDisks {
 		shard := &index.shards[i]
 		shard.mu.RLock()
-		for key, entry := range shard.entries {
+		shard.entries.rangeAll(func(key string, entry *IndexEntry) bool {
 			if entry.IsTombstone() {
-				continue // deleted keys are not checkpointed
+				return true // deleted keys are not checkpointed
 			}
 
 			ts := entry.WriteTimestampUs * 1000 // μs → ns (WAL stores nanoseconds)
 			if ts == 0 {
 				ts = now
 			}
-
-			// Serialise in the same 10-field pipe-delimited format as
-			// wal.serialize():
-			//   timestamp|0|key|valueLen|crcHex|version|vlogOffset|packed|diskLen|xflags\n
-			//
-			// valueLen is the PLAINTEXT length (UncompressedSize) and diskLen
-			// the on-disk blob (ValueSize); they differ under compression or
-			// encryption. Emitting ValueSize as valueLen and dropping the
-			// packed/compressed/encrypted flags — as this did while it wrote
-			// 7 fields — meant a clean shutdown produced a checkpoint that
-			// replayed into entries with the wrong read length and no
-			// transform bits, i.e. unreadable values and a distorted GCRatio.
+			// ValueLen is the PLAINTEXT length (UncompressedSize) and
+			// DiskValueLen the on-disk blob (ValueSize); they differ under
+			// compression or encryption. A checkpoint that conflated them, or
+			// dropped the packed/compressed/encrypted flags, replayed into
+			// entries with the wrong read length and no transform bits.
 			plainLen := entry.UncompressedSize
 			if plainLen == 0 {
 				plainLen = entry.ValueSize
 			}
-			buf = buf[:0]
-			buf = strconv.AppendInt(buf, ts, 10)
-			buf = append(buf, '|', '0', '|')
-			buf = append(buf, key...)
-			buf = append(buf, '|')
-			buf = strconv.AppendUint(buf, uint64(plainLen), 10)
-			buf = append(buf, '|')
-			buf = strconv.AppendUint(buf, uint64(entry.CRC32C), 16)
-			buf = append(buf, '|')
-			buf = strconv.AppendUint(buf, version, 10)
-			buf = append(buf, '|')
+			we = WALEntry{Timestamp: ts, Key: key, KeyLen: uint32(len(key)), Version: version}
 
 			if kvSep && entry.DiskOffset > 0 {
-				// Value is durable in VLog — header-only record, no value bytes.
-				buf = strconv.AppendInt(buf, int64(entry.DiskOffset), 10)
-				buf = append(buf, '|')
-				if entry.IsPacked() {
-					buf = append(buf, '1')
-				} else {
-					buf = append(buf, '0')
-				}
-				// Same rollback insurance as wal.serialize: only emit the
-				// transform fields when they carry information, so an
-				// untransformed checkpoint stays readable by a pre-fix binary.
-				xf := entry.Flags & (FlagCompressed | FlagEncrypted)
-				if xf != 0 || entry.ValueSize != plainLen {
-					buf = append(buf, '|')
-					buf = strconv.AppendUint(buf, uint64(entry.ValueSize), 10)
-					buf = append(buf, '|')
-					buf = strconv.AppendUint(buf, uint64(xf), 16)
-				}
-				buf = append(buf, '\n')
-				_, writeErr = bw.Write(buf)
+				// Value is durable in VLog — header-only record.
+				we.ValueLen = plainLen
+				we.Checksum = entry.CRC32C
+				we.VLogOffset = int64(entry.DiskOffset)
+				we.Packed = entry.IsPacked()
+				we.DiskValueLen = entry.ValueSize
+				we.XformFlags = entry.Flags & (FlagCompressed | FlagEncrypted)
 			} else {
 				// Non-KV-sep (or missing vlogOffset): embed value bytes from the
 				// dirty map.  If the dirty value is gone (already flushed to segment
 				// before Close was called) we have no bytes to write — skip.
 				dirtyVal := shard.dirtyValues[key]
 				if len(dirtyVal) == 0 {
-					continue
+					return true
 				}
 				// Dirty values are held in RAM as plaintext, so this record is
-				// untransformed regardless of what the IndexEntry says: rewrite
-				// the length field to match the bytes that actually follow.
-				buf = buf[:0]
-				buf = strconv.AppendInt(buf, ts, 10)
-				buf = append(buf, '|', '0', '|')
-				buf = append(buf, key...)
-				buf = append(buf, '|')
-				buf = strconv.AppendUint(buf, uint64(len(dirtyVal)), 10)
-				buf = append(buf, '|')
-				buf = strconv.AppendUint(buf, uint64(computeCRC32C(dirtyVal)), 16)
-				buf = append(buf, '|')
-				buf = strconv.AppendUint(buf, version, 10)
-				// vlogOffset=0 → value bytes follow; unpacked, untransformed.
-				buf = append(buf, '|', '0', '|', '0', '|')
-				buf = strconv.AppendUint(buf, uint64(len(dirtyVal)), 10)
-				buf = append(buf, '|', '0', '\n')
-				if _, writeErr = bw.Write(buf); writeErr == nil {
-					if _, writeErr = bw.Write(dirtyVal); writeErr == nil {
-						writeErr = bw.WriteByte('\n')
-					}
-				}
+				// untransformed regardless of what the IndexEntry says.
+				we.Value = dirtyVal
+				we.ValueLen = uint32(len(dirtyVal))
+				we.Checksum = computeCRC32C(dirtyVal)
 			}
-		}
+			buf = appendWALRecordFor(buf[:0], &we, legacyText)
+			_, writeErr = bw.Write(buf)
+			return writeErr == nil
+		})
 		shard.mu.RUnlock()
 	}
 

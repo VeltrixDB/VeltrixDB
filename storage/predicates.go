@@ -99,14 +99,15 @@ func (se *StorageEngine) predicateScanCollect(fn PredicateFunc, keyPrefix string
 		shard.mu.RLock()
 		// Snapshot keys so we don't hold the shard lock during Get.
 		var keys []string
-		for k, entry := range shard.entries {
+		shard.entries.rangeAll(func(k string, entry *IndexEntry) bool {
 			if entry.IsTombstone() {
-				continue
+				return true
 			}
 			if keyPrefix == "" || hasPrefix(k, keyPrefix) {
 				keys = append(keys, k)
 			}
-		}
+			return true
+		})
 		shard.mu.RUnlock()
 
 		for _, k := range keys {

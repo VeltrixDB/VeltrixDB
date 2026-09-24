@@ -274,6 +274,11 @@ int StorageBridge::submit_disk_batch(int                        disk_idx_in,
     DiskRing& dr = rings_[disk_idx_in];
     if (!dr.initialized || dr.ring == nullptr || count == 0) return 0;
 
+    // One caller at a time per ring, for the whole submit-then-reap cycle:
+    // the CQEs reaped below must be exactly the SQEs this call submitted.
+    std::lock_guard<std::mutex> lk(dr.mu);
+    if (dr.failed) return 0;
+
     // Track how many SQEs we actually got into the ring per flush segment.
     // We may need multiple flush segments if the ring fills up.
     size_t   total_submitted = 0;   // SQEs submitted to the kernel
@@ -350,11 +355,15 @@ int StorageBridge::submit_disk_batch(int                        disk_idx_in,
 
         // Single io_uring_submit for this segment.
         int ret = ::io_uring_submit(dr.ring);
-        if (ret < 0) {
+        if (ret < 0 || static_cast<size_t>(ret) != segment_count) {
+            // Some SQEs never reached the kernel and still sit in the SQ,
+            // pointing at this call's buffers. Retire the ring so nothing
+            // submits them later; reap what DID go in (the kernel may be
+            // writing from those buffers), then report failure.
             dr.errors.fetch_add(1, std::memory_order_relaxed);
-            // Requests in this segment will never get CQEs; skip them.
-            // Their on_complete callbacks will not be fired.
-            continue;
+            dr.failed = true;
+            if (ret > 0) total_submitted += static_cast<size_t>(ret);
+            break;
         }
 
         dr.submits.fetch_add(static_cast<uint64_t>(segment_count),
@@ -377,18 +386,23 @@ int StorageBridge::submit_disk_batch(int                        disk_idx_in,
         int ret = ::io_uring_wait_cqe(dr.ring, &cqe);
         if (ret < 0) {
             dr.errors.fetch_add(1, std::memory_order_relaxed);
-            break; // ring error — bail out, remaining CQEs are lost
+            dr.failed = true; // unreaped CQEs would be misattributed later
+            break;
         }
 
         uint64_t idx = cqe->user_data;
         int32_t  res = cqe->res;
         ::io_uring_cqe_seen(dr.ring, cqe);
 
-        if (res > 0) {
+        // Success means the WHOLE buffer was written. A short write is
+        // positive but incomplete, and used to count as success — the batch
+        // was then acknowledged with a partially written extent.
+        if (idx < count && res >= 0 && static_cast<uint32_t>(res) == reqs[idx]->len) {
             ++total_ok;
             dr.completions.fetch_add(1, std::memory_order_relaxed);
         } else {
             dr.errors.fetch_add(1, std::memory_order_relaxed);
+            if (res > 0) res = -EIO; // report the short write as an error
         }
 
         // Fire the completion callback synchronously on the caller's thread.

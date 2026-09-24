@@ -182,11 +182,21 @@ reaches the WAL, so replay never builds an index entry for it. The bytes are
 unreferenced garbage that the next GC pass reclaims, and the client never got
 an OK. Safe.
 
-**What the WAL record must carry.** A 10-field pipe-delimited line:
+**What the WAL record must carry.** Records are binary (`storage/wal_format.go`):
+a 48-byte header — magic `0xB1`, flags (tombstone / packed / inline value),
+key length, `valueLen`, `diskLen`, plaintext CRC32C, `xflags`, timestamp,
+version, `vlogOffset` — then the key, the value if inline, and a CRC32C over
+the whole record. The legacy text form is still read (and written under
+`--wal-format=text`, for rollback only):
 
 ```
 timestamp|tombstone|key|valueLen|crc32hex|version|vlogOffset|packed|diskLen|xflags
 ```
+
+The text form was replaced because keys are arbitrary bytes: one key
+containing `|` or `\n` made its record unparseable, and replay stops at the
+first unparseable record, so every acknowledged write after it was lost on a
+crash restart. Its header was also never checksummed.
 
 Fields 9 and 10 are the ones that were missing before v1.1.0. `valueLen` is
 the **plaintext** length; `diskLen` is what actually sits on disk after
@@ -289,6 +299,7 @@ The Go layer is fully functional on its own. C++ is an optional Linux accelerato
 
 | Component | Source | Reachable from Go? |
 |-----------|--------|--------------------|
+| **Index Vault (off-heap shard tables)** | `storage/native_index.cpp` | **Yes — default on every cgo build, including macOS** |
 | Vectorized batch put | `batch_engine.cpp` | Yes — cgo shim in `storage/` |
 | SQPOLL SSTable reader | `uring_reader.cpp` | Yes — cgo shim |
 | NUMA thread pinning | `numa_topology.cpp` | Yes — cgo shim |
@@ -301,8 +312,8 @@ The Go layer is fully functional on its own. C++ is an optional Linux accelerato
 
 Two consequences worth internalising:
 
-- **The published Docker image is `CGO_ENABLED=0`**, and so is every CI job. Neither contains any C++. `scripts/build.sh` flips `CGO_ENABLED=1` only when it builds the CMake lib on Linux.
-- **CI job `node-6-cpp` compiles the C++** — the CMake target, the cgo shims, and `scripts/build.sh` end to end. Every other job is `CGO_ENABLED=0`.
+- **The Docker image is `CGO_ENABLED=1`** (native index + io_uring bridge). Kubernetes' RuntimeDefault seccomp profile blocks `io_uring_setup`, in which case the bridge does not start and VLog batches use pwrite; the native index needs no privileges. `--build-arg CGO_ENABLED=0` builds the old pure-Go static image.
+- **CI job `node-6-cpp` compiles the C++** — the CMake target, the cgo shims, and `scripts/build.sh` end to end — and runs the storage suite with the C++ engine on. `node-5-race` runs the native index under `-race`. Every other job is `CGO_ENABLED=0`.
 
 ---
 

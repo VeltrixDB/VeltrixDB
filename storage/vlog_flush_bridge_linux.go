@@ -29,18 +29,10 @@ func vlogFlushViaBridge(b *VLogBatcher, fd int) bool {
 		return false
 	}
 
-	// Build the stagedRecord slice the bridge expects — one entry per packed
-	// block (or per oversized-record block group). Each entry carries the
-	// 4 KB-aligned offset and the full block-buffer length, so the bridge
-	// issues N pwrites where N == len(b.blocks), not len(records-staged).
-	staged := make([]stagedRecord, len(b.blocks))
-	for i, blk := range b.blocks {
-		staged[i] = stagedRecord{
-			offset:    blk.offset,
-			alignedSz: len(blk.buf),
-			buf:       blk.buf,
-		}
-	}
+	// The batch stages into one contiguous 4 KB-aligned extent, so this is a
+	// single (offset, len, buf) tuple covering every record in the batch —
+	// one SQE instead of one per packed block.
+	staged := b.staged()
 
 	if br.submitVLogBatch(fd, b.vl.diskIdx, staged) != len(staged) {
 		return false

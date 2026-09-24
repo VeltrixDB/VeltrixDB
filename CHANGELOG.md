@@ -9,6 +9,38 @@ Types: `Added`, `Changed`, `Fixed`, `Performance`, `Breaking`
 
 ## [Unreleased]
 
+### Fixed
+
+- **Crash replay no longer drops writes after a key containing `|` or a
+  newline.** The text WAL split records on those bytes; one such key ended
+  replay there and every later acknowledged write was lost on the next crash
+  restart. WAL records are now binary and checksummed end to end. Replay still
+  reads existing text WALs. Rolling back to an earlier build needs one clean
+  restart with `--wal-format=text` first.
+- **PITR archives compressed and encrypted values.** The archiver read them with
+  the plaintext length, failed the CRC, and counted them as "skipped": they were
+  missing from the archive.
+- **io_uring bridge (cgo builds):** concurrent batch flushes to one disk no
+  longer share a ring without a lock. Before, one could reap another's
+  completions. A short write is no longer counted as success.
+- `size()` / `index_size_keys` no longer undercount keys created by SETNX, INCR
+  or CAS.
+
+### Performance
+
+- **Off-heap native index on cgo builds.** With 5M keys, full GC takes
+  0.27 ms (21 ms before) and settled RSS is 142 B/key (168 before). Each
+  cache-miss lookup costs ~19 ns more. Opt out with `VELTRIXDB_INDEX=map`.
+  Needs `vm.max_map_count` ≥ 262144 (`scripts/sysctl.conf`).
+- Binary WAL: encoding is 4x faster per record and replay is 2.5x faster.
+
+### Changed
+
+- The Docker image is now built with `CGO_ENABLED=1`. Build with
+  `--build-arg CGO_ENABLED=0` for the old static image. cgo builds use
+  `-march=x86-64-v2` instead of `-march=native`.
+
+
 ### Performance
 
 - **Batch write latency cut ~2x: the WAL flusher now issues one `write(2)` per

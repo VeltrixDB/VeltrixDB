@@ -198,13 +198,14 @@ func (se *StorageEngine) RepairTransformMetadata(dryRun bool) (*TransformRepairR
 				// Snapshot the shard's keys under a read lock; do the VLog I/O
 				// outside it so a slow disk never blocks the whole shard.
 				shard.mu.RLock()
-				keys := make([]string, 0, len(shard.entries))
-				for k, e := range shard.entries {
+				keys := make([]string, 0, shard.entries.len())
+				shard.entries.rangeAll(func(k string, e *IndexEntry) bool {
 					if e.IsTombstone() || e.DiskOffset == 0 || e.Flags&FlagTiered != 0 {
-						continue
+						return true
 					}
 					keys = append(keys, k)
-				}
+					return true
+				})
 				shard.mu.RUnlock()
 
 				for _, key := range keys {
@@ -318,15 +319,19 @@ func (si *shardedIndex) repairTransformMetadata(
 	shard.mu.Lock()
 	defer shard.mu.Unlock()
 
-	entry, ok := shard.entries[key]
-	if !ok || entry.IsTombstone() || entry.DiskOffset != expectOffset {
-		return false
-	}
-	entry.ValueSize = valueSize
-	entry.UncompressedSize = uncompressedSize
-	entry.Flags &^= FlagCompressed | FlagEncrypted
-	entry.Flags |= xflags
-	return true
+	applied := false
+	shard.entries.update(key, fnv64a(key), func(entry *IndexEntry) bool {
+		if entry.IsTombstone() || entry.DiskOffset != expectOffset {
+			return false
+		}
+		entry.ValueSize = valueSize
+		entry.UncompressedSize = uncompressedSize
+		entry.Flags &^= FlagCompressed | FlagEncrypted
+		entry.Flags |= xflags
+		applied = true
+		return true
+	})
+	return applied
 }
 
 // ── Startup health check ─────────────────────────────────────────────────────
@@ -365,15 +370,16 @@ func (se *StorageEngine) CheckTransformMetadataHealth() (checked, damaged int) {
 
 		shard.mu.RLock()
 		var keys []string
-		for k, e := range shard.entries {
+		shard.entries.rangeAll(func(k string, e *IndexEntry) bool {
 			if e.IsTombstone() || e.DiskOffset == 0 || e.Flags&FlagTiered != 0 {
-				continue
+				return true
 			}
 			keys = append(keys, k)
 			if len(keys) >= 8 { // a few per shard, spread across the keyspace
-				break
+				return false
 			}
-		}
+			return true
+		})
 		shard.mu.RUnlock()
 
 		for _, key := range keys {

@@ -351,7 +351,7 @@ func (se *StorageEngine) scanLive(key string) ([]byte, bool) {
 	nowUs := time.Now().UnixMicro()
 	shard, _ := se.index.shardFor(key)
 	shard.mu.RLock()
-	entry, exists := shard.entries[key]
+	entry, exists := shard.entries.get(key, fnv64a(key))
 	live := exists && !entry.IsTombstone()
 	expired := live && entry.IsExpired(nowUs)
 	shard.mu.RUnlock()

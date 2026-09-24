@@ -52,6 +52,8 @@ type VeltrixCollector struct {
 
 	// ── Index ─────────────────────────────────────────────────────────────────
 	indexSize *prometheus.Desc
+	// nativeIndexBytes is C memory the Go runtime's own stats never include.
+	nativeIndexBytes *prometheus.Desc
 
 	// ── Cluster: node management + resharding ─────────────────────────────────
 	nodeAdditions       *prometheus.Desc
@@ -253,6 +255,8 @@ func NewVeltrixCollector(
 
 		// index
 		indexSize: desc("storage", "index_size_keys", "Number of live keys in the Index Vault."),
+		nativeIndexBytes: desc("storage", "native_index_bytes",
+			"Bytes held off the Go heap by the native Index Vault (0 when the map index is in use). Not included in go_memstats_*."),
 
 		// cluster node management + resharding
 		nodeAdditions:       desc("cluster", "node_additions_total", "Nodes added to the cluster."),
@@ -365,6 +369,7 @@ func (c *VeltrixCollector) Describe(ch chan<- *prometheus.Desc) {
 		c.evictionsTotal, c.evictionLatencyNs,
 		// index
 		c.indexSize,
+		c.nativeIndexBytes,
 		// vlog
 		c.vlogWrites, c.vlogReads, c.vlogGCRuns, c.vlogGCBytes,
 		c.vlogGarbageRatio, c.vlogFileBytes,
@@ -462,6 +467,7 @@ func (c *VeltrixCollector) Collect(ch chan<- prometheus.Metric) {
 
 	// ── Index ─────────────────────────────────────────────────────────────────
 	gauge(c.indexSize, float64(c.engine.GetIndexSize()))
+	gauge(c.nativeIndexBytes, float64(storage.NativeIndexBytes()))
 
 	// ── VLog ─────────────────────────────────────────────────────────────────
 	counter(c.vlogWrites, m.VLogWrites.Load())

@@ -148,6 +148,10 @@ func main() {
 	vlogWindowMs := flag.Int("vlog-flush-window-ms", 15,
 		"VLog fdatasync group-commit window in milliseconds.\n"+
 			"\tMust equal --wal-flush-window-ms. Concurrent WAL+VLog race; P99 = max(both).")
+	walFormat := flag.String("wal-format", "binary",
+		"Encoding for new WAL records: binary (default) or text.\n"+
+			"\tReplay reads both. text exists only to roll back to a pre-binary build:\n"+
+			"\trun once with it, stop cleanly (the checkpoint rewrites wal.log), then downgrade.")
 	walMaxBatch := flag.Int("wal-max-batch", 4096,
 		"Maximum WAL entries per group-commit flush before the timer fires early.\n"+
 			"\tRaise if write rate exceeds window×max_batch (e.g. 100K/s × 0.005s = 500 → 4096 is headroom).")
@@ -347,6 +351,7 @@ func main() {
 	cfg.WALFlushWindowMs = *walWindowMs
 	cfg.VLogFlushWindowMs = *vlogWindowMs
 	cfg.WALMaxBatchEntries = *walMaxBatch
+	cfg.WALFormat = *walFormat
 	cfg.DefragThreshold = *gcThreshold
 	cfg.EncryptionEnabled = *encryptAtRest
 	cfg.EncryptionKeyPath = *encryptKeyPath

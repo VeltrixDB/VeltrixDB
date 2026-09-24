@@ -123,7 +123,7 @@ func (se *StorageEngine) SetIfNotExists(key string, value []byte, ttl int32) (Se
 	shard.mu.Lock()
 	defer shard.mu.Unlock()
 
-	if entry, ok := shard.entries[key]; ok && !entry.IsTombstone() {
+	if entry, ok := shard.entries.get(key, fnv64a(key)); ok && !entry.IsTombstone() {
 		nowUs := time.Now().UnixMicro()
 		if !entry.IsExpired(nowUs) {
 			return SetNXExists, nil
@@ -143,7 +143,7 @@ func (se *StorageEngine) SetIfNotExists(key string, value []byte, ttl int32) (Se
 //
 // Returns (nil, false) when the key is absent, tombstoned, or expired.
 func (se *StorageEngine) readUnderShardLockKVSep(shard *indexShard, key string) ([]byte, bool) {
-	entry, ok := shard.entries[key]
+	entry, ok := shard.entries.get(key, fnv64a(key))
 	if !ok || entry.IsTombstone() {
 		return nil, false
 	}
@@ -199,7 +199,7 @@ func (se *StorageEngine) persistAtomicKVSep(shard *indexShard, shardID uint16, k
 	walEntry.ReplicationID = 0
 	walEntry.Packed = false
 
-	if old, ok := shard.entries[key]; ok && !old.IsTombstone() && old.DiskOffset > 0 {
+	if old, ok := shard.entries.get(key, fnv64a(key)); ok && !old.IsTombstone() && old.DiskOffset > 0 {
 		se.vlogs[int(old.SegmentID)%len(se.vlogs)].MarkDead(old.ValueSize, old.IsPacked())
 	}
 
@@ -241,7 +241,12 @@ func (se *StorageEngine) persistAtomicKVSep(shard *indexShard, shardID uint16, k
 		entry.Flags |= FlagHasTTL
 		entry.TTLExpiryUs = nowUs + int64(ttl)*1_000_000
 	}
-	shard.entries[key] = entry
+	// swap, not a blind store: a new or resurrected key must bump keyCount
+	// exactly as shardedIndex.put does, or size() drifts low on every
+	// SETNX/INCR/CAS that creates a key.
+	if old, hadOld := shard.entries.swap(key, fnv64a(key), entry); !hadOld || old.IsTombstone() {
+		se.index.keyCount.Add(1)
+	}
 	if se.index.ordered != nil {
 		// Caller holds shard.mu — matches the indexShard.mu → oiNode.mu lock
 		// order documented in ordered_index.go.

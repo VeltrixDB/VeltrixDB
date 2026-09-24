@@ -262,11 +262,12 @@ func TestSecondaryIndex_PrefixEncoding(t *testing.T) {
 	for i := range se.index.shards {
 		shard := &se.index.shards[i]
 		shard.mu.RLock()
-		for k := range shard.entries {
+		shard.entries.rangeAll(func(k string, _ *IndexEntry) bool {
 			if strings.HasPrefix(k, expectedPrefix) {
 				found = true
 			}
-		}
+			return true
+		})
 		shard.mu.RUnlock()
 	}
 	if !found {

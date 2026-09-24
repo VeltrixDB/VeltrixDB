@@ -125,7 +125,15 @@ Concurrent `pwrite64` calls to non-overlapping ranges are safe by POSIX. No mute
 
 Each disk has one `wal.log` file. The WAL provides crash durability: on unclean shutdown, `replayWAL()` reads it and rebuilds the index. On clean shutdown, `wal.truncate()` zeroes the file so next startup skips replay.
 
-### WAL Record Format (10-field pipe-delimited text)
+### WAL Record Format
+
+New records are binary — see `storage/wal_format.go` for the byte layout: a
+48-byte little-endian header, the key, the value when inline, and a CRC32C
+over the whole record. Replay also reads the legacy text records below, in any
+mix with binary ones; `--wal-format=text` writes them, for rolling back to a
+pre-binary build only. The field meanings are the same in both.
+
+Legacy text record:
 
 ```
 timestamp|isTombstone|key|valueLen|crc32hex|version|vlogOffset|packed|diskLen|xflags
@@ -179,7 +187,7 @@ In `Put()`, both WAL and VLog `beginAppend()` are called concurrently. The calle
 
 ```
 /data-dir-N/
-├── wal.log              — Write-Ahead Log (group-commit, 10-field text)
+├── wal.log              — Write-Ahead Log (group-commit, binary records)
 ├── vlog_active.dat      — Value Log (24-byte header + sector-aligned values)
 ├── seg_XXXXXXXX.dat     — Segment files (O_DIRECT sequential, 64-byte header)
 ├── vlog_punch_watermark — GC punch offset watermark for defragmentation
@@ -273,7 +281,7 @@ All 8 NVMe disks receive writes in parallel — no single disk is a serializatio
 On unclean shutdown (crash, OOM kill, SIGKILL):
 
 1. **`replayWAL()`** opens `wal.log` on each disk.
-2. For each record: parse the 10-field format, check CRC32C.
+2. For each record (binary or legacy text): decode it and check its CRC32C.
 3. **`applyWALReplay()`** rebuilds the in-memory `shardedIndex`.
 4. For KV-sep records (`vlogOffset > 0`): the VLog already has the value bytes; the WAL entry re-establishes the index pointer without re-reading the value.
 5. Legacy 6-, 7- and 8-field entries are still parsed for backward compatibility. An 8-field record replays with no transform flags, which is correct — it was written before the engine could record them.

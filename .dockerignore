@@ -1,7 +1,9 @@
 .git
 .github
 *.md
-cpp/
 k8s/
 veltrixdb-data/
 *.log
+# cpp/ is NOT ignored: the cgo shims in storage/ #include ../cpp/src and
+# ../cpp/include, so a CGO_ENABLED=1 image build needs it in the context.
+cpp/build/

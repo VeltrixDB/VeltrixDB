@@ -562,6 +562,14 @@ type StorageConfig struct {
 	VLogFlushWindowMs  int // default 10 ms; 0 = immediate (must match WALFlushWindowMs)
 	WALMaxBatchEntries int // default 1024
 
+	// WALFormat is the encoding for NEW WAL records and clean-shutdown
+	// checkpoints: "binary" (default, also "") or "text". Replay reads both,
+	// in any mix, regardless of this setting. "text" exists only to roll back
+	// to a pre-binary build: run once with it, shut down cleanly (the
+	// checkpoint rewrites wal.log as text), then downgrade. Text records
+	// cannot represent keys containing '|' or '\n' — see wal_format.go.
+	WALFormat string
+
 	// Write stall / back-pressure
 	//
 	// DirtyFlushThreshold: dirty unique keys before a compaction is triggered.

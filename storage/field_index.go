@@ -262,11 +262,12 @@ func (se *StorageEngine) scanKeysWithPrefix(prefix string) []string {
 	for i := range se.index.shards {
 		shard := &se.index.shards[i]
 		shard.mu.RLock()
-		for k, entry := range shard.entries {
+		shard.entries.rangeAll(func(k string, entry *IndexEntry) bool {
 			if !entry.IsTombstone() && !entry.IsExpired(nowUs) && strings.HasPrefix(k, prefix) {
 				keys = append(keys, k)
 			}
-		}
+			return true
+		})
 		shard.mu.RUnlock()
 	}
 	return keys

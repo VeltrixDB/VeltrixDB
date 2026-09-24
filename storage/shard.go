@@ -26,14 +26,14 @@ const numShards = 8192
 // the filter from the live index in vacuumBloomFilters().
 type indexShard struct {
 	mu          sync.RWMutex
-	entries     map[string]*IndexEntry // key → metadata (64-byte cache-line entry)
-	dirtyValues map[string][]byte      // key → value bytes, pre-segment-flush
-	bloom       *shardBloom            // nil when blooms are disabled in config
+	entries     entryTable        // key → 64-byte IndexEntry; see index_table.go
+	dirtyValues map[string][]byte // key → value bytes, pre-segment-flush
+	bloom       *shardBloom       // nil when blooms are disabled in config
 }
 
 func newIndexShard() indexShard {
 	return indexShard{
-		entries:     make(map[string]*IndexEntry),
+		entries:     newEntryTable(),
 		dirtyValues: make(map[string][]byte),
 	}
 }
@@ -61,6 +61,19 @@ func newShardedIndex() *shardedIndex {
 		si.shards[i] = newIndexShard()
 	}
 	return si
+}
+
+// close releases every shard's entry table. Only matters for the native
+// (off-heap) table, whose memory the Go GC cannot reclaim. Taking each shard
+// lock waits out any in-flight scan; a background goroutine that touches the
+// index after this sees an empty table rather than freed memory.
+func (si *shardedIndex) close() {
+	for i := range si.shards {
+		shard := &si.shards[i]
+		shard.mu.Lock()
+		shard.entries.free()
+		shard.mu.Unlock()
+	}
 }
 
 // installBlooms allocates one shardBloom per shard with the given bit budget
@@ -109,7 +122,7 @@ func (si *shardedIndex) getHashed(key string, h uint64) (IndexEntry, []byte, boo
 	shard.mu.RLock()
 	defer shard.mu.RUnlock()
 
-	entry, ok := shard.entries[key]
+	entry, ok := shard.entries.get(key, h)
 	if !ok {
 		return IndexEntry{}, nil, false
 	}
@@ -128,18 +141,18 @@ func (si *shardedIndex) getHashed(key string, h uint64) (IndexEntry, []byte, boo
 	// the single largest source of allocated objects on the read path (36% in
 	// an alloc profile). A value return leaves the copy in the caller's frame.
 	val := shard.dirtyValues[key]
-	return *entry, val, true
+	return entry, val, true
 }
 
 // put writes or overwrites the IndexEntry and its dirty value for key.
 func (si *shardedIndex) put(key string, entry *IndexEntry, value []byte) {
-	shard, _ := si.shardFor(key)
+	h := fnv64a(key)
+	shard := &si.shards[uint16(h&(numShards-1))]
 	if b := shard.bloom; b != nil {
-		b.Add(fnv64a(key))
+		b.Add(h)
 	}
 	shard.mu.Lock()
-	old, hadOld := shard.entries[key]
-	shard.entries[key] = entry
+	old, hadOld := shard.entries.swap(key, h, entry)
 	if si.ordered != nil {
 		si.ordered.Insert(key)
 	}
@@ -160,17 +173,18 @@ func (si *shardedIndex) put(key string, entry *IndexEntry, value []byte) {
 // Used exclusively by background WAL replay so concurrent Puts (which call
 // the plain put()) always win over older replayed data.
 func (si *shardedIndex) replayPut(key string, entry *IndexEntry, value []byte) {
-	shard, _ := si.shardFor(key)
+	h := fnv64a(key)
+	shard := &si.shards[uint16(h&(numShards-1))]
 	if b := shard.bloom; b != nil {
-		b.Add(fnv64a(key))
+		b.Add(h)
 	}
 	shard.mu.Lock()
-	existing, hadExisting := shard.entries[key]
+	existing, hadExisting := shard.entries.get(key, h)
 	if hadExisting && existing.WriteTimestampUs > entry.WriteTimestampUs {
 		shard.mu.Unlock()
 		return // live write during replay takes precedence — don't clobber it
 	}
-	shard.entries[key] = entry
+	shard.entries.swap(key, h, entry)
 	if si.ordered != nil {
 		si.ordered.Insert(key)
 	}
@@ -190,20 +204,27 @@ func (si *shardedIndex) replayPut(key string, entry *IndexEntry, value []byte) {
 // replayMarkTombstone is the version-aware tombstone setter used by background
 // WAL replay.  Skips if a live write arrived after the tombstone timestamp.
 func (si *shardedIndex) replayMarkTombstone(key string, nowUs int64) {
-	shard, _ := si.shardFor(key)
+	h := fnv64a(key)
+	shard := &si.shards[uint16(h&(numShards-1))]
 	shard.mu.Lock()
 	defer shard.mu.Unlock()
-	entry, ok := shard.entries[key]
-	if !ok {
+	superseded := false
+	wasLive := false
+	ok := shard.entries.update(key, h, func(entry *IndexEntry) bool {
+		if entry.WriteTimestampUs > nowUs {
+			superseded = true // live write supersedes this tombstone
+			return false
+		}
+		wasLive = !entry.IsTombstone()
+		entry.MarkTombstone(nowUs)
+		return true
+	})
+	if !ok || superseded {
 		return
 	}
-	if entry.WriteTimestampUs > nowUs {
-		return // live write supersedes this tombstone
-	}
-	if !entry.IsTombstone() {
+	if wasLive {
 		si.keyCount.Add(-1)
 	}
-	entry.MarkTombstone(nowUs)
 	if si.ordered != nil {
 		si.ordered.Remove(key)
 	}
@@ -217,18 +238,22 @@ func (si *shardedIndex) replayMarkTombstone(key string, nowUs int64) {
 // markTombstone atomically sets the tombstone flag and clears the dirty value.
 // Returns false if the key does not exist.
 func (si *shardedIndex) markTombstone(key string, nowUs int64) bool {
-	shard, _ := si.shardFor(key)
+	h := fnv64a(key)
+	shard := &si.shards[uint16(h&(numShards-1))]
 	shard.mu.Lock()
 	defer shard.mu.Unlock()
 
-	entry, ok := shard.entries[key]
-	if !ok {
+	wasLive := false
+	if !shard.entries.update(key, h, func(entry *IndexEntry) bool {
+		wasLive = !entry.IsTombstone()
+		entry.MarkTombstone(nowUs)
+		return true
+	}) {
 		return false
 	}
-	if !entry.IsTombstone() {
+	if wasLive {
 		si.keyCount.Add(-1)
 	}
-	entry.MarkTombstone(nowUs)
 	if si.ordered != nil {
 		si.ordered.Remove(key)
 	}
@@ -245,15 +270,20 @@ func (si *shardedIndex) markTombstone(key string, nowUs int64) bool {
 // the value from the cold tier; defrag.go's GC will skip relocating the entry
 // back to the hot VLog.
 func (si *shardedIndex) markTiered(key string) bool {
-	shard, _ := si.shardFor(key)
+	h := fnv64a(key)
+	shard := &si.shards[uint16(h&(numShards-1))]
 	shard.mu.Lock()
 	defer shard.mu.Unlock()
-	entry, ok := shard.entries[key]
-	if !ok || entry.IsTombstone() {
-		return false
-	}
-	entry.Flags |= FlagTiered
-	return true
+	tiered := false
+	shard.entries.update(key, h, func(entry *IndexEntry) bool {
+		if entry.IsTombstone() {
+			return false
+		}
+		entry.Flags |= FlagTiered
+		tiered = true
+		return true
+	})
+	return tiered
 }
 
 // removeTombstone deletes an entry from the index after its GC grace period
@@ -268,7 +298,7 @@ func (si *shardedIndex) removeTombstone(key string) {
 	if hadDirty {
 		si.dirtyCount.Add(-1)
 	}
-	delete(shard.entries, key)
+	shard.entries.del(key, fnv64a(key))
 	delete(shard.dirtyValues, key)
 	shard.mu.Unlock()
 }
@@ -296,11 +326,12 @@ func (si *shardedIndex) expiredTombstones(gracePeriodUs int64) []string {
 	for i := range si.shards {
 		shard := &si.shards[i]
 		shard.mu.RLock()
-		for key, entry := range shard.entries {
+		shard.entries.rangeAll(func(key string, entry *IndexEntry) bool {
 			if entry.IsTombstone() && entry.WriteTimestampUs < cutoff {
 				expired = append(expired, key)
 			}
-		}
+			return true
+		})
 		shard.mu.RUnlock()
 	}
 	return expired
@@ -315,11 +346,12 @@ func (si *shardedIndex) expiredTTL() []string {
 	for i := range si.shards {
 		shard := &si.shards[i]
 		shard.mu.RLock()
-		for key, entry := range shard.entries {
+		shard.entries.rangeAll(func(key string, entry *IndexEntry) bool {
 			if !entry.IsTombstone() && entry.IsExpired(nowUs) {
 				expired = append(expired, key)
 			}
-		}
+			return true
+		})
 		shard.mu.RUnlock()
 	}
 	return expired
@@ -358,7 +390,7 @@ func (si *shardedIndex) vlogCandidates(diskIdx, numDisks int, gcHorizon uint64) 
 	for i := diskIdx; i < numShards; i += numDisks {
 		shard := &si.shards[i]
 		shard.mu.RLock()
-		for key, entry := range shard.entries {
+		shard.entries.rangeAll(func(key string, entry *IndexEntry) bool {
 			if !entry.IsTombstone() && entry.DiskOffset > 0 && entry.DiskOffset < gcHorizon {
 				candidates = append(candidates, vlogGCEntry{
 					key:              key,
@@ -368,7 +400,8 @@ func (si *shardedIndex) vlogCandidates(diskIdx, numDisks int, gcHorizon uint64) 
 					packed:           entry.IsPacked(),
 				})
 			}
-		}
+			return true
+		})
 		shard.mu.RUnlock()
 	}
 	return candidates
@@ -396,9 +429,9 @@ func (si *shardedIndex) maxVLogEndOffset(diskIdx, numDisks int) uint64 {
 	for i := diskIdx; i < numShards; i += numDisks {
 		shard := &si.shards[i]
 		shard.mu.RLock()
-		for _, entry := range shard.entries {
+		shard.entries.rangeEntries(func(entry *IndexEntry) bool {
 			if entry.DiskOffset == 0 {
-				continue
+				return true
 			}
 			rawLen := uint64(vlogHeaderBytes) + uint64(entry.ValueSize)
 			var end uint64
@@ -417,7 +450,8 @@ func (si *shardedIndex) maxVLogEndOffset(diskIdx, numDisks int) uint64 {
 			if end > maxEnd {
 				maxEnd = end
 			}
-		}
+			return true
+		})
 		shard.mu.RUnlock()
 	}
 	return maxEnd
@@ -432,11 +466,12 @@ func (si *shardedIndex) minLiveVLogOffset(diskIdx, numDisks int) uint64 {
 	for i := diskIdx; i < numShards; i += numDisks {
 		shard := &si.shards[i]
 		shard.mu.RLock()
-		for _, entry := range shard.entries {
+		shard.entries.rangeEntries(func(entry *IndexEntry) bool {
 			if !entry.IsTombstone() && entry.DiskOffset > 0 && entry.DiskOffset < min {
 				min = entry.DiskOffset
 			}
-		}
+			return true
+		})
 		shard.mu.RUnlock()
 	}
 	return min
@@ -448,10 +483,11 @@ func (si *shardedIndex) minLiveVLogOffset(diskIdx, numDisks int) uint64 {
 // checks whether the new location is still within the compaction window so GC can
 // immediately retry from the fresh offset instead of deferring to the next pass.
 func (si *shardedIndex) getVLogEntryIfBelow(key string, gcHorizon uint64) (vlogGCEntry, bool) {
-	shard, _ := si.shardFor(key)
+	h := fnv64a(key)
+	shard := &si.shards[uint16(h&(numShards-1))]
 	shard.mu.RLock()
 	defer shard.mu.RUnlock()
-	entry, ok := shard.entries[key]
+	entry, ok := shard.entries.get(key, h)
 	if !ok || entry.IsTombstone() || entry.DiskOffset == 0 || entry.DiskOffset >= gcHorizon {
 		return vlogGCEntry{}, false
 	}
@@ -468,10 +504,11 @@ func (si *shardedIndex) getVLogEntryIfBelow(key string, gcHorizon uint64) (vlogG
 // before doing the expensive VLog write: if this returns false the candidate is
 // already stale and the write can be skipped entirely.
 func (si *shardedIndex) checkVLogOffset(key string, expectedOffset uint64) bool {
-	shard, _ := si.shardFor(key)
+	h := fnv64a(key)
+	shard := &si.shards[uint16(h&(numShards-1))]
 	shard.mu.RLock()
 	defer shard.mu.RUnlock()
-	entry, ok := shard.entries[key]
+	entry, ok := shard.entries.get(key, h)
 	return ok && !entry.IsTombstone() && entry.DiskOffset == expectedOffset
 }
 
@@ -484,20 +521,25 @@ func (si *shardedIndex) checkVLogOffset(key string, expectedOffset uint64) bool 
 // The old FlagPacked bit (whatever it was before) is fully overwritten —
 // after this call the entry's packed-ness reflects the relocation result.
 func (si *shardedIndex) updateVLogOffset(key string, oldOffset, newOffset uint64, newPacked bool) bool {
-	shard, _ := si.shardFor(key)
+	h := fnv64a(key)
+	shard := &si.shards[uint16(h&(numShards-1))]
 	shard.mu.Lock()
 	defer shard.mu.Unlock()
-	entry, ok := shard.entries[key]
-	if !ok || entry.IsTombstone() || entry.DiskOffset != oldOffset {
-		return false
-	}
-	entry.DiskOffset = newOffset
-	if newPacked {
-		entry.Flags |= FlagPacked
-	} else {
-		entry.Flags &^= FlagPacked
-	}
-	return true
+	moved := false
+	shard.entries.update(key, h, func(entry *IndexEntry) bool {
+		if entry.IsTombstone() || entry.DiskOffset != oldOffset {
+			return false
+		}
+		entry.DiskOffset = newOffset
+		if newPacked {
+			entry.Flags |= FlagPacked
+		} else {
+			entry.Flags &^= FlagPacked
+		}
+		moved = true
+		return true
+	})
+	return moved
 }
 
 // size returns the total number of live (non-tombstoned) entries across all shards.
@@ -527,12 +569,14 @@ func (si *shardedIndex) vacuumBloomFilters() {
 		}
 		shard.mu.RLock()
 		shard.bloom.Reset()
-		for key, entry := range shard.entries {
-			if entry.IsTombstone() {
-				continue
+		// KeyHash is fnv64a(key), set on every install path, so the rebuild
+		// needs no key bytes — rangeEntries skips materialising them.
+		shard.entries.rangeEntries(func(entry *IndexEntry) bool {
+			if !entry.IsTombstone() {
+				shard.bloom.Add(entry.KeyHash)
 			}
-			shard.bloom.Add(fnv64a(key))
-		}
+			return true
+		})
 		shard.mu.RUnlock()
 	}
 }
