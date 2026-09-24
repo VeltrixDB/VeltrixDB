@@ -23,14 +23,15 @@ func damageCleanShutdown(t *testing.T, se *StorageEngine, key string) {
 	t.Helper()
 	shard, _ := se.index.shardFor(key)
 	shard.mu.Lock()
-	e, ok := shard.entries[key]
+	ok := shard.entries.update(key, fnv64a(key), func(e *IndexEntry) bool {
+		e.UncompressedSize = e.ValueSize // lost: the real plaintext length
+		e.Flags &^= FlagCompressed | FlagEncrypted
+		return true
+	})
+	shard.mu.Unlock()
 	if !ok {
-		shard.mu.Unlock()
 		t.Fatalf("damageCleanShutdown: key %q not in index", key)
 	}
-	e.UncompressedSize = e.ValueSize // lost: the real plaintext length
-	e.Flags &^= FlagCompressed | FlagEncrypted
-	shard.mu.Unlock()
 	se.cache.Evict(key) // force the next Get down to the VLog
 }
 
@@ -43,15 +44,16 @@ func damageCrashRestart(t *testing.T, se *StorageEngine, key string, plaintextLe
 	t.Helper()
 	shard, _ := se.index.shardFor(key)
 	shard.mu.Lock()
-	e, ok := shard.entries[key]
+	ok := shard.entries.update(key, fnv64a(key), func(e *IndexEntry) bool {
+		e.ValueSize = uint32(plaintextLen)
+		e.UncompressedSize = uint32(plaintextLen)
+		e.Flags &^= FlagCompressed | FlagEncrypted
+		return true
+	})
+	shard.mu.Unlock()
 	if !ok {
-		shard.mu.Unlock()
 		t.Fatalf("damageCrashRestart: key %q not in index", key)
 	}
-	e.ValueSize = uint32(plaintextLen)
-	e.UncompressedSize = uint32(plaintextLen)
-	e.Flags &^= FlagCompressed | FlagEncrypted
-	shard.mu.Unlock()
 	se.cache.Evict(key)
 }
 
@@ -296,9 +298,12 @@ func TestRepair_LeavesUnresolvableEntriesUntouched(t *testing.T) {
 	// this, so the repair has no basis on which to act.
 	shard, _ := se.index.shardFor(key)
 	shard.mu.Lock()
-	before := *shard.entries[key]
-	shard.entries[key].CRC32C = 0xDEADBEEF
-	shard.entries[key].Flags &^= FlagCompressed | FlagEncrypted
+	before, _ := shard.entries.get(key, fnv64a(key))
+	shard.entries.update(key, fnv64a(key), func(e *IndexEntry) bool {
+		e.CRC32C = 0xDEADBEEF
+		e.Flags &^= FlagCompressed | FlagEncrypted
+		return true
+	})
 	shard.mu.Unlock()
 	se.cache.Evict(key)
 
@@ -317,7 +322,7 @@ func TestRepair_LeavesUnresolvableEntriesUntouched(t *testing.T) {
 	}
 
 	shard.mu.RLock()
-	after := *shard.entries[key]
+	after, _ := shard.entries.get(key, fnv64a(key))
 	shard.mu.RUnlock()
 	if after.ValueSize != before.ValueSize || after.Flags != (before.Flags&^(FlagCompressed|FlagEncrypted)) {
 		t.Errorf("unresolvable entry was mutated: before=%+v after=%+v", before, after)

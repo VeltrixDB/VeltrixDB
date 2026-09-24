@@ -49,15 +49,16 @@ func (se *StorageEngine) ChangesSince(sinceUs int64, limit int) ChangesSinceResu
 	for i := range se.index.shards {
 		shard := &se.index.shards[i]
 		shard.mu.RLock()
-		for k, entry := range shard.entries {
+		shard.entries.rangeAll(func(k string, entry *IndexEntry) bool {
 			if entry.WriteTimestampUs < sinceUs {
-				continue
+				return true
 			}
 			if !entry.IsTombstone() && entry.IsExpired(nowUs) {
-				continue
+				return true
 			}
 			matches = append(matches, change{key: k, ts: entry.WriteTimestampUs, tombstone: entry.IsTombstone()})
-		}
+			return true
+		})
 		shard.mu.RUnlock()
 	}
 

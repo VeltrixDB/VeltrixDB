@@ -195,6 +195,8 @@ func NewStorageEngine(cfg *StorageConfig) (*StorageEngine, error) {
 	// index shards. Profiling put 21.7% of CPU in that one lock.
 	cache := NewShardedLIRSCache(cfg.CacheMaxSizeMB, lirRatio)
 	index := newShardedIndex()
+	log.Printf("[index] implementation=%s (native = off-heap C++ table, invisible to the Go GC; set %s=map to opt out)",
+		IndexImpl(), IndexImplEnv)
 	if cfg.DisableOrderedIndex {
 		// Drop the ordered key view: the shard-lock hooks become no-ops and
 		// RangeScan / ScanCursor return ErrOrderedIndexDisabled.
@@ -1100,11 +1102,12 @@ func (se *StorageEngine) DropNamespace(ns string) (int, error) {
 	for i := range se.index.shards {
 		shard := &se.index.shards[i]
 		shard.mu.RLock()
-		for k, entry := range shard.entries {
+		shard.entries.rangeAll(func(k string, entry *IndexEntry) bool {
 			if !entry.IsTombstone() && !entry.IsExpired(nowUs) && len(k) > len(prefix) && k[:len(prefix)] == prefix {
 				keys = append(keys, k)
 			}
-		}
+			return true
+		})
 		shard.mu.RUnlock()
 	}
 	for _, k := range keys {
@@ -1133,12 +1136,12 @@ func (se *StorageEngine) ScanNamespace(ns, prefix string, limit int) ([]NSEntry,
 	for i := range se.index.shards {
 		shard := &se.index.shards[i]
 		shard.mu.RLock()
-		for k, entry := range shard.entries {
+		shard.entries.rangeAll(func(k string, entry *IndexEntry) bool {
 			if entry.IsTombstone() || entry.IsExpired(nowUs) {
-				continue
+				return true
 			}
 			if len(k) < len(internalPrefix) || k[:len(internalPrefix)] != internalPrefix {
-				continue
+				return true
 			}
 			candidates = append(candidates, candidate{
 				internalKey: k,
@@ -1147,9 +1150,10 @@ func (se *StorageEngine) ScanNamespace(ns, prefix string, limit int) ([]NSEntry,
 				valueSize:   entry.ValueSize,
 			})
 			if limit > 0 && len(candidates) >= limit {
-				break
+				return false
 			}
-		}
+			return true
+		})
 		shard.mu.RUnlock()
 		if limit > 0 && len(candidates) >= limit {
 			break
@@ -1179,16 +1183,17 @@ func (se *StorageEngine) ListNamespaces() []NSInfo {
 	for i := range se.index.shards {
 		shard := &se.index.shards[i]
 		shard.mu.RLock()
-		for k, entry := range shard.entries {
+		shard.entries.rangeAll(func(k string, entry *IndexEntry) bool {
 			if entry.IsTombstone() || entry.IsExpired(nowUs) {
-				continue
+				return true
 			}
 			idx := strings.Index(k, nsSep)
 			if idx <= 0 {
-				continue // not a namespaced key
+				return true // not a namespaced key
 			}
 			counts[k[:idx]]++
-		}
+			return true
+		})
 		shard.mu.RUnlock()
 	}
 	result := make([]NSInfo, 0, len(counts))
@@ -1244,11 +1249,12 @@ func (se *StorageEngine) HGetAll(key string) ([]HashField, error) {
 	for i := range se.index.shards {
 		shard := &se.index.shards[i]
 		shard.mu.RLock()
-		for k, entry := range shard.entries {
+		shard.entries.rangeAll(func(k string, entry *IndexEntry) bool {
 			if !entry.IsTombstone() && !entry.IsExpired(nowUs) && strings.HasPrefix(k, prefix) {
 				internalKeys = append(internalKeys, k)
 			}
-		}
+			return true
+		})
 		shard.mu.RUnlock()
 	}
 	results := make([]HashField, 0, len(internalKeys))
@@ -1270,11 +1276,12 @@ func (se *StorageEngine) HKeys(key string) []string {
 	for i := range se.index.shards {
 		shard := &se.index.shards[i]
 		shard.mu.RLock()
-		for k, entry := range shard.entries {
+		shard.entries.rangeAll(func(k string, entry *IndexEntry) bool {
 			if !entry.IsTombstone() && !entry.IsExpired(nowUs) && strings.HasPrefix(k, prefix) {
 				fields = append(fields, k[len(prefix):])
 			}
-		}
+			return true
+		})
 		shard.mu.RUnlock()
 	}
 	return fields
@@ -1288,11 +1295,12 @@ func (se *StorageEngine) HLen(key string) int {
 	for i := range se.index.shards {
 		shard := &se.index.shards[i]
 		shard.mu.RLock()
-		for k, entry := range shard.entries {
+		shard.entries.rangeAll(func(k string, entry *IndexEntry) bool {
 			if !entry.IsTombstone() && !entry.IsExpired(nowUs) && strings.HasPrefix(k, prefix) {
 				count++
 			}
-		}
+			return true
+		})
 		shard.mu.RUnlock()
 	}
 	return count
@@ -1391,11 +1399,12 @@ func (se *StorageEngine) ScanKeys() []string {
 	for i := range se.index.shards {
 		shard := &se.index.shards[i]
 		shard.mu.RLock()
-		for k, entry := range shard.entries {
+		shard.entries.rangeAll(func(k string, entry *IndexEntry) bool {
 			if !entry.IsTombstone() && !entry.IsExpired(nowUs) {
 				keys = append(keys, k)
 			}
-		}
+			return true
+		})
 		shard.mu.RUnlock()
 	}
 	return keys
@@ -1569,6 +1578,9 @@ func (se *StorageEngine) Close() error {
 			firstErr = err
 		}
 	}
+	// Last: the checkpoint above is the final reader. The native index lives
+	// off the Go heap, so nothing else would ever return its memory.
+	se.index.close()
 	return firstErr
 }
 
@@ -1624,8 +1636,8 @@ func (se *StorageEngine) compactDiskShards(diskIdx int, _ CompactionRequest) {
 		}
 		snap := make([]pending, 0, len(shard.dirtyValues))
 		for key, val := range shard.dirtyValues {
-			entry := shard.entries[key]
-			if entry == nil || entry.IsTombstone() {
+			entry, ok := shard.entries.get(key, fnv64a(key))
+			if !ok || entry.IsTombstone() {
 				delete(shard.dirtyValues, key)
 				se.index.dirtyCount.Add(-1)
 				continue
@@ -1643,12 +1655,16 @@ func (se *StorageEngine) compactDiskShards(diskIdx int, _ CompactionRequest) {
 
 			// 3. Update DiskOffset only if the entry hasn't been overwritten.
 			shard.mu.Lock()
-			if live := shard.entries[p.key]; live != nil && !live.IsTombstone() {
+			shard.entries.update(p.key, fnv64a(p.key), func(live *IndexEntry) bool {
+				if live.IsTombstone() {
+					return false
+				}
 				live.DiskOffset = uint64(diskOffset)
 				live.SegmentID = uint32(diskIdx)
 				delete(shard.dirtyValues, p.key)
 				se.index.dirtyCount.Add(-1)
-			}
+				return true
+			})
 			shard.mu.Unlock()
 		}
 	}

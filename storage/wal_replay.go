@@ -357,9 +357,9 @@ func writeWALCheckpoint(walPath string, index *shardedIndex, diskIdx, numDisks i
 	for i := diskIdx; i < numShards && writeErr == nil; i += numDisks {
 		shard := &index.shards[i]
 		shard.mu.RLock()
-		for key, entry := range shard.entries {
+		shard.entries.rangeAll(func(key string, entry *IndexEntry) bool {
 			if entry.IsTombstone() {
-				continue // deleted keys are not checkpointed
+				return true // deleted keys are not checkpointed
 			}
 
 			ts := entry.WriteTimestampUs * 1000 // μs → ns (WAL stores nanoseconds)
@@ -421,7 +421,7 @@ func writeWALCheckpoint(walPath string, index *shardedIndex, diskIdx, numDisks i
 				// before Close was called) we have no bytes to write — skip.
 				dirtyVal := shard.dirtyValues[key]
 				if len(dirtyVal) == 0 {
-					continue
+					return true
 				}
 				// Dirty values are held in RAM as plaintext, so this record is
 				// untransformed regardless of what the IndexEntry says: rewrite
@@ -446,7 +446,8 @@ func writeWALCheckpoint(walPath string, index *shardedIndex, diskIdx, numDisks i
 					}
 				}
 			}
-		}
+			return true
+		})
 		shard.mu.RUnlock()
 	}
 
