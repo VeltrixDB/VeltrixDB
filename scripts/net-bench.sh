@@ -13,10 +13,17 @@
 #   NETS        front-ends to compare                 [go uring]
 #   WINDOWS     WAL/VLog group-commit windows, ms     [5]
 #   DATA_ROOT   where data dirs go                    [mktemp -d]
-#   DURATION    seconds per workload                  [15]
+#   DURATION    seconds per read/mixed workload       [15]
+#   BATCH_DURATION seconds of batch write             [10]
 #   NUM_KEYS    keyspace                              [1000000]
 #   NET_THREADS event loops for C++ front-ends        [nproc]
 #   PORT        server port                           [9700]
+#
+# Every overwrite appends to the WAL and VLog and nothing reclaims space
+# during a run, so batch write grows the data dir by several GB per second
+# of load (~10 GB for one combination on an M-series Mac). BATCH_DURATION
+# caps that, and each combination's data dir is deleted when it finishes —
+# without both, a tmpfs DATA_ROOT fills and every later write fails ENOSPC.
 #
 # Client and server share the machine, so absolute numbers understate a real
 # deployment; compare rows against each other, not against other hardware.
@@ -26,6 +33,7 @@ set -euo pipefail
 NETS="${NETS:-go uring}"
 WINDOWS="${WINDOWS:-5}"
 DURATION="${DURATION:-15}"
+BATCH_DURATION="${BATCH_DURATION:-10}"
 NUM_KEYS="${NUM_KEYS:-1000000}"
 NET_THREADS="${NET_THREADS:-$(nproc 2>/dev/null || sysctl -n hw.ncpu)}"
 PORT="${PORT:-9700}"
@@ -38,7 +46,7 @@ echo "building (CGO_ENABLED=1)…"
 (cd "$ROOT" && CGO_ENABLED=1 go build -o "$WORK/veltrixdb" ./cmd/server)
 (cd "$ROOT" && CGO_ENABLED=1 go build -o "$WORK/loadtest" ./cmd/loadtest)
 
-LT=("$WORK/loadtest" --addr "127.0.0.1:$PORT" --num-keys "$NUM_KEYS" --value-size 128 --duration "$DURATION")
+LT=("$WORK/loadtest" --addr "127.0.0.1:$PORT" --num-keys "$NUM_KEYS" --value-size 128)
 
 # metric SECTION FIELD FILE — e.g. metric WRITES P99 out.txt → "4.160 ms"
 metric() {
@@ -76,6 +84,7 @@ die() {
     if kill -0 "$pid" 2>/dev/null; then echo "server pid $pid still running"
     else wait "$pid"; echo "server pid $pid exited with status $?"; fi
   fi
+  echo "──── df $DATA_ROOT"; df -h "$DATA_ROOT" || true
   command -v dmesg >/dev/null && sudo -n dmesg 2>/dev/null | tail -n 20 || true
   exit 1
 }
@@ -116,23 +125,25 @@ for net in $NETS; do
 
     rm -f "$WORK"/w.txt "$WORK"/r.txt "$WORK"/m.txt
     echo "── net=$net window=${w}ms: batch write"
-    lt w --mode write --concurrency 8 --batch-size 1024 --warmup 2
+    lt w --duration "$BATCH_DURATION" --mode write --concurrency 8 --batch-size 1024 --warmup 2
     echo "── net=$net window=${w}ms: read"
-    lt r --mode read --proto binary --concurrency 64
+    lt r --duration "$DURATION" --mode read --proto binary --concurrency 64
     echo "── net=$net window=${w}ms: mixed"
-    lt m --mode mixed --proto binary --concurrency 64 --read-ratio 0.7
+    lt m --duration "$DURATION" --mode mixed --proto binary --concurrency 64 --read-ratio 0.7
 
     ROWS+=("| $net | ${w} | $(metric WRITES Throughput "$WORK/w.txt") | $(metric WRITES P50 "$WORK/w.txt") | $(metric WRITES P99 "$WORK/w.txt") | $(metric READS Throughput "$WORK/r.txt") | $(metric READS P50 "$WORK/r.txt") | $(metric READS P99 "$WORK/r.txt") | $(metric READS P99 "$WORK/m.txt") | $(metric WRITES P50 "$WORK/m.txt") | $(metric WRITES P99 "$WORK/m.txt") |")
 
     kill -INT "$pid" 2>/dev/null || true
     wait "$pid" || true
     pid=""
+    echo "── net=$net window=${w}ms: data dir $(du -sh "$data" | cut -f1), removing"
+    rm -rf "$data"
   done
 done
 
 {
   echo
-  echo "### Network front-end comparison ($(nproc 2>/dev/null || echo ?) CPUs, client on the same host, ${DURATION}s per run)"
+  echo "### Network front-end comparison ($(nproc 2>/dev/null || echo ?) CPUs, client on the same host, batch ${BATCH_DURATION}s, read/mixed ${DURATION}s)"
   echo
   echo "| --net | window ms | batch write keys/s | batch P50 | batch P99 | read ops/s | read P50 | read P99 | mixed read P99 | mixed write P50 | mixed write P99 |"
   echo "|---|---|---|---|---|---|---|---|---|---|---|"

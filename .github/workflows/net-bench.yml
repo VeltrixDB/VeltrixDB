@@ -83,7 +83,7 @@ jobs:
       - name: mount tmpfs
         run: |
           sudo mkdir -p /mnt/vx
-          sudo mount -t tmpfs -o size=6G,mode=1777 tmpfs /mnt/vx
+          sudo mount -t tmpfs -o size=10G,mode=1777 tmpfs /mnt/vx
       - name: run
         env:
           NETS: "go uring poll"
