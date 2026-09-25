@@ -128,6 +128,9 @@ var mputRespPool = sync.Pool{
 func main() {
 	addr := flag.String("addr", ":9000", "TCP address to listen on")
 	metricsAddr := flag.String("metrics-addr", ":2112", "HTTP address for Prometheus /metrics and /healthz")
+	pprofAddr := flag.String("pprof-addr", "",
+		"Serve net/http/pprof on this address (e.g. 127.0.0.1:6060). Empty (default) = off.\n"+
+			"\tOn its own mux, never the metrics port: profiles expose internals.")
 	adminToken := flag.String("admin-token", os.Getenv("VELTRIX_ADMIN_TOKEN"), "Bearer token required for /admin/* endpoints (env VELTRIX_ADMIN_TOKEN).\n\tWhen empty, /admin/* only accepts loopback connections; /metrics, /healthz and /readyz are always unauthenticated.")
 	dataDir := flag.String("data", "./veltrixdb-data", "Single data directory (WAL + segments). Ignored when --data-dirs is set.")
 	dataDirs := flag.String("data-dirs", "", "Comma-separated NVMe mount paths, one per disk.\n\tExample: --data-dirs=/mnt/nvme0,/mnt/nvme1,...,/mnt/nvme7\n\tEach disk gets its own segment writer and compaction goroutine.\n\tWAL is placed on the first disk. Overrides --data when set.")
@@ -384,6 +387,10 @@ func main() {
 	// engine init — http.ServeMux is safe to extend while serving.
 	var engineReady atomic.Bool
 	var engineForHealth atomic.Value // *storage.StorageEngine, set after init
+	if *pprofAddr != "" {
+		go servePprof(*pprofAddr)
+	}
+
 	healthMux := http.NewServeMux()
 	healthMux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
