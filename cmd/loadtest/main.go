@@ -59,6 +59,10 @@ var (
 	flagKeyOffset = flag.Int64("key-offset", 0,
 		"Start key index offset. Use to continue from a previous run without overlap.\n"+
 			"\tKeys generated as key:(offset) … key:(offset+num-keys-1).")
+	flagProto = flag.String("proto", "text",
+		"Wire protocol for unbatched (--batch-size=1) workers: text or binary.\n"+
+			"\tbinary is required against --net=cpp|uring|poll servers, which serve only the binary protocol.\n"+
+			"\tBatched workers always use binary.")
 	flagBatchSize = flag.Int("batch-size", 1,
 		"Entries per MPut/MGet batch. Default 1 = single-frame Put/Get path.\n"+
 			"\tValues > 1 switch to MPut/MGet — engages server-side block packing\n"+
@@ -189,10 +193,34 @@ func runWorker(ctx context.Context, id int, mode string, value []byte) workerRes
 	return runUnbatchedWorker(ctx, id, mode, value)
 }
 
+// singleConn is the unbatched worker's view of either client connection.
+type singleConn interface {
+	Get(key string) ([]byte, error)
+	Put(key string, value []byte) error
+	Redial(timeout time.Duration) error
+	Close()
+}
+
+// binarySingle adapts BinaryConn (whose Put takes a TTL) to singleConn.
+type binarySingle struct{ *client.BinaryConn }
+
+func (b binarySingle) Put(key string, value []byte) error { return b.BinaryConn.Put(key, value, -1) }
+
+func dialSingle(timeout time.Duration) (singleConn, error) {
+	if *flagProto == "binary" {
+		c, err := client.DialBinary(*flagAddr, timeout)
+		if err != nil {
+			return nil, err
+		}
+		return binarySingle{c}, nil
+	}
+	return client.DialTCP(*flagAddr, timeout)
+}
+
 func runUnbatchedWorker(ctx context.Context, id int, mode string, value []byte) workerResult {
 	dialTimeout := time.Duration(*flagDialTimeout) * time.Second
 	el := &errLogger{workerID: id}
-	conn, err := client.DialTCP(*flagAddr, dialTimeout)
+	conn, err := dialSingle(dialTimeout)
 	if err != nil {
 		el.log("dial", *flagAddr, err)
 		liveWriteErrs.Add(1)

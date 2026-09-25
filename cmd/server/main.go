@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime"
 	"runtime/debug"
 	"strconv"
 	"strings"
@@ -24,6 +25,7 @@ import (
 	"github.com/VeltrixDB/veltrixdb/cluster"
 	"github.com/VeltrixDB/veltrixdb/hardware"
 	veltrixmetrics "github.com/VeltrixDB/veltrixdb/metrics"
+	"github.com/VeltrixDB/veltrixdb/netfront"
 	"github.com/VeltrixDB/veltrixdb/replication"
 	"github.com/VeltrixDB/veltrixdb/security"
 	"github.com/VeltrixDB/veltrixdb/storage"
@@ -128,6 +130,15 @@ var mputRespPool = sync.Pool{
 func main() {
 	addr := flag.String("addr", ":9000", "TCP address to listen on")
 	metricsAddr := flag.String("metrics-addr", ":2112", "HTTP address for Prometheus /metrics and /healthz")
+	netMode := flag.String("net", "go",
+		"Network front-end for --addr:\n"+
+			"\tgo    (default) the Go server: every protocol and command, AUTH, all modes\n"+
+			"\tcpp   C++ event loops (netfront/): io_uring on Linux, else poll()\n"+
+			"\turing C++ with io_uring required (fails if unavailable)\n"+
+			"\tpoll  C++ with poll() (portable; for comparison)\n"+
+			"\tThe C++ front-end serves the binary protocol's PUT GET DEL PING MPUT MGET,\n"+
+			"\tin --mode=standalone without --auth-config. TLS (--tls-addr) stays on Go.")
+	netThreads := flag.Int("net-threads", runtime.NumCPU(), "Event loops for --net=cpp|uring|poll (one per core)")
 	pprofAddr := flag.String("pprof-addr", "",
 		"Serve net/http/pprof on this address (e.g. 127.0.0.1:6060). Empty (default) = off.\n"+
 			"\tOn its own mux, never the metrics port: profiles expose internals.")
@@ -664,12 +675,38 @@ func main() {
 		log.Printf("[auth] RBAC disabled — all operations permitted without credentials")
 	}
 
-	// Plain TCP listener — always active on --addr (default :9000).
-	ln, err := net.Listen("tcp", *addr)
+	// C++ front-end on --addr instead of the Go listener.
+	var nf *netfront.Server
+	if *netMode != "go" {
+		ioBackend := map[string]string{"cpp": "auto", "uring": "uring", "poll": "poll"}[*netMode]
+		switch {
+		case ioBackend == "":
+			log.Fatalf("--net=%q: want go, cpp, uring or poll", *netMode)
+		case deploy != modeStandalone:
+			log.Fatalf("--net=%s serves --mode=standalone only (writes bypass Raft/replication routing)", *netMode)
+		case *authConfig != "":
+			log.Fatalf("--net=%s does not implement AUTH; run without --auth-config or use --net=go", *netMode)
+		}
+		nf, err = netfront.Start(netfront.Config{Addr: *addr, Threads: *netThreads, IOBackend: ioBackend}, engine)
+		if err != nil {
+			log.Fatalf("--net=%s: %v", *netMode, err)
+		}
+		log.Printf("[server] C++ front-end listening on %s  backend=%s  loops=%d  (binary PUT GET DEL PING MPUT MGET)",
+			*addr, nf.IOBackend(), *netThreads)
+	}
+
+	// Plain TCP listener — active on --addr (default :9000) unless the C++
+	// front-end owns it.
+	var ln net.Listener
+	if nf == nil {
+		ln, err = net.Listen("tcp", *addr)
+	}
 	if err != nil {
 		log.Fatalf("listen %s: %v", *addr, err)
 	}
-	log.Printf("[server] plaintext listening on %s", *addr)
+	if ln != nil {
+		log.Printf("[server] plaintext listening on %s", *addr)
+	}
 
 	// Optional TLS listener on a separate port (--tls-addr, default :9443).
 	// Both plain and TLS listeners run concurrently — plain for internal
@@ -718,6 +755,16 @@ func main() {
 	// Graceful shutdown on SIGINT / SIGTERM
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	if nf != nil {
+		<-quit
+		log.Println("[server] shutting down…")
+		if tlsLn != nil {
+			tlsLn.Close()
+		}
+		nf.Close() // waits for in-flight writes before the engine closes
+		log.Println("[server] stopped")
+		return
+	}
 	go func() {
 		<-quit
 		log.Println("[server] shutting down…")
