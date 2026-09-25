@@ -61,6 +61,37 @@ for line in open(path):
 PY
 }
 
+# die MSG — print everything needed to diagnose a failed combination, then exit.
+# Loadtest output goes to files, so without this a failure under `set -e`
+# leaves nothing in the CI log but "exit code 1".
+die() {
+  echo "::error::net-bench: $1"
+  for f in "$WORK"/w.txt "$WORK"/r.txt "$WORK"/m.txt; do
+    [[ -s "$f" ]] && { echo "──── $(basename "$f")"; tail -n 60 "$f"; }
+  done
+  if [[ -n "${log:-}" && -f "$log" ]]; then
+    echo "──── server log ($log)"; tail -n 200 "$log"
+  fi
+  if [[ -n "${pid:-}" ]]; then
+    if kill -0 "$pid" 2>/dev/null; then echo "server pid $pid still running"
+    else wait "$pid"; echo "server pid $pid exited with status $?"; fi
+  fi
+  command -v dmesg >/dev/null && sudo -n dmesg 2>/dev/null | tail -n 20 || true
+  exit 1
+}
+
+# lt NAME ARGS… — run one loadtest workload into $WORK/NAME.txt; fail loudly.
+lt() {
+  local name=$1; shift
+  local rc=0
+  "${LT[@]}" "$@" >"$WORK/$name.txt" 2>&1 || rc=$?
+  (( rc == 0 )) || die "net=$net window=${w}ms: loadtest '$name' exited $rc"
+  kill -0 "$pid" 2>/dev/null || die "net=$net window=${w}ms: server died during '$name'"
+  if grep -qE 'Errors: +[1-9]' "$WORK/$name.txt"; then
+    die "net=$net window=${w}ms: loadtest '$name' reported errors"
+  fi
+}
+
 wait_port() {
   for _ in $(seq 1 100); do
     (exec 3<>"/dev/tcp/127.0.0.1/$PORT") 2>/dev/null && return 0
@@ -80,26 +111,22 @@ for net in $NETS; do
       --wal-flush-window-ms "$w" --vlog-flush-window-ms "$w" \
       --net "$net" --net-threads "$NET_THREADS" >"$log" 2>&1 &
     pid=$!
-    if ! wait_port; then cat "$log"; exit 1; fi
+    wait_port || die "net=$net window=${w}ms: server did not start"
     grep -E 'front-end listening|plaintext listening' "$log" || true
 
+    rm -f "$WORK"/w.txt "$WORK"/r.txt "$WORK"/m.txt
     echo "── net=$net window=${w}ms: batch write"
-    "${LT[@]}" --mode write --concurrency 8 --batch-size 1024 --warmup 2 >"$WORK/w.txt" 2>&1
+    lt w --mode write --concurrency 8 --batch-size 1024 --warmup 2
     echo "── net=$net window=${w}ms: read"
-    "${LT[@]}" --mode read --proto binary --concurrency 64 >"$WORK/r.txt" 2>&1
+    lt r --mode read --proto binary --concurrency 64
     echo "── net=$net window=${w}ms: mixed"
-    "${LT[@]}" --mode mixed --proto binary --concurrency 64 --read-ratio 0.7 >"$WORK/m.txt" 2>&1
-
-    for f in w r m; do
-      if grep -qE 'Errors: +[1-9]' "$WORK/$f.txt"; then
-        echo "errors in $f run:"; cat "$WORK/$f.txt"; exit 1
-      fi
-    done
+    lt m --mode mixed --proto binary --concurrency 64 --read-ratio 0.7
 
     ROWS+=("| $net | ${w} | $(metric WRITES Throughput "$WORK/w.txt") | $(metric WRITES P50 "$WORK/w.txt") | $(metric WRITES P99 "$WORK/w.txt") | $(metric READS Throughput "$WORK/r.txt") | $(metric READS P50 "$WORK/r.txt") | $(metric READS P99 "$WORK/r.txt") | $(metric READS P99 "$WORK/m.txt") | $(metric WRITES P50 "$WORK/m.txt") | $(metric WRITES P99 "$WORK/m.txt") |")
 
-    kill -INT "$pid"
+    kill -INT "$pid" 2>/dev/null || true
     wait "$pid" || true
+    pid=""
   done
 done
 
