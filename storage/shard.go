@@ -153,11 +153,15 @@ func (si *shardedIndex) put(key string, entry *IndexEntry, value []byte) {
 	}
 	shard.mu.Lock()
 	old, hadOld := shard.entries.swap(key, h, entry)
-	if si.ordered != nil {
-		si.ordered.Insert(key)
-	}
 	if !hadOld || old.IsTombstone() {
 		si.keyCount.Add(1)
+		// Only a key that was not live needs a skiplist insert: a live one is
+		// already there (key live in entries ⇔ key in ordered). Calling Insert
+		// on every overwrite cost a full O(log N) search — ~20 cache misses at
+		// 1M keys, 480 → 1351 ns per put — for a guaranteed "already present".
+		if si.ordered != nil {
+			si.ordered.Insert(key)
+		}
 	}
 	if value != nil {
 		_, hadDirty := shard.dirtyValues[key]
@@ -185,11 +189,11 @@ func (si *shardedIndex) replayPut(key string, entry *IndexEntry, value []byte) {
 		return // live write during replay takes precedence — don't clobber it
 	}
 	shard.entries.swap(key, h, entry)
-	if si.ordered != nil {
-		si.ordered.Insert(key)
-	}
 	if !hadExisting || existing.IsTombstone() {
 		si.keyCount.Add(1)
+		if si.ordered != nil { // live keys are already present — see put
+			si.ordered.Insert(key)
+		}
 	}
 	if value != nil {
 		_, hadDirty := shard.dirtyValues[key]

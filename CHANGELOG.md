@@ -28,6 +28,19 @@ Types: `Added`, `Changed`, `Fixed`, `Performance`, `Breaking`
 
 ### Performance
 
+- **Batch writes are 2.4x faster on overwrites.** An overwrite of a live key
+  no longer searches the ordered index for a key that is already in it.
+  Server, 8 clients × 1024-key MPUT over a 1M-key space: 1.45M → 3.54M keys/s,
+  P99 9.6 → 4.2 ms.
+- **Opt-in C++ network front-end, `--net=cpp`** (io_uring on Linux). It serves
+  the binary PUT GET DEL PING MPUT MGET commands with one event loop per core,
+  and each loop hands every request that arrived in one iteration to the
+  engine in a single call. It runs in standalone mode without RBAC. Compare it
+  with `scripts/net-bench.sh` or the `Net front-end` workflow. A GET or MGET
+  that needs a disk read is answered from a goroutine instead of the loop
+  thread, so a VLog read does not stall the other connections on the loop
+  (`VELTRIXDB_NET_DEFER_READS=0` turns this off). At shutdown the server
+  logs a per-stage latency breakdown of the front-end.
 - **Off-heap native index on cgo builds.** With 5M keys, full GC takes
   0.27 ms (21 ms before) and settled RSS is 142 B/key (168 before). Each
   cache-miss lookup costs ~19 ns more. Opt out with `VELTRIXDB_INDEX=map`.
@@ -36,6 +49,18 @@ Types: `Added`, `Changed`, `Fixed`, `Performance`, `Breaking`
 
 ### Changed
 
+- **The io_uring VLog write bridge is off by default** (`VELTRIXDB_URING_BRIDGE`:
+  `off` | `on` | `sqpoll`). It used to start on every Linux cgo build with
+  SQPOLL. A VLog batch is already one `pwrite` plus one `fdatasync`, so the
+  bridge saves at most one syscall per batch. On the 4-CPU CI runner, the C++
+  storage layer (bridge with SQPOLL, batch engine and native index, all on)
+  measured 1.12M keys/s for batch writes against 1.77M with all three off.
+- New `StorageEngine.GetNoIO` / `GetAfterNoIO`: a read that stops before disk
+  and reports whether it needs disk.
+- `loadtest --proto=binary` runs unbatched workers on the binary protocol.
+  The C++ front-end requires it.
+- `--pprof-addr` serves CPU, heap and trace profiles on a separate listener.
+  It is off by default.
 - The Docker image is now built with `CGO_ENABLED=1`. Build with
   `--build-arg CGO_ENABLED=0` for the old static image. cgo builds use
   `-march=x86-64-v2` instead of `-march=native`.

@@ -246,11 +246,11 @@ func (se *StorageEngine) persistAtomicKVSep(shard *indexShard, shardID uint16, k
 	// SETNX/INCR/CAS that creates a key.
 	if old, hadOld := shard.entries.swap(key, fnv64a(key), entry); !hadOld || old.IsTombstone() {
 		se.index.keyCount.Add(1)
-	}
-	if se.index.ordered != nil {
-		// Caller holds shard.mu — matches the indexShard.mu → oiNode.mu lock
-		// order documented in ordered_index.go.
-		se.index.ordered.Insert(key)
+		if se.index.ordered != nil { // live keys are already present — see shardedIndex.put
+			// Caller holds shard.mu — matches the indexShard.mu → oiNode.mu lock
+			// order documented in ordered_index.go.
+			se.index.ordered.Insert(key)
+		}
 	}
 	if shard.bloom != nil {
 		shard.bloom.Add(fnv64a(key))

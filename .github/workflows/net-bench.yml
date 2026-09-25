@@ -1,0 +1,121 @@
+name: Net front-end
+
+# The C++ network front-end (netfront/, --net=cpp|uring|poll) has an io_uring
+# backend that only Linux can compile or run, so this is where it is tested
+# and measured. Run it from the Actions tab (workflow_dispatch) or by pushing
+# to the perf/cpp-native-engine branch.
+
+on:
+  workflow_dispatch:
+    inputs:
+      windows:
+        description: "WAL/VLog group-commit windows to compare, ms (space-separated)"
+        default: "5 1"
+      duration:
+        description: "Seconds per read/mixed workload (batch write runs 10 s)"
+        default: "15"
+      engines:
+        description: "Step 1, storage configurations under --net=go (native inline bridge sqpoll map nocgo — see scripts/net-bench.sh)"
+        default: "native bridge sqpoll map nocgo"
+      nets:
+        description: "Step 2, front-ends under engine=native and inline; NET:N = N event loops"
+        default: "go uring poll uring:2 poll:2"
+  push:
+    branches: [perf/cpp-native-engine]
+    paths:
+      - "netfront/**"
+      - "storage/**"
+      - "cmd/server/**"
+      - "cmd/loadtest/**"
+      - "scripts/net-bench.sh"
+      - ".github/workflows/net-bench.yml"
+
+jobs:
+  netfront-tests:
+    name: "netfront tests (${{ matrix.backend }}${{ matrix.race && ', -race' || '' }})"
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { backend: uring, race: false }
+          - { backend: poll, race: false }
+          - { backend: uring, race: true }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          cache: true
+      - name: install liburing
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends liburing-dev
+      - name: kernel / io_uring
+        run: |
+          uname -r
+          cat /proc/sys/kernel/io_uring_disabled 2>/dev/null || echo "io_uring_disabled: (sysctl absent = enabled)"
+      - name: vet
+        run: CGO_ENABLED=1 go vet ./netfront/... ./cmd/server/...
+      - name: test
+        env:
+          VXNF_TEST_BACKEND: ${{ matrix.backend }}
+          # The storage engine's own C++ (io_uring bridge, batch engine) is not
+          # under test here; keep it off so it cannot starve a 4-core runner.
+          VELTRIXDB_DISABLE_CGO_ENGINE: "1"
+          VELTRIXDB_INDEX: native
+        run: |
+          CGO_ENABLED=1 go test ${{ matrix.race && '-race' || '' }} -v -count=1 -timeout 600s ./netfront/...
+
+  net-bench:
+    name: "benchmark: --net=go vs uring vs poll"
+    needs: netfront-tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          cache: true
+      # gdb: on a hang the script dumps native (C++) thread stacks before
+      # SIGQUIT'ing the server for the Go goroutine dump.
+      - name: install liburing + gdb
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends liburing-dev gdb
+      # Data on tmpfs: this compares front-ends and storage configurations, and a shared runner's
+      # disk adds noise larger than the difference being measured. fdatasync
+      # still runs, it just lands on RAM (see ci.yml, invariant 40).
+      - name: mount tmpfs
+        run: |
+          sudo mkdir -p /mnt/vx
+          sudo mount -t tmpfs -o size=10G,mode=1777 tmpfs /mnt/vx
+      # Step 1: which part of the C++ storage layer costs what, with the Go
+      # front-end held fixed. The 2026-09-25 run changed three things at once
+      # (io_uring bridge + SQPOLL, batch engine, native index), so its 35%
+      # batch-write gap could not be attributed.
+      - name: "run: storage configurations (--net=go)"
+        env:
+          TITLE: "Storage configurations, --net=go"
+          ENGINES: ${{ github.event.inputs.engines || 'native bridge sqpoll map nocgo' }}
+          NETS: go
+          WINDOWS: ${{ github.event.inputs.windows || '5 1' }}
+          DURATION: ${{ github.event.inputs.duration || '15' }}
+          DATA_ROOT: /mnt/vx
+        run: bash scripts/net-bench.sh
+      # Step 2: front-ends on the default storage configuration, with disk
+      # reads deferred off the loop (native) and inline (inline), and with
+      # fewer loops than CPUs (NET:2) — the C++ loops compete with Go for the
+      # runner's 4 CPUs. Window 5 ms: where the mixed-write tail differed.
+      - name: "run: front-ends (engine=native vs inline)"
+        if: ${{ !cancelled() }}
+        env:
+          TITLE: "Front-ends, default storage"
+          ENGINES: native inline
+          NETS: ${{ github.event.inputs.nets || 'go uring poll uring:2 poll:2' }}
+          WINDOWS: "5"
+          DURATION: ${{ github.event.inputs.duration || '15' }}
+          DATA_ROOT: /mnt/vx
+        run: bash scripts/net-bench.sh
