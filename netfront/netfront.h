@@ -17,10 +17,11 @@
  * request — that amortisation is the point of the front-end.
  *
  * Responses: Go answers every request exactly once with vxnf_respond, either
- * inside vxnfExec (reads) or later from any goroutine (writes, which wait on
- * fdatasync and must never block a loop). A connection that has a write in
- * flight is not parsed further until it is answered, so each connection is
- * served strictly in order — the same semantics as the Go server.
+ * inside vxnfExec (reads that need no disk) or later from any goroutine
+ * (writes, which wait on fdatasync, and reads that need a VLog read — neither
+ * may block a loop). A connection with a write or deferred read in flight is
+ * not parsed further until it is answered, so each connection is served
+ * strictly in order — the same semantics as the Go server.
  */
 
 #pragma once
@@ -92,6 +93,25 @@ void vxnf_free(vxnf_server* s);
 /* Answer request (loop, conn) with a complete binary response frame. Safe
  * from any thread; a stale token (the connection has closed) is ignored. */
 void vxnf_respond(vxnf_server* s, uint32_t loop, uint64_t conn, const void* data, size_t len);
+
+/* Called from inside vxnfExec, on the loop's own thread only: the answer to
+ * this connection's requests will come later from a goroutine (a read that
+ * needs disk). Blocks the connection like a write — nothing more is parsed
+ * from it until every outstanding request is answered — so per-connection
+ * order holds. */
+void vxnf_defer(vxnf_server* s, uint32_t loop, uint64_t conn);
+
+/* CLOCK_MONOTONIC in ns — the clock vxnfExec's t_call_ns is taken on. */
+uint64_t vxnf_now_ns(void);
+
+/* Latency histograms, VXNF_HIST_BUCKETS buckets: bucket i counts durations of
+ * [2^(i-1), 2^i) µs, bucket 0 is sub-microsecond. */
+enum {
+    VXNF_HIST_BUCKETS = 32,
+    VXNF_HIST_WAKE = 0, /* vxnf_respond from a goroutine → answer appended on the loop */
+    VXNF_HIST_ITER = 1, /* one loop iteration: event handling + vxnfExec + post */
+};
+void vxnf_hist(const vxnf_server* s, int which, uint64_t* out);
 
 /* Counters for /metrics: loop iterations, requests, Go batches. */
 uint64_t vxnf_stat_iterations(const vxnf_server* s);

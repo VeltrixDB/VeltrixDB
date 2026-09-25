@@ -24,9 +24,11 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os"
 	"runtime/cgo"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"unsafe"
 
 	"github.com/VeltrixDB/veltrixdb/storage"
@@ -58,9 +60,19 @@ type Server struct {
 	c      *C.vxnf_server
 	h      cgo.Handle
 	be     Backend
-	writes sync.WaitGroup // in-flight write goroutines; Close waits for them
+	writes sync.WaitGroup // in-flight write and deferred-read goroutines; Close waits for them
 	once   sync.Once
+	st     stageStats
+
+	deferReads bool // answer disk-bound GET/MGET from a goroutine (DeferReadsEnv)
+
+	closed               atomic.Bool
+	finalWake, finalIter [C.VXNF_HIST_BUCKETS]uint64 // C++ histograms, captured before vxnf_free
 }
+
+// DeferReadsEnv=0 answers every GET and MGET inline on the loop thread, disk
+// reads included (the behaviour before deferral existed) — for A/B runs.
+const DeferReadsEnv = "VELTRIXDB_NET_DEFER_READS"
 
 // Start binds cfg.Addr and starts the event loops.
 func Start(cfg Config, be Backend) (*Server, error) {
@@ -84,7 +96,7 @@ func Start(cfg Config, be Backend) (*Server, error) {
 		return nil, fmt.Errorf("netfront: unknown I/O backend %q (auto, uring, poll)", cfg.IOBackend)
 	}
 
-	s := &Server{be: be}
+	s := &Server{be: be, deferReads: os.Getenv(DeferReadsEnv) != "0"}
 	s.h = cgo.NewHandle(s)
 	chost := C.CString(host)
 	defer C.free(unsafe.Pointer(chost))
@@ -123,6 +135,9 @@ func (s *Server) Close() {
 	s.once.Do(func() {
 		C.vxnf_stop(s.c)
 		s.writes.Wait() // no goroutine may call vxnf_respond after vxnf_free
+		C.vxnf_hist(s.c, C.VXNF_HIST_WAKE, (*C.uint64_t)(unsafe.Pointer(&s.finalWake[0])))
+		C.vxnf_hist(s.c, C.VXNF_HIST_ITER, (*C.uint64_t)(unsafe.Pointer(&s.finalIter[0])))
+		s.closed.Store(true)
 		C.vxnf_free(s.c)
 		s.h.Delete()
 	})
@@ -154,37 +169,139 @@ func cbytes(p *C.uint8_t, n C.uint32_t) []byte {
 	return unsafe.Slice((*byte)(unsafe.Pointer(p)), int(n))
 }
 
+// noIOGetter is the optional Backend extension that lets reads which need
+// disk leave the loop thread. *storage.StorageEngine implements it. Without
+// it every GET and MGET is answered inline, as before.
+type noIOGetter interface {
+	GetNoIO(key string) (value []byte, needIO bool, err error)
+	GetAfterNoIO(key string) ([]byte, error)
+}
+
+// chain is one connection's requests that must be answered from a goroutine,
+// in arrival order. Once a connection has deferred a request in a batch,
+// every later request of that connection in the same batch joins its chain:
+// answering one of them inline would overtake the deferred answer.
+type chain struct {
+	loop C.uint32_t
+	conn C.uint64_t
+	jobs []func(respond func([]byte))
+}
+
+func getFrame(b []byte, v []byte, err error) []byte {
+	if err != nil {
+		return appendFrame(b, statusNotFound, nil)
+	}
+	return appendFrame(b, statusOK, v)
+}
+
 //export vxnfExec
-func vxnfExec(h C.uintptr_t, reqs *C.vxnf_req, n C.int) {
+func vxnfExec(h C.uintptr_t, reqs *C.vxnf_req, n C.int, tCall C.uint64_t) {
 	s := cgo.Handle(h).Value().(*Server)
+	tEnter := uint64(C.vxnf_now_ns())
+	s.st.cbEnter.addNS(tEnter - uint64(tCall))
+	defer func() { s.st.exec.addNS(uint64(C.vxnf_now_ns()) - tEnter) }()
+
 	rs := unsafe.Slice(reqs, int(n))
 	var frame []byte // reused for every inline answer: vxnf_respond copies it
+	var chains map[C.uint64_t]*chain
+	deferTo := func(r *C.vxnf_req) *chain {
+		if ch := chains[r.conn]; ch != nil {
+			return ch
+		}
+		if chains == nil {
+			chains = make(map[C.uint64_t]*chain)
+		}
+		ch := &chain{loop: r.loop, conn: r.conn}
+		chains[r.conn] = ch
+		return ch
+	}
+	var probe noIOGetter
+	if s.deferReads {
+		probe, _ = s.be.(noIOGetter)
+	}
 
 	for i := 0; i < len(rs); i++ {
 		r := &rs[i]
+		ch := chains[r.conn] // non-nil: this connection is already deferred
+
 		switch r.op {
 		case C.VXNF_GET:
-			v, err := s.be.Get(string(cbytes(r.key, r.klen)))
-			if err != nil {
-				frame = appendFrame(frame[:0], statusNotFound, nil)
-			} else {
-				frame = appendFrame(frame[:0], statusOK, v)
+			key := string(cbytes(r.key, r.klen))
+			if ch == nil {
+				if probe == nil {
+					v, err := s.be.Get(key)
+					frame = getFrame(frame[:0], v, err)
+					s.respond(r.loop, r.conn, frame)
+					continue
+				}
+				v, needIO, err := probe.GetNoIO(key)
+				if !needIO {
+					frame = getFrame(frame[:0], v, err)
+					s.respond(r.loop, r.conn, frame)
+					continue
+				}
+				ch = deferTo(r)
+				ch.jobs = append(ch.jobs, func(respond func([]byte)) {
+					v, err := probe.GetAfterNoIO(key)
+					respond(getFrame(nil, v, err))
+				})
+				continue
 			}
-			s.respond(r.loop, r.conn, frame)
+			ch.jobs = append(ch.jobs, func(respond func([]byte)) {
+				v, err := s.be.Get(key)
+				respond(getFrame(nil, v, err))
+			})
 
 		case C.VXNF_PING:
+			if ch != nil {
+				ch.jobs = append(ch.jobs, func(respond func([]byte)) {
+					respond(appendFrame(nil, statusOK, []byte("PONG")))
+				})
+				continue
+			}
 			frame = appendFrame(frame[:0], statusOK, []byte("PONG"))
 			s.respond(r.loop, r.conn, frame)
 
 		case C.VXNF_MGET:
 			keys, ok := parseMGet(cbytes(r.key, r.klen), int(r.vlen))
 			if !ok {
+				if ch != nil {
+					ch.jobs = append(ch.jobs, func(respond func([]byte)) {
+						respond(appendFrame(nil, statusErr, []byte("malformed MGET frame")))
+					})
+					continue
+				}
 				frame = appendFrame(frame[:0], statusErr, []byte("malformed MGET frame"))
 				s.respond(r.loop, r.conn, frame)
 				continue
 			}
-			frame = appendMGetResponse(frame[:0], s.be.MultiGet(keys))
-			s.respond(r.loop, r.conn, frame)
+			if ch == nil && probe != nil {
+				// Answer every key that needs no disk now; if any does, the
+				// goroutine reads only those, and the answer stays one frame.
+				results, pending := mgetNoIO(probe, keys)
+				if len(pending) == 0 {
+					frame = appendMGetResponse(frame[:0], results)
+					s.respond(r.loop, r.conn, frame)
+					continue
+				}
+				ch = deferTo(r)
+				ch.jobs = append(ch.jobs, func(respond func([]byte)) {
+					for _, i := range pending {
+						v, err := probe.GetAfterNoIO(keys[i])
+						results[i] = storage.MultiGetResult{Key: keys[i], Value: v, Found: err == nil && v != nil, Err: err}
+					}
+					respond(appendMGetResponse(nil, results))
+				})
+				continue
+			}
+			if ch == nil {
+				frame = appendMGetResponse(frame[:0], s.be.MultiGet(keys))
+				s.respond(r.loop, r.conn, frame)
+				continue
+			}
+			ch.jobs = append(ch.jobs, func(respond func([]byte)) {
+				respond(appendMGetResponse(nil, s.be.MultiGet(keys)))
+			})
 
 		case C.VXNF_PUT:
 			// Back-to-back PUTs of one connection arrive adjacent (the parser
@@ -202,11 +319,9 @@ func vxnfExec(h C.uintptr_t, reqs *C.vxnf_req, n C.int) {
 					TTL:   -1,
 				})
 			}
-			loop, conn := r.loop, r.conn
 			i = j - 1
-			s.writes.Add(1)
-			go func() {
-				defer s.writes.Done()
+			job := func(respond func([]byte)) {
+				t0 := uint64(C.vxnf_now_ns())
 				var errs []error
 				if len(group) == 1 {
 					// Single PUT keeps the single-key path (write-through cache).
@@ -214,6 +329,7 @@ func vxnfExec(h C.uintptr_t, reqs *C.vxnf_req, n C.int) {
 				} else {
 					errs = s.be.MultiPut(group)
 				}
+				s.st.putExec.addNS(uint64(C.vxnf_now_ns()) - t0)
 				var f []byte
 				for _, err := range errs {
 					if err != nil {
@@ -221,36 +337,37 @@ func vxnfExec(h C.uintptr_t, reqs *C.vxnf_req, n C.int) {
 					} else {
 						f = appendFrame(f[:0], statusOK, nil)
 					}
-					s.respond(loop, conn, f)
+					respond(f)
 				}
-			}()
+			}
+			s.runOrChain(ch, r.loop, r.conn, job, &s.st.putSched)
 
 		case C.VXNF_DEL:
 			key := string(cbytes(r.key, r.klen))
-			loop, conn := r.loop, r.conn
-			s.writes.Add(1)
-			go func() {
-				defer s.writes.Done()
+			s.runOrChain(ch, r.loop, r.conn, func(respond func([]byte)) {
 				var f []byte
 				if err := s.be.Delete(key); err != nil {
 					f = appendFrame(f, statusErr, []byte(err.Error()))
 				} else {
 					f = appendFrame(f, statusOK, nil)
 				}
-				s.respond(loop, conn, f)
-			}()
+				respond(f)
+			}, nil)
 
 		case C.VXNF_MPUT:
 			entries, ok := parseMPut(cbytes(r.key, r.klen), int(r.vlen))
 			if !ok {
+				if ch != nil {
+					ch.jobs = append(ch.jobs, func(respond func([]byte)) {
+						respond(appendFrame(nil, statusErr, []byte("malformed MPUT frame")))
+					})
+					continue
+				}
 				frame = appendFrame(frame[:0], statusErr, []byte("malformed MPUT frame"))
 				s.respond(r.loop, r.conn, frame)
 				continue
 			}
-			loop, conn := r.loop, r.conn
-			s.writes.Add(1)
-			go func() {
-				defer s.writes.Done()
+			s.runOrChain(ch, r.loop, r.conn, func(respond func([]byte)) {
 				errs := s.be.MultiPut(entries)
 				f := make([]byte, 5, 5+len(errs))
 				f[0] = statusOK
@@ -262,15 +379,75 @@ func vxnfExec(h C.uintptr_t, reqs *C.vxnf_req, n C.int) {
 						f = append(f, statusOK)
 					}
 				}
-				s.respond(loop, conn, f)
-			}()
+				respond(f)
+			}, nil)
 
 		default:
 			// The C++ parser only emits the ops above.
+			if ch != nil {
+				ch.jobs = append(ch.jobs, func(respond func([]byte)) {
+					respond(appendFrame(nil, statusErr, []byte("unsupported op")))
+				})
+				continue
+			}
 			frame = appendFrame(frame[:0], statusErr, []byte("unsupported op"))
 			s.respond(r.loop, r.conn, frame)
 		}
 	}
+
+	// Block each deferred connection BEFORE its goroutine can answer, then
+	// run its chain in order.
+	for _, ch := range chains {
+		C.vxnf_defer(s.c, ch.loop, ch.conn)
+		ch := ch
+		tq := uint64(C.vxnf_now_ns())
+		s.writes.Add(1)
+		go func() {
+			defer s.writes.Done()
+			s.st.deferSched.addNS(uint64(C.vxnf_now_ns()) - tq)
+			t0 := uint64(C.vxnf_now_ns())
+			respond := func(f []byte) { s.respond(ch.loop, ch.conn, f) }
+			for _, job := range ch.jobs {
+				job(respond)
+			}
+			s.st.deferExec.addNS(uint64(C.vxnf_now_ns()) - t0)
+		}()
+	}
+}
+
+// runOrChain runs a write job in its own goroutine, or appends it to the
+// connection's chain when an earlier request of the connection was deferred
+// in this batch. sched, when set, records the goroutine start delay.
+func (s *Server) runOrChain(ch *chain, loop C.uint32_t, conn C.uint64_t, job func(func([]byte)), sched *hist) {
+	if ch != nil {
+		ch.jobs = append(ch.jobs, job)
+		return
+	}
+	tq := uint64(C.vxnf_now_ns())
+	s.writes.Add(1)
+	go func() {
+		defer s.writes.Done()
+		if sched != nil {
+			sched.addNS(uint64(C.vxnf_now_ns()) - tq)
+		}
+		job(func(f []byte) { s.respond(loop, conn, f) })
+	}()
+}
+
+// mgetNoIO resolves every key of an MGET that needs no disk and returns the
+// indices of those that do (their results are left for GetAfterNoIO).
+// Mirrors MultiGet's per-key Get, so each key is counted as one read.
+func mgetNoIO(p noIOGetter, keys []string) (results []storage.MultiGetResult, pending []int) {
+	results = make([]storage.MultiGetResult, len(keys))
+	for i, k := range keys {
+		v, needIO, err := p.GetNoIO(k)
+		if needIO {
+			pending = append(pending, i)
+			continue
+		}
+		results[i] = storage.MultiGetResult{Key: k, Value: v, Found: err == nil && v != nil, Err: err}
+	}
+	return results, pending
 }
 
 // parseMGet decodes count × [2B keyLen LE][key]. The C++ parser has already

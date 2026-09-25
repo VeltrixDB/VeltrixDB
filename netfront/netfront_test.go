@@ -10,6 +10,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -365,4 +366,185 @@ func TestNetfront_StorageEngine(t *testing.T) {
 		t.Fatalf("stats: iterations=%d requests=%d batches=%d", it, reqs, batches)
 	}
 	s.Close()
+	// The report is logged after Close, when the C++ server is freed: the
+	// loop histograms must come from the snapshot Close took.
+	rep := s.LatencyReport()
+	for _, stage := range []string{"iter", "put_exec", "wake"} {
+		if !strings.Contains(rep, "stage="+stage) || regexp.MustCompile(`stage=`+stage+` +n=0 `).MatchString(rep) {
+			t.Fatalf("stage %s empty after Close:\n%s", stage, rep)
+		}
+	}
+}
+
+// diskBackend adds the noIOGetter extension to memBackend: keys starting
+// with "d:" are "on disk" — GetNoIO reports needIO and GetAfterNoIO sleeps
+// readWait — so the front-end has to answer them from a goroutine.
+type diskBackend struct {
+	*memBackend
+	readWait  time.Duration
+	mu        sync.Mutex
+	afterNoIO int
+}
+
+func newDisk(writeWait, readWait time.Duration) *diskBackend {
+	return &diskBackend{memBackend: newMem(writeWait), readWait: readWait}
+}
+
+func (b *diskBackend) GetNoIO(k string) ([]byte, bool, error) {
+	if strings.HasPrefix(k, "d:") {
+		return nil, true, nil
+	}
+	v, err := b.memBackend.Get(k)
+	return v, false, err
+}
+
+func (b *diskBackend) GetAfterNoIO(k string) ([]byte, error) {
+	b.mu.Lock()
+	b.afterNoIO++
+	b.mu.Unlock()
+	time.Sleep(b.readWait)
+	return b.memBackend.Get(k)
+}
+
+func (b *diskBackend) afterNoIOCalls() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.afterNoIO
+}
+
+// A GET that needs disk is answered from a goroutine; every request behind
+// it on the connection — reads that could be answered inline, writes, and
+// reads of those writes — must still be answered in request order.
+func TestNetfront_DeferredReadOrder(t *testing.T) {
+	t.Setenv(DeferReadsEnv, "") // these test deferral itself: default on
+	be := newDisk(5*time.Millisecond, 30*time.Millisecond)
+	be.m["d:1"] = []byte("disk1")
+	be.m["m1"] = []byte("mem1")
+	_, addr := start(t, be, 1)
+	c := dial(t, addr)
+
+	for round := 0; round < 3; round++ {
+		p := client.NewPipeline(c)
+		p.Get("d:1") // deferred
+		p.Get("m1")  // inline-able, must wait for d:1
+		p.Put("m2", []byte(fmt.Sprint("v", round)), -1)
+		p.Get("m2")        // read-your-writes behind a deferred read
+		p.Get("d:missing") // deferred, not found
+		p.Get("m1")
+		res, err := p.Exec()
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := []string{"disk1", "mem1", "", fmt.Sprint("v", round), "", "mem1"}
+		for i, w := range want {
+			switch {
+			case i == 2:
+				if res[i].Err != nil {
+					t.Fatalf("round %d PUT: %v", round, res[i].Err)
+				}
+			case i == 4:
+				if !res[i].NotFound {
+					t.Fatalf("round %d res[4] = %+v, want not found", round, res[i])
+				}
+			case string(res[i].Value) != w:
+				t.Fatalf("round %d res[%d] = %q, want %q (order broken)", round, i, res[i].Value, w)
+			}
+		}
+	}
+	if n := be.afterNoIOCalls(); n != 6 {
+		t.Fatalf("GetAfterNoIO calls = %d, want 6 (2 disk keys × 3 rounds)", n)
+	}
+}
+
+// The point of deferring: a slow disk read on one connection must not stall
+// another connection on the same loop.
+func TestNetfront_DeferredReadNoHeadOfLine(t *testing.T) {
+	t.Setenv(DeferReadsEnv, "") // these test deferral itself: default on
+	be := newDisk(0, 400*time.Millisecond)
+	be.m["d:slow"] = []byte("slow")
+	be.m["fast"] = []byte("fast")
+	s, addr := start(t, be, 1) // one loop: both connections share it
+	slowC, fastC := dial(t, addr), dial(t, addr)
+
+	slowDone := make(chan error, 1)
+	go func() {
+		v, err := slowC.Get("d:slow")
+		if err == nil && string(v) != "slow" {
+			err = fmt.Errorf("Get(d:slow) = %q", v)
+		}
+		slowDone <- err
+	}()
+	time.Sleep(50 * time.Millisecond) // the slow read is now inside GetAfterNoIO
+
+	t0 := time.Now()
+	if v, err := fastC.Get("fast"); err != nil || string(v) != "fast" {
+		t.Fatalf("Get(fast) = %q, %v", v, err)
+	}
+	if d := time.Since(t0); d > 200*time.Millisecond {
+		t.Fatalf("Get(fast) took %v behind another connection's disk read (head-of-line blocking)", d)
+	}
+	if err := <-slowDone; err != nil {
+		t.Fatal(err)
+	}
+	if rep := s.LatencyReport(); !strings.Contains(rep, "stage=defer_exec") || strings.Contains(rep, "stage=defer_exec   n=0 ") {
+		t.Fatalf("latency report has no deferred execution:\n%s", rep)
+	}
+}
+
+// MGET with some keys on disk: one frame, results in key order, the disk
+// keys read once each.
+func TestNetfront_DeferredMGet(t *testing.T) {
+	t.Setenv(DeferReadsEnv, "") // these test deferral itself: default on
+	be := newDisk(0, 10*time.Millisecond)
+	be.m["d:a"] = []byte("A")
+	be.m["m:b"] = []byte("B")
+	be.m["d:c"] = []byte("C")
+	_, addr := start(t, be, 1)
+	c := dial(t, addr)
+	res, err := c.MGet([]string{"d:a", "m:b", "nope", "d:c", "d:gone"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(res[0].Value) != "A" || string(res[1].Value) != "B" || !res[2].NotFound ||
+		string(res[3].Value) != "C" || !res[4].NotFound {
+		t.Fatalf("MGet = %+v", res)
+	}
+	if n := be.afterNoIOCalls(); n != 3 {
+		t.Fatalf("GetAfterNoIO calls = %d, want 3 (only the d: keys)", n)
+	}
+	// All-inline MGET: no disk reads.
+	if res, err := c.MGet([]string{"m:b", "nope"}); err != nil || string(res[0].Value) != "B" || !res[1].NotFound {
+		t.Fatalf("inline MGet = %+v, %v", res, err)
+	}
+	if n := be.afterNoIOCalls(); n != 3 {
+		t.Fatalf("inline MGet read disk: GetAfterNoIO calls = %d", n)
+	}
+}
+
+// The deferral must outlive the batch: a request that arrives in a LATER
+// loop iteration, while the deferred read is still running, must not be
+// answered inline ahead of it. (Within one batch the chain keeps order on
+// its own; this is what vxnf_defer's blocking is for.)
+func TestNetfront_DeferredReadBlocksLaterBatches(t *testing.T) {
+	t.Setenv(DeferReadsEnv, "") // these test deferral itself: default on
+	be := newDisk(0, 150*time.Millisecond)
+	be.m["d:1"] = []byte("disk1")
+	be.m["m1"] = []byte("mem1")
+	_, addr := start(t, be, 1)
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	get := func(k string) []byte { return append([]byte{0x02, byte(len(k)), 0, 0, 0, 0, 0}, k...) }
+
+	conn.Write(get("d:1"))
+	time.Sleep(40 * time.Millisecond) // d:1 is inside GetAfterNoIO
+	conn.Write(get("m1"))             // a new batch on the same connection
+	if st, v := readFrame(t, conn); st != statusOK || v != "disk1" {
+		t.Fatalf("first answer = %d %q, want the deferred d:1 (\"disk1\") — a later request overtook it", st, v)
+	}
+	if st, v := readFrame(t, conn); st != statusOK || v != "mem1" {
+		t.Fatalf("second answer = %d %q, want \"mem1\"", st, v)
+	}
 }

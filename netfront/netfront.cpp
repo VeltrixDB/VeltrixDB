@@ -40,6 +40,7 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <poll.h>
+#include <time.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -49,7 +50,7 @@
 
 // Exported from netfront.go. Declared by hand: _cgo_export.h is C and its
 // complex-number typedefs do not compile as C++.
-extern "C" void vxnfExec(uintptr_t handle, vxnf_req* reqs, int n);
+extern "C" void vxnfExec(uintptr_t handle, vxnf_req* reqs, int n, uint64_t t_call_ns);
 
 namespace {
 
@@ -73,6 +74,26 @@ constexpr int kSendFlags = MSG_NOSIGNAL; // a C thread must never take SIGPIPE
 #else
 constexpr int kSendFlags = 0;            // macOS: SO_NOSIGPIPE is set per socket instead
 #endif
+
+inline uint64_t now_ns() {
+    timespec ts;
+    ::clock_gettime(CLOCK_MONOTONIC, &ts);
+    return uint64_t(ts.tv_sec) * 1000000000u + uint64_t(ts.tv_nsec);
+}
+
+// Latency histogram: bucket i counts durations of [2^(i-1), 2^i) µs, bucket 0
+// sub-microsecond. Relaxed atomics: a statistic, written by one loop thread
+// per server-wide array at a time in practice, read only for the report.
+struct Hist {
+    std::atomic<uint64_t> b[VXNF_HIST_BUCKETS] = {};
+    void add_ns(uint64_t ns) {
+        uint64_t us = ns / 1000;
+        int i = 0;
+        while (us) { ++i; us >>= 1; }
+        if (i >= VXNF_HIST_BUCKETS) i = VXNF_HIST_BUCKETS - 1;
+        b[i].fetch_add(1, std::memory_order_relaxed);
+    }
+};
 
 inline uint64_t token(uint32_t idx, uint32_t gen) { return uint64_t(gen) << 32 | idx; }
 inline uint32_t token_idx(uint64_t t) { return uint32_t(t); }
@@ -98,7 +119,7 @@ struct Conn {
 
     bool recv_armed = false;
     bool send_armed = false;
-    bool blocked    = false;  // a write is in flight: parse nothing more until answered
+    bool blocked    = false;  // a write or deferred read is in flight: parse nothing more until answered
     bool closing    = false;
     uint32_t outstanding = 0; // requests handed to Go, not yet answered
     std::string fail_msg;     // protocol error to send once earlier answers are queued
@@ -135,6 +156,7 @@ struct Backend {
 
 struct Completion {
     uint64_t conn;
+    uint64_t t_ns; // when vxnf_respond queued it (respond → loop wake latency)
     std::vector<uint8_t> data;
 };
 
@@ -379,6 +401,8 @@ struct vxnf_server {
     std::vector<std::unique_ptr<Loop>> loops;
     std::atomic<bool>     stopped{false};
     std::atomic<uint64_t> iterations{0}, requests{0}, batches{0};
+    Hist hist_wake; // vxnf_respond from a goroutine → the loop appending the answer
+    Hist hist_iter; // one loop iteration: events handled + exec + post
     const char* backend = "poll";
 };
 
@@ -400,6 +424,7 @@ void Loop::run() {
     while (!can_exit()) {
         events.clear();
         be->wait(events);
+        const uint64_t t_iter = now_ns();
         srv->iterations.fetch_add(1, std::memory_order_relaxed);
         for (const Event& e : events) handle(e);
         if (!stopping && stop_requested.load()) start_stopping();
@@ -409,6 +434,7 @@ void Loop::run() {
             exec();
             post();
         } while (!batch.empty());
+        srv->hist_iter.add_ns(now_ns() - t_iter);
     }
     // Connections still flushing when the loop exits: nothing is armed any
     // more (can_exit), so their fds can simply be closed.
@@ -517,7 +543,9 @@ void Loop::on_wake() {
         std::lock_guard<std::mutex> g(cmu);
         drained.swap(completions);
     }
+    const uint64_t t_now = now_ns();
     for (Completion& d : drained) {
+        srv->hist_wake.add_ns(t_now - d.t_ns);
         const uint32_t c = token_idx(d.conn);
         if (c >= conns.size()) continue;
         Conn& k = conns[c];
@@ -667,10 +695,11 @@ void Loop::exec() {
     // may add conns to `touched`, never to `batch`, so batch is stable here.
     while (!batch.empty()) {
         srv->batches.fetch_add(1, std::memory_order_relaxed);
-        vxnfExec(srv->cfg.handle, batch.data(), int(batch.size()));
+        vxnfExec(srv->cfg.handle, batch.data(), int(batch.size()), now_ns());
         batch.clear();
-        // A read answered inline cannot unblock anything (only writes block),
-        // so nothing new can have been parsed: one call drains the batch.
+        // An answer made inside vxnfExec cannot unblock anything (a blocked
+        // connection is waiting on a goroutine), so nothing new can have been
+        // parsed: one call drains the batch.
     }
 }
 
@@ -888,12 +917,33 @@ void vxnf_respond(vxnf_server* s, uint32_t loop, uint64_t conn, const void* data
     }
     Completion comp;
     comp.conn = conn;
+    comp.t_ns = now_ns();
     comp.data.assign(static_cast<const uint8_t*>(data), static_cast<const uint8_t*>(data) + len);
     {
         std::lock_guard<std::mutex> g(l->cmu);
         l->completions.push_back(std::move(comp));
     }
     l->wake();
+}
+
+void vxnf_defer(vxnf_server* s, uint32_t loop, uint64_t conn) {
+    if (loop >= s->loops.size()) return;
+    Loop* l = s->loops[loop].get();
+    if (tl_loop != l) return; // contract: only inside vxnfExec on this loop's thread
+    const uint32_t c = token_idx(conn);
+    if (c >= l->conns.size()) return;
+    Conn& k = l->conns[c];
+    if (!k.live || k.gen != token_gen(conn)) return;
+    // Its requests are already counted in `outstanding`; on_wake unblocks the
+    // connection when the last of them is answered.
+    if (k.outstanding > 0) k.blocked = true;
+}
+
+uint64_t vxnf_now_ns(void) { return now_ns(); }
+
+void vxnf_hist(const vxnf_server* s, int which, uint64_t* out) {
+    const Hist& h = which == VXNF_HIST_WAKE ? s->hist_wake : s->hist_iter;
+    for (int i = 0; i < VXNF_HIST_BUCKETS; ++i) out[i] = h.b[i].load(std::memory_order_relaxed);
 }
 
 uint64_t vxnf_stat_iterations(const vxnf_server* s) { return s->iterations.load(std::memory_order_relaxed); }

@@ -762,6 +762,7 @@ func main() {
 			tlsLn.Close()
 		}
 		nf.Close() // waits for in-flight writes before the engine closes
+		log.Print("[netfront] per-stage latency (log2 buckets):\n" + nf.LatencyReport())
 		log.Println("[server] stopped")
 		return
 	}

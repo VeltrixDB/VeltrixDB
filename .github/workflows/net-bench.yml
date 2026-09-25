@@ -15,11 +15,11 @@ on:
         description: "Seconds per read/mixed workload (batch write runs 10 s)"
         default: "15"
       engines:
-        description: "Storage engines: cgo (C++ io_uring VLog bridge + batch engine) and/or go (VELTRIXDB_DISABLE_CGO_ENGINE=1)"
-        default: "cgo go"
+        description: "Step 1, storage configurations under --net=go (native inline bridge sqpoll map nocgo — see scripts/net-bench.sh)"
+        default: "native bridge sqpoll map nocgo"
       nets:
-        description: "Network front-ends to compare"
-        default: "go uring poll"
+        description: "Step 2, front-ends under engine=native and inline; NET:N = N event loops"
+        default: "go uring poll uring:2 poll:2"
   push:
     branches: [perf/cpp-native-engine]
     paths:
@@ -72,7 +72,7 @@ jobs:
     name: "benchmark: --net=go vs uring vs poll"
     needs: netfront-tests
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -85,21 +85,37 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends liburing-dev gdb
-      # Data on tmpfs: this compares network front-ends, and a shared runner's
+      # Data on tmpfs: this compares front-ends and storage configurations, and a shared runner's
       # disk adds noise larger than the difference being measured. fdatasync
       # still runs, it just lands on RAM (see ci.yml, invariant 40).
       - name: mount tmpfs
         run: |
           sudo mkdir -p /mnt/vx
           sudo mount -t tmpfs -o size=10G,mode=1777 tmpfs /mnt/vx
-      - name: run
+      # Step 1: which part of the C++ storage layer costs what, with the Go
+      # front-end held fixed. The 2026-09-25 run changed three things at once
+      # (io_uring bridge + SQPOLL, batch engine, native index), so its 35%
+      # batch-write gap could not be attributed.
+      - name: "run: storage configurations (--net=go)"
         env:
-          # Each combination runs with the C++ storage layer on (cgo) and off
-          # (go): a server hung mid-benchmark with --net=go, so the storage
-          # engine, not the front-end, is the first suspect.
-          ENGINES: ${{ github.event.inputs.engines || 'cgo go' }}
-          NETS: ${{ github.event.inputs.nets || 'go uring poll' }}
+          TITLE: "Storage configurations, --net=go"
+          ENGINES: ${{ github.event.inputs.engines || 'native bridge sqpoll map nocgo' }}
+          NETS: go
           WINDOWS: ${{ github.event.inputs.windows || '5 1' }}
+          DURATION: ${{ github.event.inputs.duration || '15' }}
+          DATA_ROOT: /mnt/vx
+        run: bash scripts/net-bench.sh
+      # Step 2: front-ends on the default storage configuration, with disk
+      # reads deferred off the loop (native) and inline (inline), and with
+      # fewer loops than CPUs (NET:2) — the C++ loops compete with Go for the
+      # runner's 4 CPUs. Window 5 ms: where the mixed-write tail differed.
+      - name: "run: front-ends (engine=native vs inline)"
+        if: ${{ !cancelled() }}
+        env:
+          TITLE: "Front-ends, default storage"
+          ENGINES: native inline
+          NETS: ${{ github.event.inputs.nets || 'go uring poll uring:2 poll:2' }}
+          WINDOWS: "5"
           DURATION: ${{ github.event.inputs.duration || '15' }}
           DATA_ROOT: /mnt/vx
         run: bash scripts/net-bench.sh

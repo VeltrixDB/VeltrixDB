@@ -10,9 +10,16 @@
 #   mixed         70% GET / 30% PUT, 64 clients, binary protocol
 #
 # Env (defaults in brackets):
-#   NETS        front-ends to compare                 [go uring]
-#   ENGINES     storage engine: cgo (C++ layer on) and/or go
-#               (VELTRIXDB_DISABLE_CGO_ENGINE=1)      [cgo]
+#   NETS        front-ends to compare; NET:N sets N event loops for a C++
+#               front-end (e.g. uring:2), else NET_THREADS   [go uring]
+#   ENGINES     storage configurations to compare     [native]
+#                 native  native C++ index, io_uring VLog bridge off (default build)
+#                 bridge  + VELTRIXDB_URING_BRIDGE=on
+#                 sqpoll  + VELTRIXDB_URING_BRIDGE=sqpoll (the pre-2026-09-25 default)
+#                 inline  native, but the C++ front-end reads disk inline on
+#                         the loop (VELTRIXDB_NET_DEFER_READS=0) — A/B for deferral
+#                 map     VELTRIXDB_INDEX=map, bridge off
+#                 nocgo   VELTRIXDB_DISABLE_CGO_ENGINE=1 (map index, no C++ storage)
 #   WINDOWS     WAL/VLog group-commit windows, ms     [5]
 #   DATA_ROOT   where data dirs go                    [mktemp -d]
 #   DURATION    seconds per read/mixed workload       [15]
@@ -21,6 +28,7 @@
 #   NUM_KEYS    keyspace                              [1000000]
 #   NET_THREADS event loops for C++ front-ends        [nproc]
 #   PORT        server port                           [9700]
+#   TITLE       heading of the printed table
 #
 # Every overwrite appends to the WAL and VLog and nothing reclaims space
 # during a run, so batch write grows the data dir by several GB per second
@@ -34,7 +42,7 @@
 set -euo pipefail
 
 NETS="${NETS:-go uring}"
-ENGINES="${ENGINES:-cgo}"
+ENGINES="${ENGINES:-native}"
 WINDOWS="${WINDOWS:-5}"
 DURATION="${DURATION:-15}"
 BATCH_DURATION="${BATCH_DURATION:-10}"
@@ -118,7 +126,7 @@ diag() {
 fail() {
   echo "::error::net-bench [$tag]: $1"
   diag "$tag"
-  ROWS+=("| $engine | $net | ${w} | FAILED: $1 | | | | | | | | |")
+  ROWS+=("| $engine | $netspec | ${w} | FAILED: $1 | | | | | | | | |")
   FAILED=1
 }
 
@@ -156,19 +164,37 @@ wait_port() {
   return 1
 }
 
+# engine_env ENGINE — the environment for one storage configuration.
+engine_env() {
+  case $1 in
+    native) echo "VELTRIXDB_INDEX=native VELTRIXDB_URING_BRIDGE=off" ;;
+    inline) echo "VELTRIXDB_INDEX=native VELTRIXDB_URING_BRIDGE=off VELTRIXDB_NET_DEFER_READS=0" ;;
+    bridge) echo "VELTRIXDB_INDEX=native VELTRIXDB_URING_BRIDGE=on" ;;
+    sqpoll) echo "VELTRIXDB_INDEX=native VELTRIXDB_URING_BRIDGE=sqpoll" ;;
+    map)    echo "VELTRIXDB_INDEX=map VELTRIXDB_URING_BRIDGE=off" ;;
+    nocgo)  echo "VELTRIXDB_DISABLE_CGO_ENGINE=1" ;;
+    *) echo "unknown engine '$1' (native inline bridge sqpoll map nocgo)" >&2; exit 2 ;;
+  esac
+}
+
+STAGES=()
+
 run_combo() {
-  local data="$DATA_ROOT/vx-$engine-$net-$w"
+  local net=${netspec%%:*} threads=$NET_THREADS
+  [[ $netspec == *:* ]] && threads=${netspec#*:}
+  local data="$DATA_ROOT/vx-$engine-$net-$threads-$w"
   rm -rf "$data"
-  log="$WORK/server-$engine-$net-$w.log"
-  local disable=0
-  [[ $engine == go ]] && disable=1
-  VELTRIXDB_DISABLE_CGO_ENGINE=$disable GOTRACEBACK=all \
+  log="$WORK/server-$engine-$net-$threads-$w.log"
+  local envs
+  envs=$(engine_env "$engine")
+  # shellcheck disable=SC2086 # word-splitting the VAR=value list is intended
+  env $envs GOTRACEBACK=all \
     "$WORK/veltrixdb" -addr "127.0.0.1:$PORT" -metrics-addr "127.0.0.1:0" -data "$data" -cache 2048 \
       --wal-flush-window-ms "$w" --vlog-flush-window-ms "$w" \
-      --net "$net" --net-threads "$NET_THREADS" >"$log" 2>&1 &
+      --net "$net" --net-threads "$threads" >"$log" 2>&1 &
   pid=$!
   if ! wait_port; then fail "server did not start"; rm -rf "$data"; return 1; fi
-  grep -E 'front-end listening|plaintext listening' "$log" || true
+  grep -E 'front-end listening|plaintext listening|io_uring VLog bridge|\[index\] implementation' "$log" || true
 
   rm -f "$WORK"/w.txt "$WORK"/r.txt "$WORK"/m.txt
   local ok=1
@@ -184,10 +210,16 @@ run_combo() {
   fi
 
   if (( ok )); then
-    ROWS+=("| $engine | $net | ${w} | $(metric WRITES Throughput "$WORK/w.txt") | $(metric WRITES P50 "$WORK/w.txt") | $(metric WRITES P99 "$WORK/w.txt") | $(metric READS Throughput "$WORK/r.txt") | $(metric READS P50 "$WORK/r.txt") | $(metric READS P99 "$WORK/r.txt") | $(metric READS P99 "$WORK/m.txt") | $(metric WRITES P50 "$WORK/m.txt") | $(metric WRITES P99 "$WORK/m.txt") |")
+    ROWS+=("| $engine | $netspec | ${w} | $(metric WRITES Throughput "$WORK/w.txt") | $(metric WRITES P50 "$WORK/w.txt") | $(metric WRITES P99 "$WORK/w.txt") | $(metric READS Throughput "$WORK/r.txt") | $(metric READS P50 "$WORK/r.txt") | $(metric READS P99 "$WORK/r.txt") | $(metric READS P99 "$WORK/m.txt") | $(metric WRITES P50 "$WORK/m.txt") | $(metric WRITES P99 "$WORK/m.txt") |")
     kill -INT "$pid" 2>/dev/null || true
     wait "$pid" || true
     pid=""
+    # C++ front-ends log a per-stage latency breakdown at shutdown.
+    if grep -q '\[netfront\] stage=' "$log"; then
+      STAGES+=("[$tag]")
+      while IFS= read -r l; do STAGES+=("  ${l#*\[netfront\] }"); done < <(grep -o '\[netfront\] stage=.*' "$log")
+      printf '%s\n' "${STAGES[@]: -9}"
+    fi
   fi
   echo "── [$tag] data dir $(du -sh "$data" 2>/dev/null | cut -f1), removing"
   rm -rf "$data"
@@ -195,9 +227,9 @@ run_combo() {
 
 ROWS=()
 for engine in $ENGINES; do
-  for net in $NETS; do
+  for netspec in $NETS; do
     for w in $WINDOWS; do
-      tag="engine=$engine net=$net window=${w}ms"
+      tag="engine=$engine net=$netspec window=${w}ms"
       run_combo || true
     done
   done
@@ -205,13 +237,22 @@ done
 
 {
   echo
-  echo "### Network front-end comparison ($(nproc 2>/dev/null || echo ?) CPUs, client on the same host, batch ${BATCH_DURATION}s, read/mixed ${DURATION}s)"
+  echo "### ${TITLE:-Network front-end comparison} ($(nproc 2>/dev/null || echo ?) CPUs, client on the same host, batch ${BATCH_DURATION}s, read/mixed ${DURATION}s)"
   echo
   echo "| storage engine | --net | window ms | batch write keys/s | batch P50 | batch P99 | read ops/s | read P50 | read P99 | mixed read P99 | mixed write P50 | mixed write P99 |"
   echo "|---|---|---|---|---|---|---|---|---|---|---|---|"
   printf '%s\n' "${ROWS[@]}"
   echo
-  echo "storage engine: cgo = C++ storage layer on (io_uring VLog bridge + batch engine, Linux only); go = VELTRIXDB_DISABLE_CGO_ENGINE=1. The index is the native C++ table in both."
+  echo "storage engine: native = native C++ index, io_uring VLog bridge off (the default); inline = native with C++ front-end disk reads on the loop thread (no deferral); bridge / sqpoll = + VELTRIXDB_URING_BRIDGE=on / sqpoll; map = Go map index; nocgo = VELTRIXDB_DISABLE_CGO_ENGINE=1. --net NET:N = N event loops."
+  if (( ${#STAGES[@]} )); then
+    echo
+    echo "<details><summary>C++ front-end per-stage latency (log2 buckets: p99<=8ms means [4, 8) ms)</summary>"
+    echo
+    echo '```'
+    printf '%s\n' "${STAGES[@]}"
+    echo '```'
+    echo "</details>"
+  fi
 } | tee -a "${GITHUB_STEP_SUMMARY:-/dev/null}"
 
 exit "$FAILED"

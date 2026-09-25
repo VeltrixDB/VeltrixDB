@@ -40,3 +40,5 @@ func (*Server) Port() int                       { return 0 }
 func (*Server) IOBackend() string               { return "" }
 func (*Server) Stats() (uint64, uint64, uint64) { return 0, 0, 0 }
 func (*Server) Close()                          {}
+
+func (*Server) LatencyReport() string { return "" }
