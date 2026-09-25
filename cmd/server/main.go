@@ -144,7 +144,7 @@ func main() {
 			"\tOn its own mux, never the metrics port: profiles expose internals.")
 	adminToken := flag.String("admin-token", os.Getenv("VELTRIX_ADMIN_TOKEN"), "Bearer token required for /admin/* endpoints (env VELTRIX_ADMIN_TOKEN).\n\tWhen empty, /admin/* only accepts loopback connections; /metrics, /healthz and /readyz are always unauthenticated.")
 	dataDir := flag.String("data", "./veltrixdb-data", "Single data directory (WAL + segments). Ignored when --data-dirs is set.")
-	dataDirs := flag.String("data-dirs", "", "Comma-separated NVMe mount paths, one per disk.\n\tExample: --data-dirs=/mnt/nvme0,/mnt/nvme1,...,/mnt/nvme7\n\tEach disk gets its own segment writer and compaction goroutine.\n\tWAL is placed on the first disk. Overrides --data when set.")
+	dataDirs := flag.String("data-dirs", "", "Comma-separated NVMe mount paths, one per disk.\n\tExample: --data-dirs=/mnt/nvme0,/mnt/nvme1,...,/mnt/nvme7\n\tEach disk gets its own segment writer and compaction goroutine.\n\tEach disk also gets its own WAL and VLog. Overrides --data when set.")
 	rawVlogs := flag.String("raw-vlogs", "", "(Linux) Comma-separated raw NVMe block-device paths for VLog backing, paired index-by-index with --data-dirs.\n"+
 		"\tExample: --raw-vlogs=/dev/nvme0n1,/dev/nvme1n1,...,/dev/nvme7n1\n"+
 		"\tBypasses XFS for VLog I/O. WAL and segment files still live on --data-dirs.\n"+
