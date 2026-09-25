@@ -12,8 +12,14 @@ on:
         description: "WAL/VLog group-commit windows to compare, ms (space-separated)"
         default: "5 1"
       duration:
-        description: "Seconds per workload"
+        description: "Seconds per read/mixed workload (batch write runs 10 s)"
         default: "15"
+      engines:
+        description: "Storage engines: cgo (C++ io_uring VLog bridge + batch engine) and/or go (VELTRIXDB_DISABLE_CGO_ENGINE=1)"
+        default: "cgo go"
+      nets:
+        description: "Network front-ends to compare"
+        default: "go uring poll"
   push:
     branches: [perf/cpp-native-engine]
     paths:
@@ -73,10 +79,12 @@ jobs:
         with:
           go-version: "1.22"
           cache: true
-      - name: install liburing
+      # gdb: on a hang the script dumps native (C++) thread stacks before
+      # SIGQUIT'ing the server for the Go goroutine dump.
+      - name: install liburing + gdb
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends liburing-dev
+          sudo apt-get install -y --no-install-recommends liburing-dev gdb
       # Data on tmpfs: this compares network front-ends, and a shared runner's
       # disk adds noise larger than the difference being measured. fdatasync
       # still runs, it just lands on RAM (see ci.yml, invariant 40).
@@ -86,7 +94,11 @@ jobs:
           sudo mount -t tmpfs -o size=10G,mode=1777 tmpfs /mnt/vx
       - name: run
         env:
-          NETS: "go uring poll"
+          # Each combination runs with the C++ storage layer on (cgo) and off
+          # (go): a server hung mid-benchmark with --net=go, so the storage
+          # engine, not the front-end, is the first suspect.
+          ENGINES: ${{ github.event.inputs.engines || 'cgo go' }}
+          NETS: ${{ github.event.inputs.nets || 'go uring poll' }}
           WINDOWS: ${{ github.event.inputs.windows || '5 1' }}
           DURATION: ${{ github.event.inputs.duration || '15' }}
           DATA_ROOT: /mnt/vx

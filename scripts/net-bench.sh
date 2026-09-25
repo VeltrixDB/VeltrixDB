@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # net-bench.sh — compare network front-ends (--net) on one machine.
 #
-# For every NET x WINDOW combination: start a fresh server, run the three
+# For every ENGINE x NET x WINDOW combination: start a fresh server, run the three
 # workloads the README's comparison table uses, and print one markdown table
 # (also appended to $GITHUB_STEP_SUMMARY when set).
 #
@@ -11,10 +11,13 @@
 #
 # Env (defaults in brackets):
 #   NETS        front-ends to compare                 [go uring]
+#   ENGINES     storage engine: cgo (C++ layer on) and/or go
+#               (VELTRIXDB_DISABLE_CGO_ENGINE=1)      [cgo]
 #   WINDOWS     WAL/VLog group-commit windows, ms     [5]
 #   DATA_ROOT   where data dirs go                    [mktemp -d]
 #   DURATION    seconds per read/mixed workload       [15]
 #   BATCH_DURATION seconds of batch write             [10]
+#   WATCHDOG_SLACK seconds past a workload's duration before it counts as hung [60]
 #   NUM_KEYS    keyspace                              [1000000]
 #   NET_THREADS event loops for C++ front-ends        [nproc]
 #   PORT        server port                           [9700]
@@ -31,9 +34,11 @@
 set -euo pipefail
 
 NETS="${NETS:-go uring}"
+ENGINES="${ENGINES:-cgo}"
 WINDOWS="${WINDOWS:-5}"
 DURATION="${DURATION:-15}"
 BATCH_DURATION="${BATCH_DURATION:-10}"
+WATCHDOG_SLACK="${WATCHDOG_SLACK:-60}"
 NUM_KEYS="${NUM_KEYS:-1000000}"
 NET_THREADS="${NET_THREADS:-$(nproc 2>/dev/null || sysctl -n hw.ncpu)}"
 PORT="${PORT:-9700}"
@@ -69,75 +74,132 @@ for line in open(path):
 PY
 }
 
-# die MSG — print everything needed to diagnose a failed combination, then exit.
-# Loadtest output goes to files, so without this a failure under `set -e`
-# leaves nothing in the CI log but "exit code 1".
-die() {
-  echo "::error::net-bench: $1"
+# ── One combination = one fresh server + three workloads ────────────────────
+#
+# A failure never aborts the run: it dumps diagnostics, records a FAILED row
+# and moves on, so one CI run shows every combination. The script still exits
+# non-zero at the end if anything failed.
+
+FAILED=0
+
+# diag — everything needed to diagnose a failed combination.
+diag() {
+  echo "::group::diagnostics: $1"
   for f in "$WORK"/w.txt "$WORK"/r.txt "$WORK"/m.txt; do
-    [[ -s "$f" ]] && { echo "──── $(basename "$f")"; tail -n 60 "$f"; }
+    [[ -s "$f" ]] && { echo "──── $(basename "$f") (last 40 lines)"; tail -n 40 "$f"; }
   done
-  if [[ -n "${log:-}" && -f "$log" ]]; then
-    echo "──── server log ($log)"; tail -n 200 "$log"
+  echo "──── df $DATA_ROOT"; df -h "$DATA_ROOT" || true
+  if [[ -n "${pid:-}" ]] && kill -0 "$pid" 2>/dev/null; then
+    # Native stacks first (C++ threads: io_uring bridge, batch engine,
+    # netfront loops) — SIGQUIT below kills the process.
+    if command -v gdb >/dev/null; then
+      echo "──── native thread backtraces (gdb)"
+      sudo -n gdb -p "$pid" -batch -nx -ex "set pagination off" \
+        -ex "thread apply all bt 25" 2>&1 | grep -vE '^\[New LWP|^warning:' | head -n 1500 || true
+    fi
+    echo "──── SIGQUIT → Go goroutine dump"
+    kill -QUIT "$pid" 2>/dev/null || true
+    for _ in $(seq 1 50); do kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
   fi
   if [[ -n "${pid:-}" ]]; then
-    if kill -0 "$pid" 2>/dev/null; then echo "server pid $pid still running"
-    else wait "$pid"; echo "server pid $pid exited with status $?"; fi
+    kill -KILL "$pid" 2>/dev/null || true
+    local st=0; wait "$pid" 2>/dev/null || st=$?
+    echo "server exit status: $st"
   fi
-  echo "──── df $DATA_ROOT"; df -h "$DATA_ROOT" || true
-  command -v dmesg >/dev/null && sudo -n dmesg 2>/dev/null | tail -n 20 || true
-  exit 1
+  if [[ -n "${log:-}" && -f "$log" ]]; then
+    echo "──── server log ($log, last 4000 lines)"; tail -n 4000 "$log"
+  fi
+  command -v dmesg >/dev/null && { sudo -n dmesg 2>/dev/null | tail -n 20 || true; }
+  echo "::endgroup::"
+  pid=""
 }
 
-# lt NAME ARGS… — run one loadtest workload into $WORK/NAME.txt; fail loudly.
+# fail MSG — mark this combination failed; the caller returns 1.
+fail() {
+  echo "::error::net-bench [$tag]: $1"
+  diag "$tag"
+  ROWS+=("| $engine | $net | ${w} | FAILED: $1 | | | | | | | | |")
+  FAILED=1
+}
+
+# lt NAME LIMIT_S ARGS… — run one loadtest workload into $WORK/NAME.txt.
+# LIMIT_S is a watchdog: loadtest has no request timeout, so a server that
+# stops answering would otherwise hang the job until the Actions timeout
+# (which is what happened: 45 min, no output).
 lt() {
-  local name=$1; shift
-  local rc=0
-  "${LT[@]}" "$@" >"$WORK/$name.txt" 2>&1 || rc=$?
-  (( rc == 0 )) || die "net=$net window=${w}ms: loadtest '$name' exited $rc"
-  kill -0 "$pid" 2>/dev/null || die "net=$net window=${w}ms: server died during '$name'"
+  local name=$1 limit=$2; shift 2
+  "${LT[@]}" "$@" >"$WORK/$name.txt" 2>&1 &
+  local lpid=$! waited=0
+  while kill -0 "$lpid" 2>/dev/null; do
+    if (( waited >= limit * 10 )); then
+      echo "── [$tag] '$name' still running after ${limit}s — server looks hung"
+      fail "'$name' hung (>${limit}s)"
+      kill -KILL "$lpid" 2>/dev/null || true; wait "$lpid" 2>/dev/null || true
+      return 1
+    fi
+    sleep 0.1; waited=$((waited + 1))
+  done
+  local rc=0; wait "$lpid" || rc=$?
+  if (( rc != 0 )); then fail "loadtest '$name' exited $rc"; return 1; fi
+  if ! kill -0 "$pid" 2>/dev/null; then fail "server died during '$name'"; return 1; fi
   if grep -qE 'Errors: +[1-9]' "$WORK/$name.txt"; then
-    die "net=$net window=${w}ms: loadtest '$name' reported errors"
+    fail "loadtest '$name' reported errors"; return 1
   fi
 }
 
 wait_port() {
   for _ in $(seq 1 100); do
     (exec 3<>"/dev/tcp/127.0.0.1/$PORT") 2>/dev/null && return 0
+    kill -0 "$pid" 2>/dev/null || return 1
     sleep 0.1
   done
-  echo "server did not open port $PORT" >&2
   return 1
 }
 
-ROWS=()
-for net in $NETS; do
-  for w in $WINDOWS; do
-    data="$DATA_ROOT/vx-$net-$w"
-    rm -rf "$data"
-    log="$WORK/server-$net-$w.log"
+run_combo() {
+  local data="$DATA_ROOT/vx-$engine-$net-$w"
+  rm -rf "$data"
+  log="$WORK/server-$engine-$net-$w.log"
+  local disable=0
+  [[ $engine == go ]] && disable=1
+  VELTRIXDB_DISABLE_CGO_ENGINE=$disable GOTRACEBACK=all \
     "$WORK/veltrixdb" -addr "127.0.0.1:$PORT" -metrics-addr "127.0.0.1:0" -data "$data" -cache 2048 \
       --wal-flush-window-ms "$w" --vlog-flush-window-ms "$w" \
       --net "$net" --net-threads "$NET_THREADS" >"$log" 2>&1 &
-    pid=$!
-    wait_port || die "net=$net window=${w}ms: server did not start"
-    grep -E 'front-end listening|plaintext listening' "$log" || true
+  pid=$!
+  if ! wait_port; then fail "server did not start"; rm -rf "$data"; return 1; fi
+  grep -E 'front-end listening|plaintext listening' "$log" || true
 
-    rm -f "$WORK"/w.txt "$WORK"/r.txt "$WORK"/m.txt
-    echo "── net=$net window=${w}ms: batch write"
-    lt w --duration "$BATCH_DURATION" --mode write --concurrency 8 --batch-size 1024 --warmup 2
-    echo "── net=$net window=${w}ms: read"
-    lt r --duration "$DURATION" --mode read --proto binary --concurrency 64
-    echo "── net=$net window=${w}ms: mixed"
-    lt m --duration "$DURATION" --mode mixed --proto binary --concurrency 64 --read-ratio 0.7
+  rm -f "$WORK"/w.txt "$WORK"/r.txt "$WORK"/m.txt
+  local ok=1
+  echo "── [$tag] batch write"
+  lt w $((BATCH_DURATION + 2 + WATCHDOG_SLACK)) --duration "$BATCH_DURATION" --mode write --concurrency 8 --batch-size 1024 --warmup 2 || ok=0
+  if (( ok )); then
+    echo "── [$tag] read"
+    lt r $((DURATION + WATCHDOG_SLACK)) --duration "$DURATION" --mode read --proto binary --concurrency 64 || ok=0
+  fi
+  if (( ok )); then
+    echo "── [$tag] mixed"
+    lt m $((DURATION + 5 + WATCHDOG_SLACK)) --duration "$DURATION" --mode mixed --proto binary --concurrency 64 --read-ratio 0.7 || ok=0
+  fi
 
-    ROWS+=("| $net | ${w} | $(metric WRITES Throughput "$WORK/w.txt") | $(metric WRITES P50 "$WORK/w.txt") | $(metric WRITES P99 "$WORK/w.txt") | $(metric READS Throughput "$WORK/r.txt") | $(metric READS P50 "$WORK/r.txt") | $(metric READS P99 "$WORK/r.txt") | $(metric READS P99 "$WORK/m.txt") | $(metric WRITES P50 "$WORK/m.txt") | $(metric WRITES P99 "$WORK/m.txt") |")
-
+  if (( ok )); then
+    ROWS+=("| $engine | $net | ${w} | $(metric WRITES Throughput "$WORK/w.txt") | $(metric WRITES P50 "$WORK/w.txt") | $(metric WRITES P99 "$WORK/w.txt") | $(metric READS Throughput "$WORK/r.txt") | $(metric READS P50 "$WORK/r.txt") | $(metric READS P99 "$WORK/r.txt") | $(metric READS P99 "$WORK/m.txt") | $(metric WRITES P50 "$WORK/m.txt") | $(metric WRITES P99 "$WORK/m.txt") |")
     kill -INT "$pid" 2>/dev/null || true
     wait "$pid" || true
     pid=""
-    echo "── net=$net window=${w}ms: data dir $(du -sh "$data" | cut -f1), removing"
-    rm -rf "$data"
+  fi
+  echo "── [$tag] data dir $(du -sh "$data" 2>/dev/null | cut -f1), removing"
+  rm -rf "$data"
+}
+
+ROWS=()
+for engine in $ENGINES; do
+  for net in $NETS; do
+    for w in $WINDOWS; do
+      tag="engine=$engine net=$net window=${w}ms"
+      run_combo || true
+    done
   done
 done
 
@@ -145,7 +207,11 @@ done
   echo
   echo "### Network front-end comparison ($(nproc 2>/dev/null || echo ?) CPUs, client on the same host, batch ${BATCH_DURATION}s, read/mixed ${DURATION}s)"
   echo
-  echo "| --net | window ms | batch write keys/s | batch P50 | batch P99 | read ops/s | read P50 | read P99 | mixed read P99 | mixed write P50 | mixed write P99 |"
-  echo "|---|---|---|---|---|---|---|---|---|---|---|"
+  echo "| storage engine | --net | window ms | batch write keys/s | batch P50 | batch P99 | read ops/s | read P50 | read P99 | mixed read P99 | mixed write P50 | mixed write P99 |"
+  echo "|---|---|---|---|---|---|---|---|---|---|---|---|"
   printf '%s\n' "${ROWS[@]}"
+  echo
+  echo "storage engine: cgo = C++ storage layer on (io_uring VLog bridge + batch engine, Linux only); go = VELTRIXDB_DISABLE_CGO_ENGINE=1. The index is the native C++ table in both."
 } | tee -a "${GITHUB_STEP_SUMMARY:-/dev/null}"
+
+exit "$FAILED"
