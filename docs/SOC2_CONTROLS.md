@@ -9,7 +9,7 @@ This document maps VeltrixDB's built-in capabilities to the SOC 2 Trust Service 
 | CC6.7 | Encrypted data at rest | AES-256-GCM at rest (`EncryptionEnabled=true`); key sourced from `VELTRIXDB_ENCRYPTION_KEY` env or `EncryptionKeyPath` file | Manage the master key in KMS / sealed secret; never commit key material to source. PITR archive segments hold values decrypted — encrypt and access-restrict the archive location |
 | CC6.8 | Anti-malware / image hygiene | Single-binary distribution; `Dockerfile` runtime stage is `gcr.io/distroless/cc-debian12` (glibc, no shell) | Scan published images (Trivy / Snyk); pin SHA256 in Helm chart |
 | CC7.1 | Detection of vulnerabilities | `govulncheck` runs in CI (`.github/workflows/ci.yml`) | Triage vulncheck output weekly; subscribe to Go security mailing list |
-| CC7.2 | Monitoring of components | Prometheus metrics (130+ series), `/healthz` and `/readyz` endpoints, `PrometheusRule` for 22 default alerts (write/read latency, GC, scrub corruption, slow disk, replication, cluster) | Run a Prometheus / Alertmanager stack with paging integration; review alert noise quarterly |
+| CC7.2 | Monitoring of components | Prometheus metrics (~105 families: storage, VLog, cache, cluster, replication, failure detector, plus runtime / process / system / disk from `metrics/hardware.go`), `/healthz` and `/readyz` endpoints, a `PrometheusRule` with 10 default alerts in `monitoring/prometheus-rules.yaml` (write throttle, GC stalled, VLog read errors, scrub corruption, cache hit rate, read P99, node failure, cluster shrank, disk usage, restart) | Run a Prometheus / Alertmanager stack with paging integration; review alert noise quarterly |
 | CC7.3 | Anomaly identification | Slow-op trace ring buffer at `/traces` (50 ms threshold); per-disk latency EWMA; scrub corruption counter | Define normal-baseline; alert on deviations |
 | CC7.4 | Security incident response | DR runbook (`docs/DR_RUNBOOK.md`) | Rehearse the runbook quarterly; capture post-mortems |
 | CC7.5 | Recovery from incidents | Backup via VolumeSnapshot or `veltrixdb-backup` (full, incremental, PITR); replica resync; raw-mode crash recovery (Invariant 27); WAL replay | Test restore at least twice a year; maintain quorum across availability zones |
@@ -27,7 +27,7 @@ This document maps VeltrixDB's built-in capabilities to the SOC 2 Trust Service 
 
 For an auditor in the room, the operator should be able to produce:
 
-1. **Encryption proof** — `kubectl exec POD -- env | grep VELTRIXDB_ENCRYPTION_KEY` (key value redacted in output) and a `kubectl describe secret veltrixdb-encryption` showing the secret exists.
+1. **Encryption proof** — `kubectl get pod POD -o jsonpath='{.spec.containers[*].env[?(@.name=="VELTRIXDB_ENCRYPTION_KEY")]}'` (shows the Secret reference, not the key; the image is distroless, so `kubectl exec … env` does not work) and a `kubectl describe secret veltrixdb-encryption` showing the secret exists.
 2. **Access control proof** — `cat /var/lib/veltrixdb/auth.json` showing roles + users, and a sample successful + failed login traces from server logs.
 3. **TLS proof** — `openssl s_client -connect veltrixdb.svc:9443 -showcerts` showing the chain. mTLS proof: an attempt without a client cert is rejected.
 4. **Backup proof** — `kubectl get volumesnapshot -n veltrixdb` listing snapshots within the last 7 days.

@@ -22,7 +22,7 @@ An earlier internal 3-node GKE run reached 7.2M reads/s / 1.8M writes/s, but it 
 
 **How it deploys**
 
-There's a Kubernetes Operator with a CRD, a Helm chart, and 22 Prometheus alerts baked in. Replication uses Raft. Storage is encrypted with AES-256-GCM. RBAC and audit logging are included. CDC is supported for streaming changes downstream.
+There's a Kubernetes Operator with a CRD, a Helm chart, and Prometheus alerts baked in. Replication uses Raft. Storage is encrypted with AES-256-GCM. RBAC and audit logging are included. CDC is supported for streaming changes downstream.
 
 Client SDKs: Go, Java, Python, Node.js, Rust, C++.
 

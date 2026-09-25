@@ -19,7 +19,7 @@ Benchmark results (YCSB 0.17.0, single AWS EC2 node with 4 NVMe disks, 100M keys
 → Zero errors and zero value-log GC emergency runs across 100M operations  
 → ~160 GB storage for 1B × 128B values
 
-We've also built the operational layer we wish existed: a Kubernetes Operator with auto-resharding and self-healing, a Helm chart with 22 Prometheus alerting rules, a cloud-agnostic NVMe provisioner for GKE/EKS/AKS, and client SDKs for Go, Java, Python, Node.js, Rust, and C++.
+We've also built the operational layer we wish existed: a Kubernetes Operator with auto-resharding and self-healing, a Helm chart with Prometheus alerting rules, a cloud-agnostic NVMe provisioner for GKE/EKS/AKS, and client SDKs for Go, Java, Python, Node.js, Rust, and C++.
 
 What's NOT ready: Redis protocol compatibility (RESP is on the roadmap) and a managed cloud offering. We'd rather ship an honest v1 than oversell it.
 

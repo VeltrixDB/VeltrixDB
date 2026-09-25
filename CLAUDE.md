@@ -425,9 +425,9 @@ When reading load test output or Prometheus metrics, keep these in mind:
 
 **`veltrixdb_cache_misses_total` includes key-not-found.** In a load test where `--num-keys=1000000` and only 30% of operations are writes, the keyspace is ~36% populated by end of test. ~78% of all GETs hit keys that don't exist → all counted as misses. To measure true cache behavior, use `--num-keys=100000` or run a dedicated write phase before reading.
 
-**`veltrixdb_reads_total` was zero before the fix.** `Get()` in `storage/engine.go` called `se.metrics.Reads.Add(1)` — wait, it was **missing** this call. Fixed: the line is now the first statement in `Get()`. If you see `reads_total=0` with active traffic, check you're running the patched code.
+**`veltrixdb_storage_reads_total` was zero before the fix.** `Get()` in `storage/engine.go` called `se.metrics.Reads.Add(1)` — wait, it was **missing** this call. Fixed: the line is now the first statement in `Get()`. If you see `reads_total=0` with active traffic, check you're running the patched code.
 
-**`veltrixdb_fd_failed_nodes` noise in single-node mode.** If this counter ticks up continuously despite no actual failures, `SetLocalNode` was not called before `fd.Start()`. See Invariant 11.
+**`veltrixdb_failure_detector_nodes_failed_total` noise in single-node mode.** If this counter ticks up continuously despite no actual failures, `SetLocalNode` was not called before `fd.Start()`. See Invariant 11.
 
 **Admission control activates at read EWMA > 20 ms; watch `veltrixdb_storage_write_admission_throttles_total`.** When read P99 EWMA crosses 20 ms, every `Put()` sleeps 2 ms before submitting to WAL+VLog, and the VLog compactor halts. If this counter climbs rapidly, read latency is high enough to impair writes — diagnose with `veltrixdb_storage_read_latency_seconds` histogram. GC bandwidth throttling (60 MB/s cap) kicks in earlier at 15 ms EWMA to reduce pressure before full pause.
 

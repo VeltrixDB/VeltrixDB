@@ -72,7 +72,7 @@ Production-grade from day one:
 
 • Kubernetes Operator with a CRD
 • Helm chart
-• 22 Prometheus alerts pre-configured
+• Prometheus alerts pre-configured
 • AES-256-GCM encryption
 • RBAC + audit logging
 • CDC for streaming changes downstream

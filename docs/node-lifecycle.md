@@ -353,10 +353,13 @@ Rolling back a node that was not stopped cleanly after step 1 leaves binary reco
 
 | Metric | Meaning |
 |--------|---------|
-| `veltrixdb_fd_suspected_nodes` | Nodes currently in SUSPECT state |
-| `veltrixdb_fd_failed_nodes` | Nodes currently in FAILED state |
-| `veltrixdb_fd_false_positives_total` | Nodes suspected then recovered (flapping) |
+| `veltrixdb_failure_detector_nodes_failed_total` | Counter: nodes marked FAILED by the heartbeat monitor |
+| `veltrixdb_failure_detector_nodes_recovered_total` | Counter: nodes that recovered after being marked FAILED. Failed minus recovered over a window = nodes still down |
+| `veltrixdb_failure_detector_false_positives_total` | Nodes suspected then recovered (flapping) |
+| `veltrixdb_cluster_nodes_total` | Registered cluster nodes |
 | `veltrixdb_cluster_partition_migrations_total` | Data migration batches completed |
 | `veltrixdb_cluster_rebalances_total` | Partition map rebalances triggered |
-| `veltrixdb_raft_term` | Current Raft term (increments on every election) |
-| `veltrixdb_raft_leader_id` | Which node is the current leader |
+
+There is no gauge for nodes currently in SUSPECT state, and the Raft term and
+leader are not Prometheus metrics: read them from `GET /admin/cluster`
+(`term`, `leader_id`) or `veltrix nodes`.

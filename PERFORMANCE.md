@@ -161,13 +161,13 @@ throttled progressively rather than stopped dead.
 ## Prometheus Queries
 
 ```promql
-rate(veltrixdb_writes_total[1m])                                    # write throughput
-rate(veltrixdb_reads_total[1m])                                     # read throughput
+rate(veltrixdb_storage_writes_total[1m])                                    # write throughput
+rate(veltrixdb_storage_reads_total[1m])                                     # read throughput
 
 rate(veltrixdb_cache_hits_total[5m]) /
   (rate(veltrixdb_cache_hits_total[5m]) + rate(veltrixdb_cache_misses_total[5m]))   # hit ratio
 
-rate(veltrixdb_writes_total[1m]) / rate(veltrixdb_wal_flushes_total[1m])            # WAL amortisation
+rate(veltrixdb_storage_writes_total[1m]) / rate(veltrixdb_storage_wal_flushes_total[1m])            # WAL amortisation
 
 histogram_quantile(0.99, rate(veltrixdb_storage_read_latency_seconds_bucket[5m]))  # P99 read
 ```

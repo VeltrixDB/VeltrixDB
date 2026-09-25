@@ -1484,7 +1484,7 @@
       "gridPos": { "h": 4, "w": 4, "x": 20, "y": 165 },
       "id": 76,
       "options": { "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
-      "targets": [{ "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "rate(veltrixdb_runtime_gc_pause_total_seconds_total{node=~\"$node\"}[1m])", "legendFormat": "GC Pause/s — {{node}}", "refId": "A" }],
+      "targets": [{ "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "rate(veltrixdb_runtime_gc_pause_total_seconds{node=~\"$node\"}[1m])", "legendFormat": "GC Pause/s — {{node}}", "refId": "A" }],
       "title": "GC Pause Rate (s/s)",
       "type": "timeseries"
     },

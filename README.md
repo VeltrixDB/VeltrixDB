@@ -181,7 +181,7 @@ kubectl apply -f VeltrixDB-Kubernetes-Operator/config/manager/manager.yaml
 - `StorageClass` for local NVMe PersistentVolumes
 - `ServiceMonitor` for Prometheus scraping
 - `PodDisruptionBudget` (`minAvailable: 2`) for safe rolling upgrades
-- 22 `PrometheusRule` alerts (slow disk, GC emergency, corruption detected, replication lag)
+- A `PrometheusRule` — the repo's copy, `monitoring/prometheus-rules.yaml`, has 10 alerts (write throttle, GC stalled, VLog read errors, scrub corruption, low cache hit rate, read P99, node failed, cluster shrank, disk full, restart). The chart is published separately; check its own rules for anything beyond these.
 
 > **GKE requirement**: create node pools with `--local-ssd-interface=NVME`. Without it, GKE merges all SSDs into one RAID-0 device and you lose the parallel I/O benefit.
 
@@ -330,7 +330,7 @@ Key metrics to watch:
 
 | Metric | Healthy value |
 |--------|---------------|
-| `veltrixdb_writes_total` / `reads_total` | growing |
+| `veltrixdb_storage_writes_total` / `reads_total` | growing |
 | `veltrixdb_cache_hits_total` / `misses_total` | hit rate > 90% |
 | `veltrixdb_storage_write_admission_throttles_total` | 0 |
 | `veltrixdb_vlog_garbage_ratio` | < 0.30 |

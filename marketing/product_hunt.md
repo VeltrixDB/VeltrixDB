@@ -16,7 +16,7 @@ The architecture that makes this work: WiscKey KV-separation, where values are a
 
 Across those 100M operations there were zero errors and zero value-log GC emergency runs: space reclamation kept up with the write rate instead of falling behind. On cgo builds the key index lives off the Go heap; with 5M keys a full Go GC takes 0.27 ms instead of 21 ms.
 
-Production deployment is first-class: Kubernetes Operator with a CRD, Helm chart, 22 Prometheus alerts pre-configured, Raft replication, AES-256-GCM encryption, RBAC, audit logging, and CDC support. Six client SDKs cover Go, Java, Python, Node.js, Rust, and C++.
+Production deployment is first-class: Kubernetes Operator with a CRD, Helm chart, Prometheus alerts pre-configured, Raft replication, AES-256-GCM encryption, RBAC, audit logging, and CDC support. Six client SDKs cover Go, Java, Python, Node.js, Rust, and C++.
 
 What it doesn't do yet: no RESP protocol (can't drop-in replace Redis without code changes) and no managed cloud offering. These are real limitations worth knowing before you evaluate it.
 
