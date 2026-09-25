@@ -9,6 +9,85 @@ Types: `Added`, `Changed`, `Fixed`, `Performance`, `Breaking`
 
 ## [Unreleased]
 
+### Added
+
+- **Opt-in C++ network front-end, `--net=cpp|uring|poll`** (`cpp` picks
+  io_uring when available, else poll; `--net-threads` loops, default one per
+  core). It serves the binary PUT GET DEL PING MPUT MGET commands, and each
+  loop hands every request that arrived in one iteration to the engine in a
+  single call. Standalone mode only, and it refuses `--auth-config`; text
+  protocol, AUTH, TLS and the extended binary commands stay on `--net=go`. A
+  GET or MGET that needs a disk read is answered from a goroutine instead of
+  the loop thread, so a VLog read does not stall the other connections on the
+  loop (`VELTRIXDB_NET_DEFER_READS=0` turns this off). At shutdown the server
+  logs a per-stage latency breakdown of the front-end. Experimental and not
+  faster overall: on the 4-CPU CI runner (before reads were deferred) it
+  lowered read P50 but had a worse read P99 and ~12% lower batch-write
+  throughput than `--net=go`.
+- **`scripts/net-bench.sh` and the `Net front-end` workflow** compare
+  front-ends (`NETS`, with `NET:N` loops) and storage configurations
+  (`ENGINES`: `native` `inline` `bridge` `sqpoll` `map` `nocgo`) per
+  group-commit window, with a watchdog that dumps stacks on a hang. See
+  BENCHMARKING.md.
+- New `StorageEngine.GetNoIO` / `GetAfterNoIO`: a read that stops before disk
+  and reports whether it needs disk.
+- `loadtest --proto=binary` runs unbatched workers on the binary protocol.
+  The C++ front-end requires it.
+- `--pprof-addr` serves CPU, heap and trace profiles on a separate listener.
+  It is off by default.
+- **`cmd/veltrix-repair`** — offline repair for value-transform metadata lost
+  by pre-fix builds. `--scan` is read-only and reports what is affected;
+  `--repair` corrects the index and writes a corrected checkpoint, after
+  backing up each `wal.log`. The repair is exact rather than heuristic:
+  `IndexEntry.CRC32C` is the CRC of the *plaintext* and survived the bug, so
+  the tool enumerates the four possible interpretations of each on-disk blob
+  and accepts only the one that reproduces that CRC. Anything else is reported
+  and left untouched. Idempotent; safe to re-run.
+
+### Changed
+
+- **The io_uring VLog write bridge is off by default** (`VELTRIXDB_URING_BRIDGE`:
+  `off` | `on` | `sqpoll`). It used to start on every Linux cgo build with
+  SQPOLL. A VLog batch is already one `pwrite` plus one `fdatasync`, so the
+  bridge saves at most one syscall per batch. On the 4-CPU CI runner, the C++
+  storage layer (bridge with SQPOLL, batch engine and native index, all on)
+  measured 1.12M keys/s for batch writes against 1.77M with all three off.
+- The Docker image is now built with `CGO_ENABLED=1`, so it carries the
+  native index (hosts need `vm.max_map_count` ≥ 262144); the io_uring bridge
+  in it stays opt-in, and Kubernetes' RuntimeDefault seccomp profile blocks
+  it anyway (it falls back to pwrite). Build with `--build-arg CGO_ENABLED=0`
+  for the old static image. cgo builds use `-march=x86-64-v2` instead of
+  `-march=native`.
+- **`MultiPut` refreshes the cache write-around.** It updates keys already in
+  the cache (`PutIfPresent`) instead of inserting every key, so bulk writes no
+  longer evict the read working set; single `Put` stays write-through. A
+  bulk-written key's first read is now a cache miss.
+- **Text WAL record format is now 10 fields** (the legacy encoding, still read
+  and written under `--wal-format=text`; binary records are now the default,
+  see Fixed):
+  `timestamp|tombstone|key|valueLen|crc32hex|version|vlogOffset|packed|diskLen|xflags`.
+  `valueLen` remains the plaintext length; `diskLen` is the on-disk blob length
+  after compression and encryption; `xflags` (hex) carries
+  `FlagCompressed|FlagEncrypted`. Forward-compatible: 6-, 7- and 8-field
+  records still replay, defaulting `diskLen` to `valueLen` and `xflags` to 0.
+- `VLogBatcher.Stage` returns `(offset int64, packed bool, err error)`.
+  Callers must propagate `packed` to `FlagPacked` verbatim rather than
+  recomputing or assuming it.
+
+- **`StorageConfig.NumShards` is now marked deprecated and warns when set.**
+  It had no effect — the index shard count is the compile-time `numShards`
+  (8192) — but `hardware/config.go` computed it from CPU count and callers set
+  it to 1024, all of which read as working tuning. The dead computation and the
+  no-op assignments are gone, `NewStorageEngine` logs a warning if the field is
+  set to anything other than 8192, and the auto-config log line no longer
+  reports a shard count it did not choose.
+
+- **`cpp/src/vlog.cpp` and `cpp/src/ebpf_gc_throttle.cpp` are now in the CMake
+  build.** They were absent from `cpp/CMakeLists.txt` and from every cgo shim,
+  so they were compiled by nothing while the docs advertised `vlog.cpp` as a
+  performance hot path. Both wrap their body in `#ifdef __linux__`. Note this
+  gives them compile coverage only — neither has a Go call site.
+
 ### Fixed
 
 - **Crash replay no longer drops writes after a key containing `|` or a
@@ -25,81 +104,6 @@ Types: `Added`, `Changed`, `Fixed`, `Performance`, `Breaking`
   completions. A short write is no longer counted as success.
 - `size()` / `index_size_keys` no longer undercount keys created by SETNX, INCR
   or CAS.
-
-### Performance
-
-- **Batch writes are 2.4x faster on overwrites.** An overwrite of a live key
-  no longer searches the ordered index for a key that is already in it.
-  Server, 8 clients × 1024-key MPUT over a 1M-key space: 1.45M → 3.54M keys/s,
-  P99 9.6 → 4.2 ms.
-- **Opt-in C++ network front-end, `--net=cpp`** (io_uring on Linux). It serves
-  the binary PUT GET DEL PING MPUT MGET commands with one event loop per core,
-  and each loop hands every request that arrived in one iteration to the
-  engine in a single call. It runs in standalone mode without RBAC. Compare it
-  with `scripts/net-bench.sh` or the `Net front-end` workflow. A GET or MGET
-  that needs a disk read is answered from a goroutine instead of the loop
-  thread, so a VLog read does not stall the other connections on the loop
-  (`VELTRIXDB_NET_DEFER_READS=0` turns this off). At shutdown the server
-  logs a per-stage latency breakdown of the front-end.
-- **Off-heap native index on cgo builds.** With 5M keys, full GC takes
-  0.27 ms (21 ms before) and settled RSS is 142 B/key (168 before). Each
-  cache-miss lookup costs ~19 ns more. Opt out with `VELTRIXDB_INDEX=map`.
-  Needs `vm.max_map_count` ≥ 262144 (`scripts/sysctl.conf`).
-- Binary WAL: encoding is 4x faster per record and replay is 2.5x faster.
-
-### Changed
-
-- **The io_uring VLog write bridge is off by default** (`VELTRIXDB_URING_BRIDGE`:
-  `off` | `on` | `sqpoll`). It used to start on every Linux cgo build with
-  SQPOLL. A VLog batch is already one `pwrite` plus one `fdatasync`, so the
-  bridge saves at most one syscall per batch. On the 4-CPU CI runner, the C++
-  storage layer (bridge with SQPOLL, batch engine and native index, all on)
-  measured 1.12M keys/s for batch writes against 1.77M with all three off.
-- New `StorageEngine.GetNoIO` / `GetAfterNoIO`: a read that stops before disk
-  and reports whether it needs disk.
-- `loadtest --proto=binary` runs unbatched workers on the binary protocol.
-  The C++ front-end requires it.
-- `--pprof-addr` serves CPU, heap and trace profiles on a separate listener.
-  It is off by default.
-- The Docker image is now built with `CGO_ENABLED=1`. Build with
-  `--build-arg CGO_ENABLED=0` for the old static image. cgo builds use
-  `-march=x86-64-v2` instead of `-march=native`.
-
-
-### Performance
-
-- **Batch write latency cut ~2x: the WAL flusher now issues one `write(2)` per
-  group-commit batch instead of one per entry.** Group commit amortised the
-  `fdatasync` but not the writes, so a 1024-key `MultiPut` from 8 concurrent
-  clients cost ~8 K write syscalls before a single sync.
-
-  | | before | after | |
-  |---|---|---|---|
-  | `loadtest --batch-size=1024 --concurrency=8` P50 | 13.24 ms | **7.44 ms** | |
-  | same, P99 | 23.67 ms | **14.04 ms** | **-41%** |
-  | same, throughput | 596,819 ops/s | **1,065,175 ops/s** | **1.79x** |
-  | `MultiPut_Concurrent/workers=8` | 12.56 ms | **4.25 ms** | **-66%** |
-  | `MultiPut_1024` | 3.44 ms | 2.53 ms | -26% |
-  | `Put` (single key) | 78.4 us | 77.0 us | unchanged |
-
-  benchstat, n=6, p=0.002 on every changed row.
-
-  **The flush window was not the cause**, contrary to the obvious reading.
-  Sweeping `--wal-flush-window-ms` across 0 / 1 / 5 / 15 / 30 ms moved batch
-  P50 by ~1% — turning group commit off entirely did not help. Profiling
-  showed `syscall.write` at 27% of CPU and `syscall.Fsync` at 1.2%.
-
-  **Durability is unchanged**: identical bytes, identical order, still exactly
-  one `fdatasync` covering the batch before any waiter is ACKed. Verified by
-  SIGKILLing a server after 3000 ACKed writes and restarting — `missing=0
-  wrong=0`, with the WAL intact at 190 KB (i.e. the replay path really ran).
-
-- **One fewer allocation per WAL entry.** `serialize` borrowed a scratch buffer
-  and then allocated a second one to return; it now builds directly into a
-  pooled buffer that the flusher recycles. `MultiPut_1024` allocations -11%.
-
-### Fixed
-
 - **Test bloom filters allocated 256 MB per engine, taking the suite to
   8 GB peak RSS and killing CI.** Bloom memory is
   `BloomFilterShardBits / 8 × 8192`, allocated eagerly per engine.
@@ -126,27 +130,6 @@ Types: `Added`, `Changed`, `Fixed`, `Performance`, `Breaking`
   work dir under `TMPDIR`, so a job-level value failed every matrix leg at
   setup with `creating work dir: stat /mnt/veltrix-tmp: no such file or
   directory`.
-
-### Changed
-
-- **Documentation corrected against the code, repo-wide.** Several docs had
-  drifted far enough to mislead an operator:
-
-  | Claim | Reality |
-  |---|---|
-  | `F_FULLFSYNC ≈ 7–10 ms` on macOS (7 sites, incl. `veltrix info` output) | Never called. Plain `fsync(2)`, **0.020 ms**, drive cache only — macOS builds are **not power-loss safe** |
-  | Admission control fires at 3 / 4 / 2 ms (`PERFORMANCE.md`) | **15 / 20 / 10 ms** |
-  | Flush window default 10 ms (`README.md`, `PERFORMANCE.md`, `veltrix info`) | **15 ms** |
-  | 1024 shards, `& 0x3FF` (`docs/storage.md`, `IMPLEMENTATION_GUIDE.md`) | **8192**, `& 0x1FFF` |
-  | 7-field WAL (`docs/storage.md`, `docs/node-lifecycle.md`, `CLAUDE.md` file map) | **10-field** — `CLAUDE.md` contradicted its own invariant 21 |
-  | Cache hit ~220 ns (`README.md`) | **~92 ns** since the cache was sharded |
-
-- **`ARCHITECTURE.md` now carries real diagrams** (Mermaid, rendered by
-  GitHub): system overview with the C++ boundary drawn honestly, a write-path
-  sequence showing the concurrent WAL/VLog fdatasync, a read-path flow, and
-  the three-way hash split. Plus a new "Durability" section documenting the
-  macOS fsync caveat above.
-
 
 - **The default bloom-filter budget allocated 4 GB per engine, 8× its
   documented intent.** `BloomFilterShardBits: 1 << 22` carried the comment
@@ -220,33 +203,56 @@ Types: `Added`, `Changed`, `Fixed`, `Performance`, `Breaking`
   fired late. `Stage` now returns whether it packed, and both call sites
   propagate that value.
 
-### Changed
-
-- **WAL record format is now 10 fields**:
-  `timestamp|tombstone|key|valueLen|crc32hex|version|vlogOffset|packed|diskLen|xflags`.
-  `valueLen` remains the plaintext length; `diskLen` is the on-disk blob length
-  after compression and encryption; `xflags` (hex) carries
-  `FlagCompressed|FlagEncrypted`. Forward-compatible: 6-, 7- and 8-field
-  records still replay, defaulting `diskLen` to `valueLen` and `xflags` to 0.
-- `VLogBatcher.Stage` returns `(offset int64, packed bool, err error)`.
-  Callers must propagate `packed` to `FlagPacked` verbatim rather than
-  recomputing or assuming it.
-
-- **`StorageConfig.NumShards` is now marked deprecated and warns when set.**
-  It had no effect — the index shard count is the compile-time `numShards`
-  (8192) — but `hardware/config.go` computed it from CPU count and callers set
-  it to 1024, all of which read as working tuning. The dead computation and the
-  no-op assignments are gone, `NewStorageEngine` logs a warning if the field is
-  set to anything other than 8192, and the auto-config log line no longer
-  reports a shard count it did not choose.
-
-- **`cpp/src/vlog.cpp` and `cpp/src/ebpf_gc_throttle.cpp` are now in the CMake
-  build.** They were absent from `cpp/CMakeLists.txt` and from every cgo shim,
-  so they were compiled by nothing while the docs advertised `vlog.cpp` as a
-  performance hot path. Both wrap their body in `#ifdef __linux__`. Note this
-  gives them compile coverage only — neither has a Go call site.
-
 ### Performance
+
+- **Batch writes are 2.4x faster on overwrites.** An overwrite of a live key
+  no longer searches the ordered index for a key that is already in it.
+  Server, 8 clients × 1024-key MPUT over a 1M-key space: 1.45M → 3.54M keys/s,
+  P99 9.6 → 4.2 ms.
+- **Off-heap native index on cgo builds.** With 5M keys, full GC takes
+  0.27 ms (21 ms before) and settled RSS is 142 B/key (168 before). Each
+  cache-miss lookup costs ~19 ns more. Opt out with `VELTRIXDB_INDEX=map`.
+  Needs `vm.max_map_count` ≥ 262144 (`scripts/sysctl.conf`).
+- Binary WAL: encoding is 4x faster per record and replay is 2.5x faster.
+- **Batch writes: one `pwrite` per VLog batch and one channel send per WAL
+  batch.** `VLogBatcher.Flush` issued one `pwrite` per 4 KB packed block (~40
+  per 1024-key batch) and `WriteAheadLog.appendAll` one channel send per key;
+  both now handle the batch as a unit. `BenchmarkMultiPut_Concurrent` at 64
+  workers × 1024 keys (darwin/arm64): P50 77.45 → 8.28 ms, P99 98.56 →
+  39.21 ms. Durability is unchanged.
+- **Cache write-around for `MultiPut`** (see Changed): with 8 writers ×
+  1024-key batches, batch P99 with no readers 6.19 → 4.23 ms, and P50 with 64
+  concurrent readers 5.72 → 4.98 ms.
+
+- **Batch write latency cut ~2x: the WAL flusher now issues one `write(2)` per
+  group-commit batch instead of one per entry.** Group commit amortised the
+  `fdatasync` but not the writes, so a 1024-key `MultiPut` from 8 concurrent
+  clients cost ~8 K write syscalls before a single sync.
+
+  | | before | after | |
+  |---|---|---|---|
+  | `loadtest --batch-size=1024 --concurrency=8` P50 | 13.24 ms | **7.44 ms** | |
+  | same, P99 | 23.67 ms | **14.04 ms** | **-41%** |
+  | same, throughput | 596,819 ops/s | **1,065,175 ops/s** | **1.79x** |
+  | `MultiPut_Concurrent/workers=8` | 12.56 ms | **4.25 ms** | **-66%** |
+  | `MultiPut_1024` | 3.44 ms | 2.53 ms | -26% |
+  | `Put` (single key) | 78.4 us | 77.0 us | unchanged |
+
+  benchstat, n=6, p=0.002 on every changed row.
+
+  **The flush window was not the cause**, contrary to the obvious reading.
+  Sweeping `--wal-flush-window-ms` across 0 / 1 / 5 / 15 / 30 ms moved batch
+  P50 by ~1% — turning group commit off entirely did not help. Profiling
+  showed `syscall.write` at 27% of CPU and `syscall.Fsync` at 1.2%.
+
+  **Durability is unchanged**: identical bytes, identical order, still exactly
+  one `fdatasync` covering the batch before any waiter is ACKed. Verified by
+  SIGKILLing a server after 3000 ACKed writes and restarting — `missing=0
+  wrong=0`, with the WAL intact at 190 KB (i.e. the replay path really ran).
+
+- **One fewer allocation per WAL entry.** `serialize` borrowed a scratch buffer
+  and then allocated a second one to return; it now builds directly into a
+  pooled buffer that the flusher recycles. `MultiPut_1024` allocations -11%.
 
 - **Cache-hit reads are 6.3x faster and the miss path is zero-allocation.**
   Profile-driven; benchstat count=8, all p=0.000. The LIRS cache had one
@@ -268,17 +274,6 @@ Types: `Added`, `Changed`, `Fixed`, `Performance`, `Breaking`
   ranking should carry to Linux, but the absolute numbers will not. The write
   path is fsync-bound on macOS and was NOT tuned — it needs measuring on NVMe.
 
-### Added
-
-- **`cmd/veltrix-repair`** — offline repair for value-transform metadata lost
-  by pre-fix builds. `--scan` is read-only and reports what is affected;
-  `--repair` corrects the index and writes a corrected checkpoint, after
-  backing up each `wal.log`. The repair is exact rather than heuristic:
-  `IndexEntry.CRC32C` is the CRC of the *plaintext* and survived the bug, so
-  the tool enumerates the four possible interpretations of each on-disk blob
-  and accepts only the one that reproduces that CRC. Anything else is reported
-  and left untouched. Idempotent; safe to re-run.
-
 ### CI
 
 - **Added `node-5-race`**: the full test suite under `-race`. No job ran the
@@ -289,6 +284,12 @@ Types: `Added`, `Changed`, `Fixed`, `Performance`, `Breaking`
   change under it was completely unverified.
 - **Added a `gofmt` gate** to `node-1-storage`; the tree is now gofmt-clean
   (39 files were not).
+- `node-6-cpp` runs the storage tests with `VELTRIXDB_URING_BRIDGE=on`, since
+  the bridge is now opt-in; `node-5-race` keeps the C++ engine off but runs
+  the native index (`VELTRIXDB_INDEX=native`).
+- The `Net front-end` workflow runs the `netfront` tests on the io_uring and
+  poll backends (io_uring also under `-race`) and the `net-bench.sh`
+  comparison.
 
 ### Documentation
 
@@ -296,9 +297,9 @@ Types: `Added`, `Changed`, `Fixed`, `Performance`, `Breaking`
   checklist" for the 2M reads/s target told operators to pass
   `--cgo-batch-engine=true --numa-aware=true --sqpoll-reader=true`. No such
   flags are defined, and `flag.Parse()` is `ExitOnError`, so following the
-  checklist made the server exit with "flag provided but not defined". All
-  three behaviours are unconditional in a Linux CGO build and cannot be
-  toggled at runtime.
+  checklist made the server exit with "flag provided but not defined". The
+  batch engine and its NUMA pinning are on in every Linux cgo build unless
+  `VELTRIXDB_DISABLE_CGO_ENGINE=1`; the SQPOLL reader has no Go call site.
 
 - Corrected admission-control and flush-window constants in `CLAUDE.md` and
   `ARCHITECTURE.md`, which had drifted from the code: admission throttle is
@@ -307,11 +308,30 @@ Types: `Added`, `Changed`, `Fixed`, `Performance`, `Breaking`
 - Documented which C++ sources are actually compiled and reachable from Go.
   `cpp/src/vlog.cpp` and `cpp/src/ebpf_gc_throttle.cpp` are built by nothing;
   `art.cpp` and `scheduler.cpp` compile into the CMake static lib but have no
-  Go call site. The published Docker image and all CI jobs are
-  `CGO_ENABLED=0`, so they contain no C++ at all.
+  Go call site. (At the time the Docker image and all CI jobs but
+  `node-6-cpp` were `CGO_ENABLED=0`; the image is now `CGO_ENABLED=1`, see
+  Changed.)
 - Noted that `StorageConfig.NumShards` is vestigial — the index always uses the
   compile-time `numShards = 8192`. Fixed the startup log line that derived
   shards-per-disk from 1024.
+
+- **Documentation corrected against the code, repo-wide.** Several docs had
+  drifted far enough to mislead an operator:
+
+  | Claim | Reality |
+  |---|---|
+  | `F_FULLFSYNC ≈ 7–10 ms` on macOS (7 sites, incl. `veltrix info` output) | Never called. Plain `fsync(2)`, **0.020 ms**, drive cache only — macOS builds are **not power-loss safe** |
+  | Admission control fires at 3 / 4 / 2 ms (`PERFORMANCE.md`) | **15 / 20 / 10 ms** |
+  | Flush window default 10 ms (`README.md`, `PERFORMANCE.md`, `veltrix info`) | **15 ms** |
+  | 1024 shards, `& 0x3FF` (`docs/storage.md`, `IMPLEMENTATION_GUIDE.md`) | **8192**, `& 0x1FFF` |
+  | 7-field WAL (`docs/storage.md`, `docs/node-lifecycle.md`, `CLAUDE.md` file map) | **10-field** — `CLAUDE.md` contradicted its own invariant 21 |
+  | Cache hit ~220 ns (`README.md`) | **~92 ns** since the cache was sharded |
+
+- **`ARCHITECTURE.md` now carries real diagrams** (Mermaid, rendered by
+  GitHub): system overview with the C++ boundary drawn honestly, a write-path
+  sequence showing the concurrent WAL/VLog fdatasync, a read-path flow, and
+  the three-way hash split. Plus a new "Durability" section documenting the
+  macOS fsync caveat above.
 
 ---
 

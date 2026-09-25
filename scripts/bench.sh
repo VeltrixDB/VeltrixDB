@@ -14,8 +14,9 @@
 #   6. Sustained-write stress → watch GC emergency counter (must stay 0)
 #   7. Final report: density, throughput, P99, GC stats, pass/fail
 #
-# Targets are tuned for n2-highmem-64 Linux NVMe. macOS dev runs will fall
-# short on every fdatasync-bound metric (F_FULLFSYNC ≈ 7 ms vs Linux 0.2 ms);
+# Targets are tuned for n2-highmem-64 Linux NVMe. macOS dev numbers are not
+# comparable: Darwin's plain fsync returns at the drive cache (~0.02 ms, no
+# F_FULLFSYNC), so fdatasync-bound metrics look better than Linux, not worse;
 # the script still runs end-to-end and validates correctness paths.
 #
 # Usage:
@@ -98,16 +99,19 @@ trap cleanup EXIT
 # ── Phase 1: build + start ────────────────────────────────────────────────────
 hdr "phase 1: build + start"
 say "building veltrixdb + loadtest"
-# Default to CGO_ENABLED=0, matching how the published Docker image and every
-# CI job are built — so the harness measures the artifact people actually run.
+# Default to CGO_ENABLED=0 (Go map index, no C++), matching every CI job
+# except node-6-cpp. Note the Docker image is now CGO_ENABLED=1 (native index),
+# so to measure what the image runs, export CGO_ENABLED=1 on Linux.
 #
-# It is also required on macOS: with cgo enabled Go links through clang, and
+# The default is also required on macOS: with cgo enabled Go links through clang, and
 # recent Xcode toolchains emit a binary with no LC_UUID load command, which
 # dyld refuses to start ("missing LC_UUID load command", SIGABRT). That made
 # this script unrunnable on macOS despite the header advertising dev runs.
 #
-# Export CGO_ENABLED=1 explicitly to benchmark the C++-accelerated build on
-# Linux.
+# Export CGO_ENABLED=1 explicitly to benchmark the cgo build on Linux
+# (native index; the io_uring VLog bridge stays off unless
+# VELTRIXDB_URING_BRIDGE=on|sqpoll). For front-end and storage-configuration
+# comparisons use scripts/net-bench.sh.
 BENCH_CGO="${CGO_ENABLED:-0}"
 say "building with CGO_ENABLED=${BENCH_CGO}"
 CGO_ENABLED="${BENCH_CGO}" go build -o "${SERVER_BIN}" ./cmd/server >>"${RUN_LOG}" 2>&1 || fail "server build failed (see ${RUN_LOG})"

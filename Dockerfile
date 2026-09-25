@@ -2,8 +2,12 @@
 FROM golang:1.22-bookworm AS builder
 
 # CGO_ENABLED=1 (default) builds the C++ layer in: the off-heap native index
-# (storage/native_index.cpp) and the io_uring VLog write bridge. Pass
-# --build-arg CGO_ENABLED=0 for the old fully static, pure-Go image.
+# (storage/native_index.cpp, on by default), the batch engine, and the
+# io_uring VLog write bridge (compiled in but off unless
+# VELTRIXDB_URING_BRIDGE=on|sqpoll). The native index needs the node's
+# vm.max_map_count >= 262144 at large key counts (scripts/sysctl.conf) — a
+# container cannot set it. Pass --build-arg CGO_ENABLED=0 for the old fully
+# static, pure-Go image (Go map index).
 ARG CGO_ENABLED=1
 
 RUN if [ "$CGO_ENABLED" = "1" ]; then \
@@ -45,9 +49,10 @@ RUN mkdir -p /runtime-libs && \
 # enforces runAsNonRoot:true + runAsUser:65532 for non-rawVLog deployments.
 #
 # io_uring under Kubernetes: the RuntimeDefault seccomp profile of recent
-# containerd / Docker releases blocks io_uring_setup. The engine detects that
-# (bridge creation fails), logs it, and falls back to pwrite — correct, just
-# without io_uring. To actually use it the pod needs a seccomp profile that
+# containerd / Docker releases blocks io_uring_setup. The bridge is opt-in
+# (VELTRIXDB_URING_BRIDGE); an opted-in engine detects the failure, logs it,
+# and falls back to pwrite — correct, just without io_uring. To actually use
+# it the pod needs a seccomp profile that
 # allows io_uring_setup / io_uring_enter / io_uring_register. The native
 # index needs nothing special.
 FROM gcr.io/distroless/cc-debian12

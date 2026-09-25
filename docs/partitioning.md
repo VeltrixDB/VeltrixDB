@@ -19,6 +19,8 @@ key  ──► FNV-1a hash ──► shard_id = hash & 0x1FFF  (0..8191)
 
 ## Cluster-Level Partitioning
 
+Cluster routing only applies in `--mode=raft` or `--mode=replicated`, and those modes need the Go network front-end (`--net=go`, the default). The server refuses to start with `--net=cpp|uring|poll` outside `--mode=standalone`, because the C++ front-end writes straight to the local engine and would bypass Raft/replication routing.
+
 ### Consistent Hash Ring
 
 The `ConsistentHashRing` (`cluster/partition_map.go`) maps a continuous 64-bit hash space onto physical nodes using **virtual nodes**:
@@ -127,23 +129,20 @@ Rebalancing is triggered by `pm.Rebalance(partitionCount)` after any topology ch
 
 ```go
 func (pm *PartitionMap) Rebalance(partitionCount uint32) error {
-    // 1. Collect all ACTIVE nodes
-    nodeList := [active nodes from pm.Nodes]
+    // 1. Collect all ACTIVE nodes, sorted by node ID
+    nodeList := [active nodes from pm.Nodes, sorted by ID]
 
     // 2. Clear existing partition assignments
     pm.Partitions = make(map[uint32]*PartitionInfo)
 
     // 3. For each partition 0..partitionCount-1:
     for i := range partitions {
-        partitionHash = FNV-1a(fmt.Sprintf("partition-%d", i))
-        
-        // Assign primary + (RF-1) replicas
-        // Nodes selected via: (partitionHash + j) % len(nodeList)
-        // Deduplication: skip node if already assigned to this partition
-        
+        start := i % len(nodeList)                 // round-robin primary
+        replicas := pickReplicas(nodeList, start, pm.ReplicationFactor)
+
         pm.Partitions[i] = &PartitionInfo{
-            PrimaryNode:  nodeList[primaryIdx].ID,
-            ReplicaNodes: [replica node IDs],
+            PrimaryNode:  replicas[0],
+            ReplicaNodes: replicas[1:],
             HashRange:    [rangeStart, rangeEnd),
         }
     }
@@ -152,7 +151,9 @@ func (pm *PartitionMap) Rebalance(partitionCount uint32) error {
 }
 ```
 
-The assignment formula `(partitionHash + j) % len(nodeList)` distributes partitions round-robin across nodes. With 256 partitions and 3 nodes, each node gets ~85 primary partitions plus ~170 replica assignments.
+Partitions are assigned round-robin over the ID-sorted node list, so every member that runs `Rebalance` independently computes the same table, and the primary count per node differs by at most one. With 256 partitions and 3 nodes, each node gets ~85 primary partitions plus ~170 replica assignments.
+
+`pickReplicas` walks forward from the primary and is rack-aware: a replica never shares a failure domain (`--rack-id`) with an earlier copy unless every remaining node would. With no racks configured it reduces to plain round-robin.
 
 ### After Rebalance: Data Migration
 

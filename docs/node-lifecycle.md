@@ -240,21 +240,29 @@ Up to `MaxRecoveryRetries` (3) attempts are made, spaced `RecoveryInterval` (5 s
 When `node-2` restarts:
 
 ```
-1. RaftNode.loadState()
-   └─ Read raft_state.gob → restore (CurrentTerm, VotedFor, Log)
+1. RaftNode starts (NewRaftNodeWithOptions)
+   ├─ Restore raft_snapshot.gob if present (state machine + lastIncludedIndex/Term)
+   └─ loadState(): read raft_state.gob → (CurrentTerm, VotedFor, retained log tail)
 
 2. StorageEngine starts → replayWAL()
    ├─ Open wal.log on each disk
-   ├─ Parse every WAL record (10-field; 6/7/8-field still accepted)
+   ├─ Decode every record with one reader: binary records (the default,
+   │  CRC32C over the whole record) and legacy 10-field text records
+   │  (6/7/8-field still accepted) may be mixed in one file
+   ├─ A torn or corrupt record ends replay; everything before it is kept
+   │  and the stop offset is logged
    └─ applyWALReplay() → rebuild shardedIndex in RAM
-      (WAL file was not zeroed on crash — replay needed)
+      (after a crash wal.log holds every record since the last clean-shutdown
+       checkpoint — replay needed)
 
 3. RaftNode starts as Follower
    ├─ Election timer starts (400–800 ms)
    └─ Current leader sends AppendEntries → node-2 becomes follower again
 
 4. Leader backfills missing log entries:
-   ├─ node-2.nextIndex was saved as 0 on leader → leader sends full log
+   ├─ AppendEntries consistency check fails → leader backs nextIndex["node-2"] down
+   ├─ If the entries node-2 needs were compacted into the leader's snapshot,
+   │  the leader sends one InstallSnapshot RPC instead
    └─ node-2 applies all missed entries to StateMachine (StorageEngine)
 
 5. node-2 is caught up → counts toward quorum again
@@ -281,7 +289,7 @@ When a crashed node comes back online after repair:
 
 ```
 1. raft_state.gob still present → node knows its last term and voted-for
-2. WAL replay rebuilds the index from the last clean state
+2. WAL replay rebuilds the index (last clean-shutdown checkpoint + every record after it)
 3. Node joins as Follower
 4. Leader sends missing AppendEntries to catch up the log
 5. Once matchIndex[recovered_node] == leader.lastLogIndex:
@@ -292,6 +300,38 @@ When a crashed node comes back online after repair:
 ```
 
 During the catch-up phase, the recovering node serves reads from its potentially-stale local state. Clients that need strong consistency should read from the leader or use quorum reads.
+
+---
+
+## Clean Shutdown, Restart and Upgrades
+
+### Clean shutdown
+
+`StorageEngine.Close()` (SIGTERM / normal exit) drains in this order: write batcher → C++ batch engine → io_uring bridge (if enabled) → defrag and compaction workers → segment files and VLogs → WALs. Each WAL is then rewritten as a **compacted checkpoint** — one record per live key, written to a temp file and atomically renamed — so the next startup replays O(live keys), not O(total writes). A crash during the checkpoint leaves the old `wal.log` intact. The native off-heap index is freed **last**, after the checkpoint (its final reader); the Go GC cannot reclaim it.
+
+A node killed without a clean shutdown (SIGKILL, OOM, power loss) keeps its full WAL and replays it on restart, as described above.
+
+### Before starting a node (Linux, cgo builds)
+
+cgo builds keep the index off the Go heap, with one `mmap` per large shard array. Set `vm.max_map_count ≥ 262144` (`scripts/sysctl.conf`); with the default 65530, inserts can fail with `ENOMEM` at large key counts. `VELTRIXDB_INDEX=map` falls back to the Go map index.
+
+### Network front-end in cluster modes
+
+`--mode=raft` and `--mode=replicated` require `--net=go` (the default). `cmd/server` exits at startup if `--net=cpp|uring|poll` is combined with any mode other than `--mode=standalone` (or with `--auth-config`): the C++ front-end writes straight to the local engine and would bypass Raft and replication.
+
+### Upgrade and rollback (WAL format)
+
+New builds write **binary WAL records** by default and replay both binary and text, so an upgraded node reads its existing text `wal.log` and appends binary records after it — a rolling upgrade needs no extra step.
+
+A pre-binary build cannot read binary records. To roll a node back:
+
+```
+1. Restart the current build once with --wal-format=text
+2. Stop it cleanly (the clean-shutdown checkpoint rewrites wal.log as text)
+3. Start the older build
+```
+
+Rolling back a node that was not stopped cleanly after step 1 leaves binary records in `wal.log` that the old build cannot replay.
 
 ---
 

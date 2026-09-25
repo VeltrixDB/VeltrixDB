@@ -140,7 +140,7 @@ func main() {
 			"\tin --mode=standalone without --auth-config. TLS (--tls-addr) stays on Go.")
 	netThreads := flag.Int("net-threads", runtime.NumCPU(), "Event loops for --net=cpp|uring|poll (one per core)")
 	pprofAddr := flag.String("pprof-addr", "",
-		"Serve net/http/pprof on this address (e.g. 127.0.0.1:6060). Empty (default) = off.\n"+
+		"Serve CPU/heap/goroutine/trace profiles (pprof format) on this address (e.g. 127.0.0.1:6060). Empty (default) = off.\n"+
 			"\tOn its own mux, never the metrics port: profiles expose internals.")
 	adminToken := flag.String("admin-token", os.Getenv("VELTRIX_ADMIN_TOKEN"), "Bearer token required for /admin/* endpoints (env VELTRIX_ADMIN_TOKEN).\n\tWhen empty, /admin/* only accepts loopback connections; /metrics, /healthz and /readyz are always unauthenticated.")
 	dataDir := flag.String("data", "./veltrixdb-data", "Single data directory (WAL + segments). Ignored when --data-dirs is set.")

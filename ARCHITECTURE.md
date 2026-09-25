@@ -4,9 +4,11 @@
 
 ## Overview
 
-Everything on the serving path is Go. The C++ layer is an optional Linux-only
-accelerator, and most of what is under `cpp/` has no Go call site at all —
-the dashed box below is the honest boundary, not the file tree.
+The serving path is Go, with two C++ exceptions on a cgo build: the
+per-shard index tables live off the Go heap in C++ (default on every cgo
+build, macOS included), and `--net=cpp` swaps in an opt-in C++ network
+front-end. Most of what is under `cpp/` has no Go call site at all — the
+dashed boxes below are the honest boundary, not the file tree.
 
 ```mermaid
 flowchart TB
@@ -14,7 +16,7 @@ flowchart TB
 
     subgraph SRV["TCP Server — cmd/server"]
         direction LR
-        CONN["1 goroutine per conn<br/>binary + text protocol"]
+        CONN["--net=go (default)<br/>1 goroutine per conn<br/>binary + text protocol"]
         COAL["PUT/GET coalescing<br/>cap 256 → MultiPut/MultiGet"]
         CONN --> COAL
     end
@@ -25,7 +27,7 @@ flowchart TB
 
         subgraph MEM["In-memory, per shard"]
             direction LR
-            IDX["Index Vault<br/>8192 shards · RWMutex each<br/>64 B entry, no value bytes"]
+            IDX["Index Vault<br/>8192 shards · RWMutex each<br/>64 B entry, no value bytes<br/><i>off-heap C++ table on cgo builds,<br/>Go map when CGO_ENABLED=0</i>"]
             BLM["Bloom filter<br/>lock-free, per shard"]
             CSH["Sharded LIRS cache<br/>up to 256 independent caches<br/>keyed on HIGH hash bits"]
         end
@@ -37,33 +39,39 @@ flowchart TB
 
     subgraph DISK["Per NVMe disk — N independent sets"]
         direction LR
-        WAL["WAL<br/>group-commit<br/>one fdatasync per window"]
-        VLOG["VLog<br/>append-only values<br/>lock-free offset reservation"]
+        WAL["WAL<br/>binary records, CRC32C<br/>group-commit: one write + one fdatasync per window"]
+        VLOG["VLog<br/>append-only values<br/>lock-free offset reservation<br/>one pwrite + one fdatasync per batch"]
         SEG["Segment writer<br/>O_DIRECT"]
     end
 
     GC["Defragmenter + VLog GC<br/>3-tier escalation"]
     SCRUB["Scrubber<br/>CRC32C walk"]
 
-    CPP["<b>C++ accelerator</b> — Linux + CGO_ENABLED=1 only<br/>batch engine · io_uring SQPOLL reader · NUMA pinning<br/><i>absent from the published Docker image</i>"]
+    CPP["<b>C++ storage extras</b> — Linux + CGO_ENABLED=1 (Docker image default)<br/>batch engine + NUMA pinning (BatchPut / WriteBatcher only)<br/>io_uring VLog write bridge — <i>opt-in, VELTRIXDB_URING_BRIDGE</i>"]
+    NETF["<b>C++ network front-end</b> — --net=cpp / uring / poll, opt-in<br/>event loop per core · binary PUT GET DEL PING MPUT MGET<br/>disk-bound reads deferred to goroutines"]
 
     CL -->|TCP| SRV
+    CL -.->|TCP| NETF
     SRV --> ENG
+    NETF -.->|"vxnfExec, once per loop iteration"| ENG
     XF --> VLOG
     ROUTE --> WAL
     DISK --- GC
     DISK --- SCRUB
-    ENG -.->|"optional, opt-out via<br/>VELTRIXDB_DISABLE_CGO_ENGINE"| CPP
+    ENG -.->|"cgo builds; VELTRIXDB_DISABLE_CGO_ENGINE=1<br/>turns it off"| CPP
 
     classDef opt stroke-dasharray:6 6,stroke:#888,color:#555
-    class CPP opt
+    class CPP,NETF opt
 ```
 
 ### What is NOT in that diagram
 
 `cpp/` also contains an ART index, a 3-tier priority io_uring scheduler, a C++
-VLog, a LIRS cache and a defragmenter — roughly 5,400 lines. They compile and
-link, and **nothing in Go calls them**. See [cpp/README.md](cpp/README.md).
+VLog, a LIRS cache, a defragmenter and an eBPF GC throttle — roughly 5,400
+lines. They compile and link, and **nothing in Go calls them**. The SQPOLL
+`UringReader` is compiled into cgo builds by a shim but has no Go call site
+either; the VLog read path is Go (`storage/vlog.go:ReadValue`). See
+[cpp/README.md](cpp/README.md).
 
 ---
 
@@ -98,9 +106,17 @@ nothing reads it, and changing it has no effect.
 
 ## Key Components
 
-**In-Memory Index** — a hash map per shard. Each entry is ~64 B: disk offset,
+**In-Memory Index** — one table per shard. Each entry is ~64 B: disk offset,
 disk index, value size, flags, TTL and a monotone version counter. No value
-bytes. (The C++ ART tree is *not* wired to Go; see the C++ section.)
+bytes. On a cgo build the table is C++ off the Go heap
+(`storage/native_index.cpp`): dense 64 B records, 8 B tag/position slots and a
+per-shard key arena, invisible to the GC. With 5M keys that took a full GC from
+21 ms to 0.27 ms and settled RSS from 168 to 142 B/key, for ~19 ns more per
+cache-miss lookup. Arrays of a page or more are individually mmap'd, so large
+engines need `vm.max_map_count` ≥ 262144 (`scripts/sysctl.conf`) or inserts
+can fail with ENOMEM. `CGO_ENABLED=0`, `VELTRIXDB_INDEX=map` or
+`VELTRIXDB_DISABLE_CGO_ENGINE=1` select the Go map instead. (The C++ ART tree
+is *not* wired to Go; see the C++ section.)
 
 **Sharded LIRS Cache** — scan-resistant, with value-aware eviction: small
 values (≤ 256 B) get priority 2 vs 1, so they resist eviction. Split across up
@@ -121,12 +137,16 @@ words, double-hashed probes. Rebuilt from the live index on every defrag pass,
 otherwise deletes would leave bits set forever and the false-positive rate
 would climb.
 
-**WAL** — group-commit: N writes share one `fdatasync`. Default 15 ms window.
-One WAL per disk.
+**WAL** — group-commit: N writes share one `write(2)` and one `fdatasync`.
+Default 15 ms window. One WAL per disk. Records are binary and checksummed
+(see the write path); a `MultiPut` enqueues one item per batch, not one per
+key.
 
 **VLog** — append-only file per disk. Values live here; only key metadata is
 in the index (WiscKey KV separation). Concurrent appends reserve offsets with
-an atomic add, so there is no mutex on the write path.
+an atomic add, so there is no mutex on the write path. A batch reserves its
+whole extent with one add and writes it with one `pwrite` and one `fdatasync`
+(one SQE with the opt-in io_uring bridge).
 
 **Block Packing** — batched writes pack up to ~26 records into a 4 KB VLog
 block. For 128 B values that is 4096 B → 152 B per record (27× density).
@@ -177,6 +197,12 @@ sequenceDiagram
     E-->>C: OK
 ```
 
+The batch path (`MultiPut`) keeps the same order per disk, with one `pwrite`
+for the VLog extent and one WAL item for the batch. It refreshes only keys
+already in the cache (`PutIfPresent`) instead of inserting, so bulk writes do
+not evict the read working set; single `Put` stays write-through. The ordered
+(range-scan) index is touched only when a key becomes live, not on overwrites.
+
 **Crash between the VLog write and the WAL fdatasync**: the offset never
 reaches the WAL, so replay never builds an index entry for it. The bytes are
 unreferenced garbage that the next GC pass reclaims, and the client never got
@@ -186,8 +212,9 @@ an OK. Safe.
 a 48-byte header — magic `0xB1`, flags (tombstone / packed / inline value),
 key length, `valueLen`, `diskLen`, plaintext CRC32C, `xflags`, timestamp,
 version, `vlogOffset` — then the key, the value if inline, and a CRC32C over
-the whole record. The legacy text form is still read (and written under
-`--wal-format=text`, for rollback only):
+the whole record. The legacy text form is still read (and written by the
+server under `--wal-format=text`, for rollback only; it logs a warning that
+such records cannot carry keys containing `|` or `\n`):
 
 ```
 timestamp|tombstone|key|valueLen|crc32hex|version|vlogOffset|packed|diskLen|xflags
@@ -198,7 +225,7 @@ containing `|` or `\n` made its record unparseable, and replay stops at the
 first unparseable record, so every acknowledged write after it was lost on a
 crash restart. Its header was also never checksummed.
 
-Fields 9 and 10 are the ones that were missing before v1.1.0. `valueLen` is
+In the text form, fields 9 and 10 are the ones that were missing before v1.1.0. `valueLen` is
 the **plaintext** length; `diskLen` is what actually sits on disk after
 compression and encryption; `xflags` carries the transform bits. Replay needs
 all three or it rebuilds an entry that reads back ciphertext. Fields 9–10 are
@@ -232,6 +259,12 @@ flowchart TD
 The hash is computed **once** and threaded through both the cache and the
 index lookup. The cache shards on the **high** bits and the index on the low
 13, so the two placements stay independent.
+
+`StorageEngine.GetNoIO` runs the same flow but stops before the VLog read:
+it answers a cache hit, an absent / tombstoned / expired key, or a dirty
+value still in RAM, and otherwise returns `needIO=true`; `GetAfterNoIO`
+finishes that key. The pair counts as one read. The C++ network front-end
+uses it so disk reads never run on a loop thread.
 
 Both terminal misses return package-level sentinels (`ErrKeyNotFound`,
 `ErrKeyExpired`) rather than `fmt.Errorf`, because formatting the key
@@ -293,16 +326,16 @@ Emergency mode logs `[gc] disk=N EMERGENCY` and increments `veltrixdb_vlog_gc_em
 
 ---
 
-## C++ Layer (Linux Only)
+## C++ Layer
 
-The Go layer is fully functional on its own. C++ is an optional Linux accelerator — and **less of it is wired up than the file tree suggests**, so check this table before attributing behaviour to it.
+The Go layer is fully functional on its own. C++ is optional — the native index on any cgo build, the rest Linux-only — and **less of it is wired up than the file tree suggests**, so check this table before attributing behaviour to it.
 
 | Component | Source | Reachable from Go? |
 |-----------|--------|--------------------|
 | **Index Vault (off-heap shard tables)** | `storage/native_index.cpp` | **Yes — default on every cgo build, including macOS** |
-| Vectorized batch put | `batch_engine.cpp` | Yes — cgo shim in `storage/` |
-| SQPOLL SSTable reader | `uring_reader.cpp` | Yes — cgo shim |
-| NUMA thread pinning | `numa_topology.cpp` | Yes — cgo shim |
+| Vectorized batch put | `batch_engine.cpp` | Yes — cgo shim in `storage/`; only the fire-and-forget `BatchPut` / `WriteBatcher` path |
+| NUMA thread pinning | `numa_topology.cpp` | Yes — cgo shim; pins the batch engine's threads |
+| SQPOLL SSTable reader | `uring_reader.cpp` | **No** — compiled in by a cgo shim, but no Go call site |
 | 8-ring io_uring VLog write bridge | `storage_bridge.cpp` | Yes, **opt-in** — `VELTRIXDB_URING_BRIDGE=on` (no SQPOLL) or `sqpoll`; default off |
 | ART index | `art.cpp` | **No** — compiled into the CMake lib, but no Go call site |
 | Priority io_uring scheduler | `scheduler.cpp` | **No** — same |
@@ -336,7 +369,13 @@ At shutdown the server logs a per-stage latency breakdown: loop iteration,
 cgo callback entry, `vxnfExec`, PUT scheduling and engine time,
 respond-to-wake, and deferred chains.
 Serves PUT GET DEL PING MPUT MGET of the binary protocol, standalone mode,
-no RBAC; TLS and the text protocol stay on Go.
+no RBAC (the server refuses `--auth-config`); TLS, AUTH, the text protocol
+and the extended binary commands stay on Go. It is experimental: on a 4-CPU
+CI runner (measured before reads were deferred) it cut read P50 against
+`--net=go` but had a worse read P99 and ~12% lower batch-write throughput.
+Compare with `scripts/net-bench.sh` (see BENCHMARKING.md) on the target
+hardware; a Mac cannot show a difference, since loopback caps round trips at
+~60K/s for both.
 
 ## Cluster
 

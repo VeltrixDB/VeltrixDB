@@ -46,6 +46,8 @@ echo -e "PUT hello world\nGET hello\nPING" | nc localhost 9000
 | PUT — 5 ms window, 512 workers | 2.6 ms | 5.2 ms (~102K writes/s) |
 | MultiPut 1024 entries | — | ~9.5 ms (~426K entries/s) |
 
+These rows are historical (pure-Go path). Later server batch writes, 8 clients × 1024-key MPUT: 3.54M keys/s, P99 4.2 ms (macOS, 1M-key space) and 1.77M keys/s, P99 12.2–12.7 ms (4-CPU CI runner, tmpfs, same-host client). See [BENCHMARK_RESULTS.md](BENCHMARK_RESULTS.md#later-measurements).
+
 Full methodology: [BENCHMARKING.md](BENCHMARKING.md)
 
 ---
@@ -78,7 +80,7 @@ In the YCSB run above (100M operations): **zero errors and zero GC emergency eve
 
 **Values on NVMe, index in DRAM.** The in-memory index stores only a 64-byte pointer per key (disk offset, shard, size, TTL, version). Value bytes go directly to the per-disk append-only VLog. A cache hit is a DRAM lookup (**~92 ns** since the cache was sharded; it was 711 ns when a single mutex fronted it). A cache miss is one NVMe random read (~400 µs).
 
-**Group-commit WAL.** A background flusher amortizes `fdatasync` across all writers within a configurable window (default 15 ms). One `fdatasync` per batch instead of per write — 10–100× write throughput improvement at the cost of at most one window of durability latency.
+**Group-commit WAL.** A background flusher amortizes `fdatasync` across all writers within a configurable window (default 15 ms). Records are binary with a CRC32C over the whole record (replay still reads legacy text WALs). One `write(2)` and one `fdatasync` per batch instead of per write — 10–100× write throughput improvement at the cost of at most one window of durability latency.
 
 **LIRS cache.** Scan-resistant eviction: large sequential reads don't evict your hot keys. Small values (≤256 B) get higher eviction priority, keeping the working set in RAM even under mixed workloads.
 
@@ -99,7 +101,7 @@ echo -e "PUT hello world\nGET hello\nPING" | nc localhost 9000
 ```
 
 ```bash
-# Build from source (Go only — works on macOS and Linux)
+# Build from source (macOS and Linux; CGO_ENABLED=0 for a pure-Go build)
 go build ./...
 go run ./cmd/server -addr :9000 -data ./dev-data -cache 256
 ```
@@ -143,7 +145,7 @@ print(db.get("user:1001"))  # alice
 | | |
 |--|--|
 | **Storage** | WiscKey KV-separation, 8192-shard index, LIRS cache, append-only VLog |
-| **Durability** | Group-commit WAL, fdatasync amortization, crash recovery via WAL replay |
+| **Durability** | Group-commit WAL (binary, CRC32C-checksummed records), fdatasync amortization, crash recovery via WAL replay |
 | **Atomic ops** | CAS, INCR, DECR, SETNX — shard-locked RMW, safe under concurrency |
 | **Data types** | Keys with TTL, hash fields with per-field TTL, namespaces |
 | **Replication** | Raft consensus, async / quorum / strong modes, anti-entropy |
@@ -211,9 +213,13 @@ veltrix --help
 | `-addr` | `:9000` | TCP listen address |
 | `-data` | — | Single data directory |
 | `-data-dirs` | — | Comma-separated NVMe disk paths |
-| `-cache` | `1024` | LIRS cache size in MB |
-| `-wal-flush-window-ms` | `10` | WAL group-commit window |
-| `-vlog-flush-window-ms` | `10` | VLog flush window (keep equal to WAL) |
+| `-cache` | `256` | LIRS cache size in MB |
+| `-wal-flush-window-ms` | `15` | WAL group-commit window |
+| `-vlog-flush-window-ms` | `15` | VLog flush window (keep equal to WAL) |
+| `-wal-format` | `binary` | WAL record encoding; `text` only to roll back to a pre-binary build (run once, stop cleanly) |
+| `-net` | `go` | Network front-end: `go` \| `cpp` \| `uring` \| `poll` (C++ front-ends are opt-in, experimental, binary subset only, standalone without `-auth-config`) |
+| `-net-threads` | NumCPU | Event loops for the C++ front-end |
+| `-pprof-addr` | — (off) | CPU/heap/trace profiles on a separate listener |
 | `-encrypt-at-rest` | `false` | AES-256-GCM (key via `VELTRIXDB_ENCRYPTION_KEY`) |
 | `-tls-cert` / `-tls-key` | — | TLS certificate and key |
 | `-auth-config` | — | Path to auth config JSON |
@@ -278,6 +284,9 @@ QUIT            → BYE
 ```
 
 ### Binary (used by all SDKs, auto-detected)
+
+With `-net=cpp|uring|poll` only the binary PUT GET DEL PING MPUT MGET commands are served; everything else needs the default `-net=go`.
+
 ```
 Request:  [1B cmd][2B keyLen][4B valLen][key][value]
 Response: [1B status][4B payloadLen][payload]
@@ -347,7 +356,7 @@ These are real gaps. We'd rather you know them upfront:
 
 - **No Redis protocol (RESP).** You can't point a Redis client at VeltrixDB yet. RESP compatibility is on the roadmap — once it ships, migration requires only a connection-string change.
 - **No managed cloud offering.** Self-hosted only today. Managed service is planned.
-- **No native range/prefix scans.** Workaround: use namespaces + NSSCAN, or secondary indexes.
+- **Range scans cost memory on every write.** `RANGE` and `SCANCUR` are served by an ordered skiplist of all live keys (~90 B/key resident). `--disable-ordered-index` gives that memory back, and then both commands return an error.
 - **CDC is in-process only.** Events lost if `repl-ship` is down. Durable WAL-tail mode is future work.
 - **Raft reads are local (possibly stale).** `raft` mode gives linearizable *writes* (quorum commit) but reads are served from local applied state — there is no read-index / lease-read path yet.
 - **Replicated mode is not linearizable.** `replicated` mode is primary-copy replication for durability across copies; it has no single-writer ordering, so concurrent writers to the same key are not linearizable. Use `raft` mode when you need write linearizability.

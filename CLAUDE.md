@@ -9,7 +9,7 @@ not derivable from reading the code alone.
 ## Project Identity
 
 - **Module**: `github.com/VeltrixDB/veltrixdb`
-- **Language split**: Go 1.19+ (cluster, replication, storage engine, TCP server) + C++20 (ART index, io_uring scheduler, compaction)
+- **Language split**: Go 1.19+ (cluster, replication, storage engine, TCP server) + C++ (off-heap native index, batch engine, opt-in io_uring VLog bridge, opt-in `netfront/` network front-end; the ART index, io_uring scheduler and C++ VLog under `cpp/` compile but are not called from Go — invariant 9)
 - **Build**: `go build ./...` for Go; CMake + liburing for C++ (Linux only)
 - **Target platform**: GKE Linux nodes with local NVMe SSDs. macOS is dev-only; C++ io_uring code does not compile on macOS (expected).
 
@@ -59,6 +59,13 @@ go run ./cmd/loadtest \
 DATA_DIRS=/mnt/nvme0,...,/mnt/nvme7 RAW_VLOGS=/dev/nvme0n1,...,/dev/nvme7n1 \
   CACHE_MB=409600 NUM_KEYS=10000000 ./scripts/bench.sh
 
+# Compare network front-ends / storage configurations (Linux for io_uring).
+# See BENCHMARKING.md. The C++ front-end needs --proto=binary in loadtest.
+NETS="go uring poll" ENGINES="native bridge sqpoll map nocgo" ./scripts/net-bench.sh
+
+# Profiles on a separate listener (off by default)
+go run ./cmd/server -addr :9000 -data ./dev-data --pprof-addr 127.0.0.1:6060
+
 # Prometheus metrics
 curl http://localhost:2112/metrics
 curl http://localhost:2112/healthz
@@ -69,7 +76,7 @@ curl http://localhost:2112/readyz
 
 ## Architecture in One Paragraph
 
-**8192 shards** (FNV-1a hash & 0x1FFF), each with its own `sync.RWMutex`. N NVMe disks each own: one `SegmentWriter` (O_DIRECT on Linux), one `VLog` (append-only Value Log, WiscKey KV separation), one group-commit `WriteAheadLog`, one compaction goroutine, one io_uring `PriorityScheduler`. Shard routing: `shard % numDisks`. On a cgo build each shard's entries live off the Go heap in a C++ table (`storage/native_index.cpp`, invariant 44); `CGO_ENABLED=0` falls back to a Go map behind the same `entryTable` interface. With `KeyValueSeparation=true` (default), only key metadata lives in the Index Vault; value bytes go directly to the per-disk VLog — compaction only GCs dead VLog space instead of merging full KV records. The Go layer handles crash durability (WAL + fdatasync); the C++ layer handles the ART index, high-speed io_uring VLog reads (SQPOLL, O_DIRECT), and vectorized batch puts (1024-entry CGO batches, `runtime.Pinner` on Go 1.21+). LIRS is the sole cache with value-aware eviction (small ≤256 B values have priority 2, resisting eviction). Client connections are 1-per-goroutine; the binary protocol uses `binPayloadPool` to eliminate per-request heap allocation.
+**8192 shards** (FNV-1a hash & 0x1FFF), each with its own `sync.RWMutex`. N NVMe disks each own: one `SegmentWriter` (O_DIRECT on Linux), one `VLog` (append-only Value Log, WiscKey KV separation), one group-commit `WriteAheadLog` (binary records, invariant 21), one compaction goroutine. Shard routing: `shard % numDisks`. On a cgo build each shard's entries live off the Go heap in a C++ table (`storage/native_index.cpp`, invariant 44); `CGO_ENABLED=0` falls back to a Go map behind the same `entryTable` interface. With `KeyValueSeparation=true` (default), only key metadata lives in the Index Vault; value bytes go directly to the per-disk VLog — compaction only GCs dead VLog space instead of merging full KV records. The Go layer handles crash durability (WAL + fdatasync) and every VLog read (`storage/vlog.go:ReadValue`); on a Linux cgo build the C++ layer adds vectorized batch puts for the fire-and-forget `BatchPut` / `WriteBatcher` path (`runtime.Pinner` on Go 1.21+) and an opt-in io_uring VLog write bridge (invariant 51). LIRS is the sole cache with value-aware eviction (small ≤256 B values have priority 2, resisting eviction). With `--net=go` (default) client connections are 1-per-goroutine and the binary protocol uses `binPayloadPool` to eliminate per-request heap allocation; `--net=cpp|uring|poll` is the opt-in C++ front-end (invariant 50).
 
 ---
 
@@ -101,7 +108,7 @@ curl http://localhost:2112/readyz
 | `cmd/kubectl-veltrix/main.go` | kubectl plugin; auto port-forwards to a matching pod and hits `/admin/*` |
 | `Veltrixdb-client/rust/src/lib.rs` | Blocking, stdlib-only Rust client; full atomic-op surface — lives in the **Veltrixdb-client** repo, not this repo |
 | `Veltrixdb-client/cpp/include/veltrixdb.hpp` | Header-only POSIX-sockets C++17 client — lives in the **Veltrixdb-client** repo, not this repo |
-| `storage/wal.go` | Group-commit `WriteAheadLog`: channel → flusher goroutine → single fdatasync; `appendWALRecordFor` picks binary (default) or legacy text (`legacyText`, `--wal-format=text`); `walItemPool`; bounded `close()` via `flusherDone` + 30 s grace; `truncate()` for clean shutdown |
+| `storage/wal.go` | Group-commit `WriteAheadLog`: channel → flusher goroutine → single fdatasync; `appendWALRecordFor` picks binary (default) or legacy text (`legacyText`, `--wal-format=text`); `walItemPool`; bounded `close()` via `flusherDone` + 30 s grace; clean shutdown replaces wal.log with a compacted checkpoint (`writeWALCheckpoint`, `storage/wal_replay.go`) |
 | `storage/wal_format.go` | Binary WAL record encoder + the ONE decoder (`walReader`) used by crash replay, the PITR archiver and PITR restore; reads binary and 6/7/8/10-field text records in any mix (invariant 21) |
 | `storage/wal_replay.go` | `replayWAL()` drives `walReader` and logs where a torn/corrupt tail stopped it; `applyWALReplay()` rebuilds `shardedIndex` and restores `se.version`; `writeWALCheckpoint` encodes through the same `appendWALRecordFor`; `maxVLogEndFromWAL()` seeds `vl.end` synchronously before serving (invariant 27); `walPathForDir()` mirrors `newWriteAheadLog` path |
 | `storage/segment.go` | `SegmentWriter`: O_DIRECT binary record format, `ioPool` usage |
@@ -113,6 +120,7 @@ curl http://localhost:2112/readyz
 | `storage/cache.go` | LIRS cache; value-aware eviction: `priority=2` for ≤256 B values; 16-entry scan window picks largest cold victim |
 | `storage/cache_sharded.go` | `shardedLIRSCache`: up to 256 independent `LIRSCache` instances keyed on the **high** bits of `fnv64a(key)`; `cacheShardCountFor` falls back to a single cache below 2 MB. See invariant 36 |
 | `storage/repair.go` + `cmd/veltrix-repair` | Exact repair of value-transform metadata lost by pre-v1.1.0 WALs: `IndexEntry.CRC32C` is the plaintext CRC and acts as the oracle; `CheckTransformMetadataHealth()` samples 512 records at startup |
+| `storage/cgo_bridge_storage_bridge_linux.go` + `vlog_flush_bridge_linux.go` | cgo binding for the io_uring VLog write bridge (`storage_bridge.cpp`, compiled in by `cgo_storage_bridge_impl_linux.cpp`); `vlogFlushViaBridge` submits a batch's extent as one SQE + one fdatasync, falling back to pwrite when the bridge is off or failed. Opt-in — invariant 51 |
 | `storage/cgo_toggle.go` | `VELTRIXDB_DISABLE_CGO_ENGINE=1` → `cgoEngineDisabled()`: skips the io_uring bridge and C++ batch engine and selects the map index on a cgo build. `VELTRIXDB_URING_BRIDGE=off\|on\|sqpoll` (default off) → `uringBridgeModeFromEnv()` |
 | `storage/fdatasync_linux.go` / `storage/fdatasync_other.go` | `syscall.Fdatasync` on Linux; plain `syscall.Fsync` elsewhere. **Not equivalent** — Darwin's fsync returns at the drive cache (0.020 ms measured) and never flushes it. `F_FULLFSYNC` (3.098 ms) is not called anywhere |
 | `storage/testconfig_test.go` | `testStorageConfig()` — the single source of test engine config. New test helpers must call it (invariant 39) |
@@ -121,13 +129,14 @@ curl http://localhost:2112/readyz
 | `storage/batcher.go` | `WriteBatcher`: 2 MB / **4096-entry** / 5 ms flush windows; batchBufPool pre-sized 4096; channel depth 65536; falls back to sync Put when saturated |
 | `storage/cgo_bridge.go` | CGO bridge (Go <1.21): zero-copy uintptr pointer passing to C++ VeltrixBatchEngine |
 | `storage/cgo_bridge_pinner.go` | CGO bridge (Go ≥1.21): `runtime.Pinner` path — pins Go backing arrays, stores pointers directly in C heap |
-| `storage/index_hugepage_linux.go` | `HugepageAlloc` / `HugepageFree`: 2 MB hugepage mmap for Go Index Vault (Linux); falls back to regular mmap |
-| `storage/mlockall_linux.go` | `LockProcessMemory` / `SetMemoryRLimitLock`: mlockall(MCL_CURRENT\|MCL_FUTURE\|MCL_ONFAULT) to prevent swap eviction at 1B+ key scale |
+| `storage/index_hugepage_linux.go` | `HugepageAlloc` / `HugepageFree`: 2 MB hugepage mmap (Linux); falls back to regular mmap. **No caller** — neither index uses it |
+| `storage/mlockall_linux.go` | `LockProcessMemory` / `SetMemoryRLimitLock`: mlockall(MCL_CURRENT\|MCL_FUTURE\|MCL_ONFAULT) to prevent swap eviction at 1B+ key scale. **No caller** in the server |
 | `cmd/server/main.go` | TCP server: binary + text protocol, `binPayloadPool`, flag parsing; `--net` picks the Go server or the C++ front-end; `--pprof-addr` (pprof.go) serves CPU/heap/trace profiles on a separate listener |
 | `netfront/` | C++ network front-end (invariant 50): `netfront.cpp` event loops (io_uring / poll), `netfront.go` cgo binding + `vxnfExec` executing each loop iteration's requests against the engine; `stats.go` per-stage latency histograms (`LatencyReport`, logged at shutdown) |
 | `cmd/server/readv_linux.go` | `readvInto` + `setSocketRecvBuf`: scatter-gather readv(2) + SO_RCVBUF 256 KB hint on accept |
 | `client/tcp.go` | `TCPConn`: persistent TCP connection, Put/Get/Delete/Ping/Info/Redial |
-| `cmd/loadtest/main.go` | Concurrent load tester: per-goroutine conn + RNG, latency percentiles |
+| `cmd/loadtest/main.go` | Concurrent load tester: per-goroutine conn + RNG, latency percentiles; `--proto=text\|binary` (default text; the C++ front-end needs binary) |
+| `scripts/net-bench.sh` + `.github/workflows/net-bench.yml` | Front-end × storage-configuration bench (`NETS`, `ENGINES`, `WINDOWS`, watchdog); the "Net front-end" workflow also runs the `netfront` tests on both backends. See BENCHMARKING.md |
 | `cpp/include/scheduler.hpp` | `PriorityScheduler`: 3-tier io_uring queue + write batching + fixed bufs |
 | `cpp/src/scheduler.cpp` | Scheduler implementation: ioprio, write group commit, three separate tier deques |
 | `cpp/include/allocator.hpp` | `SegmentedPool` (hugepage-capable slab allocator), `IoBuffer` — no longer contains `ArtSlabAllocator` |
@@ -138,16 +147,16 @@ curl http://localhost:2112/readyz
 | `cpp/include/batch_engine.hpp` | `VeltrixBatchEngine` C API: shard-parallel vectorized batch put/get; NUMA-aware constructor (`veltrix_batch_engine_create_ex`) |
 | `cpp/include/lockfree_index.hpp` | `LockFreeIndex`: hash-only open-addressing map. **Not wired and not safe as the index**: it stores no key bytes (a 64-bit collision returns another key's entry) and updates fields non-atomically. The index is `storage/native_index.cpp` |
 | `cpp/include/numa_topology.hpp` | `NumaTopology` / `nvme_preferred_node` / `pin_thread_to_node`: NUMA node discovery + NVMe IRQ affinity thread pinning |
-| `cpp/include/uring_reader.hpp` | `UringReader`: SQPOLL io_uring SSTable reader; zero-syscall submission; dedicated Tier 0 completion thread; pre-registered fixed buffers |
+| `cpp/include/uring_reader.hpp` | `UringReader`: SQPOLL io_uring SSTable reader; zero-syscall submission; dedicated Tier 0 completion thread; pre-registered fixed buffers. **Compiled in by `storage/cgo_uring_linux.cpp` but no Go call site** |
 | `cpp/src/batch_engine.cpp` | VeltrixBatchEngine implementation |
 | `cpp/src/numa_topology.cpp` | NUMA topology implementation |
-| `cpp/src/uring_reader.cpp` | UringReader implementation |
+| `cpp/src/uring_reader.cpp` | UringReader implementation (not called from Go) |
 | `metrics/prometheus.go` | `VeltrixCollector`: all Prometheus metrics |
 | `cluster/` | Partition map, gossip failure detector, consistent hash ring |
 | `replication/` | Async/quorum/strong replication, vector clocks, anti-entropy |
 | `scripts/build.sh` | Full build: C++ + Go + tarball; uses `cd` subshell (Go 1.19+ compatible) |
 | `scripts/hugepages.sh` | One-time host prep: hugepages, NVMe scheduler, ulimits |
-| `scripts/sysctl.conf` | Drop-in `/etc/sysctl.d/99-veltrixdb.conf` for production VMs |
+| `scripts/sysctl.conf` | Drop-in `/etc/sysctl.d/99-veltrixdb.conf` for production VMs; carries `vm.max_map_count = 262144`, which the native index needs at large key counts (invariant 46) |
 
 ---
 
@@ -169,14 +178,14 @@ curl http://localhost:2112/readyz
 
 8. **`/dev/nvme0n1` is the GKE boot disk.** The nvme-prep DaemonSet detects it by checking if it's mounted AND by size (375 GiB local SSDs vs 100 GiB boot). Never hardcode device paths.
 
-9. **C++ `io_uring` code is Linux-only, and most of it is not in the shipped binary.** Do not attempt to compile `cpp/` on macOS. The Go layer is the cross-platform storage engine and is fully functional alone; C++ is an optional Linux-only accelerator. What is actually reachable from Go:
+9. **C++ `io_uring` code is Linux-only, and most of it is not in the shipped binary.** Do not attempt to compile `cpp/` on macOS. The Go layer is the cross-platform storage engine and is fully functional alone; apart from the native index (any cgo build, macOS included — invariant 44), C++ is an optional Linux-only accelerator. What is actually reachable from Go:
 
-    - **Compiled via cgo shims in `storage/`** (needs `CGO_ENABLED=1` + Linux): `batch_engine.cpp`, `uring_reader.cpp`, `numa_topology.cpp`.
-    - **Compiled by CMake into `libveltrixdb_engine.a`** and linked only when `scripts/build.sh` runs without `--go-only` on Linux: `lirs_cache.cpp`, `shard.cpp`, `write_path.cpp`, `defragmenter.cpp`, `art.cpp`, `scheduler.cpp`, `storage_bridge.cpp`, `vlog.cpp`, `ebpf_gc_throttle.cpp`. Of these only `storage_bridge.cpp` has a C entry point Go calls (`storage_bridge_capi.h`) — **the ART index, the priority scheduler and the C++ VLog are built but unreachable from Go today**. Treat "it compiles" as the only guarantee.
+    - **Compiled via cgo shims in `storage/`** (needs `CGO_ENABLED=1` + Linux): `batch_engine.cpp`, `numa_topology.cpp`, `storage_bridge.cpp` (the io_uring VLog write bridge, `storage_bridge_capi.h`; opt-in at runtime, invariant 51) and `uring_reader.cpp` — the last one is compiled in but **has no Go call site**.
+    - **Compiled by CMake into `libveltrixdb_engine.a`** and linked only when `scripts/build.sh` runs without `--go-only` on Linux: `lirs_cache.cpp`, `shard.cpp`, `write_path.cpp`, `defragmenter.cpp`, `art.cpp`, `scheduler.cpp`, `vlog.cpp`, `ebpf_gc_throttle.cpp`. None has a C entry point Go calls — **the ART index, the priority scheduler and the C++ VLog are built but unreachable from Go today**. Treat "it compiles" as the only guarantee.
 
-    Never list the three cgo-shim sources in `cpp/CMakeLists.txt`: they would then be defined twice at link time.
+    Never list the four cgo-shim sources in `cpp/CMakeLists.txt`: they would then be defined twice at link time.
 
-    **The Docker image is `CGO_ENABLED=1` by default** (native index; `--build-arg CGO_ENABLED=0` gives the old static image). The io_uring VLog bridge is **opt-in** (`VELTRIXDB_URING_BRIDGE=on|sqpoll`, invariant 51). Under the RuntimeDefault seccomp profile `io_uring_setup` is blocked, so an opted-in bridge fails to start and VLog batches fall back to pwrite. CI job `node-6-cpp` builds the CMake target, the cgo shims and `scripts/build.sh` and runs the storage suite with the C++ engine on; `node-5-race` runs with the engine off but `VELTRIXDB_INDEX=native`; every other job is `CGO_ENABLED=0`.
+    **The Docker image is `CGO_ENABLED=1` by default** (native index; `--build-arg CGO_ENABLED=0` gives the old static image). The io_uring VLog bridge is **opt-in** (`VELTRIXDB_URING_BRIDGE=on|sqpoll`, invariant 51). Under the RuntimeDefault seccomp profile `io_uring_setup` is blocked, so an opted-in bridge fails to start and VLog batches fall back to pwrite. CI job `node-6-cpp` builds the CMake target, the cgo shims and `scripts/build.sh` and runs the storage suite with the C++ engine on and `VELTRIXDB_URING_BRIDGE=on`; `node-5-race` runs with the engine off but `VELTRIXDB_INDEX=native`; every other job is `CGO_ENABLED=0`.
 
     The native index is the exception to the shim pattern: its sources live in `storage/` itself (invariant 44).
 
@@ -204,7 +213,7 @@ curl http://localhost:2112/readyz
 
 20. **`WALFlushWindowMs` and `VLogFlushWindowMs` must always be equal** (both default 15 ms). The concurrent `Put()` path waits for `max(WAL_wait, VLog_wait)`. If windows differ, the shorter one finishes first but the caller still blocks on the longer one — the shorter window's throughput benefit is lost. Keep them equal so both fdatasyncs race to completion within the same window.
 
-21. **WAL records are binary by default (`storage/wal_format.go`); the legacy text format is still READ, and written only under `--wal-format=text`.** Binary: 48-byte little-endian header (magic `0xB1`, version, flags tombstone/packed/inline, keyLen, valueLen, diskLen, CRC32C of plaintext, xflags, timestamp, version, vlogOffset) + key + optional inline value + CRC32C of the whole record. The first byte decides per record (`0xB1` vs an ASCII digit), so upgraded nodes append binary after existing text. **Never reintroduce delimiter parsing of keys**: a key containing `|` or `\n` made a text record unparseable, replay read that as a torn tail, and every later acknowledged write was dropped on crash restart (`TestWAL_CrashReplay_KeysWithDelimiters`). Rollback to a pre-binary build: run once with `--wal-format=text` and stop cleanly — the checkpoint rewrites wal.log as text. The field semantics below apply to both encodings. Legacy text record: `timestamp|tombstone|key|valueLen|crc32hex|version|vlogOffset|packed|diskLen|xflags\n[value bytes\n]`. `valueLen` is the PLAINTEXT length; `diskLen` is the on-disk blob length after compression + encryption; `xflags` (hex) carries `FlagCompressed|FlagEncrypted`. Replay needs all three — see invariant 29. In KV-sep mode, `vlogOffset > 0` → value already durable in VLog, no value bytes in WAL (WAL header only, ~100 B/write instead of header+value). On restart, `replayWAL()` parses each disk's WAL and `applyWALReplay()` rebuilds the in-memory index. Clean shutdown calls `wal.truncate()` (zeros the file) so next startup skips replay entirely. Dirty shutdown (crash) leaves WAL intact for full replay. Legacy 6-field entries (no vlogOffset field) are parsed for backward compatibility: if value bytes are present they are re-appended to VLog and old VLog data becomes GC garbage.
+21. **WAL records are binary by default (`storage/wal_format.go`); the legacy text format is still READ, and written only under `--wal-format=text`.** Binary: 48-byte little-endian header (magic `0xB1`, version, flags tombstone/packed/inline, keyLen, valueLen, diskLen, CRC32C of plaintext, xflags, timestamp (UnixNano), version, vlogOffset) + key + optional inline value + CRC32C of the whole record. The first byte decides per record (`0xB1` vs an ASCII digit), so upgraded nodes append binary after existing text. **Never reintroduce delimiter parsing of keys**: a key containing `|` or `\n` made a text record unparseable, replay read that as a torn tail, and every later acknowledged write was dropped on crash restart (`TestWAL_CrashReplay_KeysWithDelimiters`). Rollback to a pre-binary build: run once with `--wal-format=text` and stop cleanly — the checkpoint rewrites wal.log as text. Only `cmd/server` has `--wal-format` (it logs a warning that keys containing `|` or `\n` can lose writes on crash); `veltrixdb-backup` (including `restore-pitr`) and `veltrix-repair` always write binary. The field semantics below apply to both encodings. Legacy text record: `timestamp|tombstone|key|valueLen|crc32hex|version|vlogOffset|packed|diskLen|xflags\n[value bytes\n]`. `valueLen` is the PLAINTEXT length; `diskLen` is the on-disk blob length after compression + encryption; `xflags` (hex) carries `FlagCompressed|FlagEncrypted`. Replay needs all three — see invariant 29. In KV-sep mode, `vlogOffset > 0` → value already durable in VLog, no value bytes in WAL (WAL header only, ~100 B/write instead of header+value). On restart, `replayWAL()` parses each disk's WAL and `applyWALReplay()` rebuilds the in-memory index. Clean shutdown (`Engine.Close`) writes a compacted checkpoint — one record per live key, tombstones dropped — to `wal.log.ckpt`, fdatasyncs it and renames it over `wal.log` (`writeWALCheckpoint`), so the next startup replays O(live keys) rather than the full history; a crash mid-checkpoint leaves the old WAL intact. Dirty shutdown (crash) leaves WAL intact for full replay. Legacy 6-field entries (no vlogOffset field) are parsed for backward compatibility: if value bytes are present they are re-appended to VLog and old VLog data becomes GC garbage.
 
 22. **Admission control thresholds: 20 ms EWMA activates write throttle + GC pause; 10 ms EWMA clears both; stale EWMA auto-expires after 4 min.** When `ReadLatencyEWMANs > admissionThrottleNs (20ms)`, `AdmissionControl.WriteThrottleActive` is set true and `GCPaused` is set true. Each `Put()` call checks `WriteThrottleActive` before `beginAppend()` and sleeps 2 ms if set. `compactVLog()` checks `GCPaused` at entry. Staleness guard: if `AdmissionControl.LastReadNs` is 0 (no reads ever) or the last `Get()` was more than `gcEWMAStaleDuration` (4 min = 2 × DefragInterval) ago, `compactVLog()` treats the EWMA as stale, clears `GCPaused`, and resets `ReadLatencyEWMANs` to 0 so the next real read starts fresh — this prevents a single slow read early in a write-only benchmark from permanently blocking VLog GC. `LastReadNs` is stamped inside the `Get()` defer on every call. The `veltrixdb_storage_write_admission_throttles_total` counter tracks throttled Put operations. The GC rate limiter threshold (`gcLatencyThresholdNs=15ms`) fires before admission control (20ms) to progressively cap GC bandwidth before full pause.
 
@@ -354,8 +363,8 @@ status: 0x00=OK   0x01=ERR  0x02=NOT_FOUND
 2. `helm install veltrixdb veltrixdb/veltrixdb --namespace veltrixdb --create-namespace` — deploys StorageClass + nvme-prep DaemonSet + StatefulSet + ServiceMonitor + PDB in one step. Or use the Operator: `kubectl apply -f VeltrixDB-Kubernetes-Operator/config/crd/bases/ && kubectl apply -f VeltrixDB-Kubernetes-Operator/config/manager/manager.yaml`
 3. Wait for 24 PVs (3 nodes × 8 SSDs) to be `Available`
 4. Verify pods are Running: `kubectl get pods -n veltrixdb -l app.kubernetes.io/name=veltrixdb`
-5. Set `vm.nr_hugepages = 512` on each node (startup script or DaemonSet)
-6. Verify `io_uring_register_buffers` succeeds — needs RLIMIT_MEMLOCK or CAP_IPC_LOCK
+5. Set `vm.max_map_count = 262144` on each node (startup script or DaemonSet) — the native index on the default `CGO_ENABLED=1` image needs it at large key counts (invariant 46). `vm.nr_hugepages = 512` only matters for the unwired C++ ART slab allocator
+6. Only if the io_uring VLog bridge is opted in (`VELTRIXDB_URING_BRIDGE=on|sqpoll`, invariant 51): the pod needs a seccomp profile allowing `io_uring_setup` / `io_uring_enter` / `io_uring_register` (RuntimeDefault blocks them; the bridge then falls back to pwrite), and `io_uring_register_buffers` needs RLIMIT_MEMLOCK or CAP_IPC_LOCK
 
 ---
 
@@ -364,14 +373,18 @@ status: 0x00=OK   0x01=ERR  0x02=NOT_FOUND
 | Goal | Config | Value |
 |------|--------|-------|
 | Max read throughput | `cfg.CacheMaxSizeMB` | 262144 (256 GB) |
-| Max write throughput | `cfg.write_batch_limit` | 32 (C++ scheduler) |
-| Write latency cap | `cfg.write_batch_window_us` | 1000 (1 ms) |
+| Max write throughput | `cfg.write_batch_limit` | 32 (C++ scheduler — not wired to Go, no effect on the server) |
+| Write latency cap | `cfg.write_batch_window_us` | 1000 (1 ms) (C++ scheduler — same) |
 | **WAL flush window (Go)** | `cfg.WALFlushWindowMs` | **15 ms** — P99 ≈ 15.2 ms on NVMe; batch_size ≈ writes/s/disk × 0.015; 0 = immediate flush (legacy) |
 | **VLog flush window (Go)** | `cfg.VLogFlushWindowMs` | **15 ms** — must equal WALFlushWindowMs; VLog group-commit runs same pattern; WAL+VLog submitted concurrently in Put() |
 | WAL max batch cap | `cfg.WALMaxBatchEntries` | 4096 — forces early flush if batch reaches this before window expires |
 | Range scan speed | `cfg.DefragInterval` | 30s |
-| Hugepages (C++) | `/proc/sys/vm/nr_hugepages` | ≥ 512 |
-| io_uring fixed bufs | `scheduler.register_fixed_buffers(N, size)` | N=8, size=512KB |
+| Hugepages (C++) | `/proc/sys/vm/nr_hugepages` | ≥ 512 (ART slab allocator — not wired to Go) |
+| io_uring fixed bufs | `scheduler.register_fixed_buffers(N, size)` | N=8, size=512KB (C++ scheduler — not wired to Go) |
+| Memory mappings (native index) | `vm.max_map_count` | ≥ 262144 (`scripts/sysctl.conf`) — below that a large engine's inserts can fail with ENOMEM (invariant 46) |
+| Index implementation | `VELTRIXDB_INDEX` | unset = native on cgo builds; `map` opts out; `native` forces (invariant 44) |
+| io_uring VLog write bridge | `VELTRIXDB_URING_BRIDGE` | `off` (default); `on` / `sqpoll` only after measuring on the target (invariant 51) |
+| C++ network front-end | `--net` / `--net-threads` | `go` (default); `cpp` / `uring` / `poll` is experimental, binary protocol only, standalone without `--auth-config` (invariant 50) |
 | KV separation (WiscKey) | `cfg.KeyValueSeparation` | `true` (default) |
 | VLog GC trigger | `cfg.DefragThreshold` | 0.30 — GC when 30% of VLog is dead space |
 | GC bandwidth cap (normal) | `gcThrottledBPS` (defrag.go) | 60 MB/s (~15% of 400 MB/s NVMe) when read EWMA > 15 ms AND garbage < 50%; unlimited when reads fast |
@@ -397,10 +410,10 @@ When reading load test output or Prometheus metrics, keep these in mind:
 **Read-heavy P99 < 5 ms at 2 M ops/sec on n2-highmem-64.** Achievable with the `--read-heavy` preset + correct hardware setup. Key facts:
 
 - **Cache hit (>95% of reads at the right size)**: ~110 ns sharded-LIRS lookup (measured 112.9 ns on darwin/arm64 18-core; was 711 ns before the cache was sharded). At 200 ns/op the per-core ceiling is ~5 M ops/sec; 64 cores → ~320 M ops/sec theoretical → 2 M is well within budget.
-- **Cache miss (≤5% with 400 GB cache for ~1.5 B small keys)**: 1 NVMe random read via the C++ `UringReader` with SQPOLL — ~80 µs P99 on n2-highmem-64 local SSD. 5% × 80 µs + 95% × 200 ns ≈ 4.2 µs blended P99 — order of magnitude under the 5 ms target.
+- **Cache miss (≤5% with 400 GB cache for ~1.5 B small keys)**: 1 NVMe random read via Go `pread` in `storage/vlog.go:ReadValue` (the C++ `UringReader` is not called from Go) — ~80 µs P99 on n2-highmem-64 local SSD (projected). 5% × 80 µs + 95% × 200 ns ≈ 4.2 µs blended P99 — order of magnitude under the 5 ms target.
 - **The hot-path bottleneck at 2 M ops/sec was the EWMA CAS-loop in `Get()`** — every read CAS'd the same `ReadLatencyEWMANs` atomic, so 64 cores ping-ponged a single cache line. Fixed: the CAS now runs only every 64th read (`readEWMASampleEvery=64`). Admission-control lag is ≤ 32 µs at 2 M/s — negligible vs the 10–20 ms admission thresholds.
-- **What still hurts P99**: GC bandwidth competing with reads (mitigated by 3-tier I/O priority + the 60→200 MB/s tiered cap), a single hot key crossing CPU NUMA nodes (mitigated by the NUMA-aware CGO bridge, automatic on Linux CGO builds), or running without hugepages (TLB misses on the index hash map).
-- **Operator checklist for the target**: `--read-heavy`, `vm.nr_hugepages ≥ 2048`, mlockall enabled, `--local-ssd-interface=NVME` GKE node pool, a binary built with `CGO_ENABLED=1` on Linux, clients using MGET batches of 256 keys with one persistent TCP connection per CPU core. **There are no `--cgo-batch-engine` / `--numa-aware` / `--sqpoll-reader` flags** — earlier revisions of this checklist listed them, and because `flag.Parse()` is `ExitOnError`, passing any of them makes the server exit with "flag provided but not defined". In a CGO build `newCGOBatchEngine` is always constructed and always uses the NUMA-aware `veltrix_batch_engine_create_ex` (Go ≥1.21); only `VELTRIXDB_DISABLE_CGO_ENGINE=1` or compiling out turns it off. The io_uring VLog bridge is the exception: opt-in via `VELTRIXDB_URING_BRIDGE=on|sqpoll` (invariant 51).
+- **What still hurts P99**: GC bandwidth competing with reads (mitigated by 3-tier I/O priority + the 60→200 MB/s tiered cap), a single hot key crossing CPU NUMA nodes (NUMA pinning covers only the C++ batch engine's threads, i.e. the `BatchPut` / `WriteBatcher` path), or TLB misses on the index (nothing maps it on hugepages today).
+- **Operator checklist for the target**: `--read-heavy`, `vm.max_map_count ≥ 262144`, `--local-ssd-interface=NVME` GKE node pool, a binary built with `CGO_ENABLED=1` on Linux, clients using MGET batches of 256 keys with one persistent TCP connection per CPU core. **There are no `--cgo-batch-engine` / `--numa-aware` / `--sqpoll-reader` flags** — earlier revisions of this checklist listed them, and because `flag.Parse()` is `ExitOnError`, passing any of them makes the server exit with "flag provided but not defined". In a CGO build `newCGOBatchEngine` is always constructed and always uses the NUMA-aware `veltrix_batch_engine_create_ex` (Go ≥1.21); only `VELTRIXDB_DISABLE_CGO_ENGINE=1` or compiling out turns it off. The io_uring VLog bridge is the exception: opt-in via `VELTRIXDB_URING_BRIDGE=on|sqpoll` (invariant 51).
 
 **WAL + VLog flush windows are the write throughput lever.** Both default to **15 ms**. `WALFlushWindowMs=15` amortises the fdatasync cost across all writers arriving within a 15 ms window. In the KV-separation path, `Put()` submits to WAL and VLog concurrently via `beginAppend()` and waits for both — effective P99 = `max(WAL_wait, VLog_wait) + fdatasync`, not their sum. Before the window: macOS P99 was ~122 ms (one `F_FULLFSYNC` per write). With the 15 ms window: macOS P99 ~24 ms, Linux NVMe P99 ~15.2 ms. Write throughput is 10× higher at low concurrency because N writes share 1 fdatasync instead of paying N times. **To hit 100K+ writes/s**: set both windows to 5 ms (`--wal-flush-window-ms 5 --vlog-flush-window-ms 5`); formula: `writes/goroutine/s ≈ 1000 / window_ms` → at 5 ms, 512 goroutines yield ~102K writes/s theoretical ceiling.
 
@@ -435,7 +448,7 @@ When reading load test output or Prometheus metrics, keep these in mind:
 - `sectorSize = 512` in `storage/segment.go` — tied to O_DIRECT kernel contract AND `ioPool` alignment logic
 - `numShards = 8192` — bitmask `& 0x1FFF` is baked into shard routing AND the C++ `kNumShards`; both must be changed atomically; existing on-disk data is not portable across shard-count changes without a migration
 - `appendCh` buffer size in `storage/wal.go` — cap=4096 absorbs bursts; too small causes backpressure spikes
-- `IOSQE_IO_LINK` on consecutive write SQEs — removes the need for explicit fdatasync SQEs in the C++ hot path; removing it breaks write ordering
-- `sqe->ioprio` RT class for reads — removing it re-introduces 100+ ms read tail latency during write bursts
+- `IOSQE_IO_LINK` on consecutive write SQEs — removes the need for explicit fdatasync SQEs in the C++ scheduler; removing it breaks write ordering (the scheduler is not wired to Go today)
+- `sqe->ioprio` RT class for reads in the C++ scheduler — removing it re-introduces read tail latency during write bursts once the scheduler is wired (it is not today)
 - `RecordHeader` field order in `cpp/include/shard.hpp` — fields are ordered to eliminate implicit compiler padding so the struct is exactly 64 bytes. The explicit `_pad0[2]` after `key_len` replaces the 2-byte implicit gap; `_pad[37]` fills to 64. The static_assert enforces this. Do not reorder fields without recomputing the padding.
 - `ArtSlabAllocator` in `cpp/include/art.hpp` — uses 256 KB slabs with 64-byte cache-line alignment via a composed `SegmentedPool`. The removed `allocator.hpp` stub (which inherited from `SegmentedPool` and called `enable_hugepages(true)`) was non-functional — it had no `make<T>()` or `make_leaf()` methods and caused a class redefinition when `art.hpp` was included. Do not re-add the stub.

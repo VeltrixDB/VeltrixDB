@@ -42,7 +42,18 @@ disk_idx = shard_id % numDisks        // which NVMe disk owns this shard
 Anything sized *per shard* is multiplied by 8192. See the sizing note in
 [ARCHITECTURE.md](../ARCHITECTURE.md#sharding).
 
-Each shard holds a `map[string]IndexEntry` — the full live key space is always in memory (the Index Vault). There is no on-disk B-tree or LSM tree for the index; durability comes from the WAL.
+Each shard holds a key → `IndexEntry` table — the full live key space is always in memory (the Index Vault). There is no on-disk B-tree or LSM tree for the index; durability comes from the WAL.
+
+The table implementation is chosen per process:
+
+| Build | Default | Notes |
+|-------|---------|-------|
+| cgo (incl. macOS) | Off-heap native table (`storage/native_index.cpp`) | Per-shard C++ open-addressing table plus key arena, invisible to the Go GC. Arrays of a page or more are individually mmap'd, so large engines need `vm.max_map_count ≥ 262144` (`scripts/sysctl.conf`); below that an insert can fail with ENOMEM and panic. |
+| `CGO_ENABLED=0` | Go `map[string]IndexEntry` | — |
+
+`VELTRIXDB_INDEX=map` opts a cgo build out of the native table (`=native` forces it); `VELTRIXDB_DISABLE_CGO_ENGINE=1` also selects the map. Measured with 5M keys: full GC 21 ms → 0.27 ms and settled RSS 168 → 142 B/key, at ~19 ns more per cache-miss lookup.
+
+A separate ordered skiplist (`storage/ordered_index.go`) serves range scans. A key is inserted into it only when it becomes live (absent or tombstoned before); overwriting a live key does not touch it.
 
 ### IndexEntry (64 bytes, one CPU cache line)
 
@@ -57,7 +68,7 @@ Each shard holds a `map[string]IndexEntry` — the full live key space is always
 | `WriteTimestampUs` | 8 B | Write time (µs since Unix epoch) |
 | `TTLExpiryUs` | 8 B | Absolute expiry (0 = immortal) |
 | `CRC32C` | 4 B | Castagnoli checksum of value |
-| `ShardID` | 2 B | Shard 0–1023 |
+| `ShardID` | 2 B | Shard 0–8191 |
 | `Flags` | 1 B | Bitmask (see below) |
 | `SchemaVersion` | 1 B | Rolling migration version |
 | `_reserved` | 8 B | Future use |
@@ -119,19 +130,56 @@ pwrite64(fd, value, offset)                     // POSIX-safe concurrent writes
 
 Concurrent `pwrite64` calls to non-overlapping ranges are safe by POSIX. No mutex is held during the I/O — throughput is bounded only by NVMe IOPS (~450K/disk), not lock contention.
 
+**Batch writes** (`MultiPut`) go through the `VLogBatcher`, which stages the whole batch's records into one contiguous 4 KB-aligned extent and writes it with **one `pwrite` plus one `fdatasync`** per disk, however many blocks it spans.
+
+On Linux cgo builds the batch write can instead be submitted through an io_uring bridge (one ring per disk). It is **off by default** — the batch is already a single `pwrite`, so the bridge saves at most one syscall. Opt in with `VELTRIXDB_URING_BRIDGE=on` (or `sqpoll` for a kernel polling thread); `VELTRIXDB_DISABLE_CGO_ENGINE=1` forces it off. If ring setup fails (for example, Kubernetes' RuntimeDefault seccomp profile blocks `io_uring_setup`) the engine logs it and falls back to `pwrite`.
+
+### Read Path
+
+`Get` checks, in order: the LIRS cache, the index (absent / tombstone / expired), a dirty value still in RAM, and finally the VLog (`VLog.ReadValue`, Go, CRC32C-verified). `GetNoIO` runs the same steps but stops before the VLog read and returns `needIO=true` instead; `GetAfterNoIO` completes such a key. The pair counts as one read. It exists for callers that must not block on disk, such as the C++ network front-end's event loops.
+
 ---
 
 ## 3. Write-Ahead Log (WAL)
 
-Each disk has one `wal.log` file. The WAL provides crash durability: on unclean shutdown, `replayWAL()` reads it and rebuilds the index. On clean shutdown, `wal.truncate()` zeroes the file so next startup skips replay.
+Each disk has one `wal.log` file. The WAL provides crash durability: on unclean shutdown, `replayWAL()` reads it and rebuilds the index. On clean shutdown, a checkpoint rewrites `wal.log` as one record per live key (temp file + atomic rename), so the next startup replays O(live keys) instead of the full write history.
 
 ### WAL Record Format
 
-New records are binary — see `storage/wal_format.go` for the byte layout: a
-48-byte little-endian header, the key, the value when inline, and a CRC32C
-over the whole record. Replay also reads the legacy text records below, in any
-mix with binary ones; `--wal-format=text` writes them, for rolling back to a
-pre-binary build only. The field meanings are the same in both.
+New records are binary (`storage/wal_format.go`), all integers little-endian:
+
+```
+Offset  Size  Field
+  0      1    Magic 0xB1 (a text record always starts with an ASCII digit)
+  1      1    Format version (1)
+  2      2    Flags: bit0 tombstone, bit1 packed, bit2 value inline
+  4      4    Key length
+  8      4    valueLen  (plaintext length)
+ 12      4    diskLen   (on-disk length after compress + encrypt)
+ 16      4    CRC32C of the plaintext value
+ 20      1    xflags: FlagCompressed | FlagEncrypted
+ 21      3    Zero
+ 24      8    Timestamp (UnixNano)
+ 32      8    Version
+ 40      8    vlogOffset (0 = value inline, or none)
+─────────────────────────────────────────────────────
+ 48    keyLen  Key bytes
+  …    valueLen Value bytes (only when the inline flag is set)
+ end     4    CRC32C of every byte above
+```
+
+Records are length-prefixed, so key bytes are never interpreted: keys
+containing `|` or `\n` are safe. (With the text format such a key made replay
+stop at that record and drop every later acknowledged write on crash restart.)
+The trailing CRC32C covers the whole record, header included — text headers
+had no checksum.
+
+Replay also reads the legacy text records below, in any mix with binary ones
+(the first byte decides, per record), so an upgraded node keeps appending
+binary records after existing text ones. `--wal-format=text` writes text, and
+exists only to roll back to a pre-binary build: run once with it and stop
+cleanly (the checkpoint rewrites `wal.log` as text), then downgrade. The field
+meanings are the same in both.
 
 Legacy text record:
 
@@ -147,7 +195,7 @@ able to read newly-written data.
 
 | Field | Type | Meaning |
 |-------|------|---------|
-| `timestamp` | int64 | µs since Unix epoch |
+| `timestamp` | int64 | ns since Unix epoch |
 | `isTombstone` | "1"/"0" | Delete marker |
 | `key` | string | Raw key bytes |
 | `valueLen` | decimal | Value byte count |
@@ -164,18 +212,18 @@ able to read newly-written data.
 > v1.1.0 the WAL carried neither, which is exactly what went wrong; see
 > [DR_RUNBOOK.md](DR_RUNBOOK.md) §7.
 
-**KV-separation mode**: `vlogOffset > 0` and no value bytes follow in the WAL — the WAL record is ~100 bytes instead of 100 + value_size. The VLog already has the durable value bytes.
+**KV-separation mode**: `vlogOffset > 0` and no value bytes follow in the WAL — the WAL record is header + key only instead of also carrying the value. The VLog already has the durable value bytes.
 
 ### Group Commit
 
 The WAL uses a **group commit** pattern to amortise `fdatasync` cost:
 
-1. Every `Put` call enqueues a `WALEntry` to a channel.
-2. A single flusher goroutine drains up to `WALMaxBatchEntries` (4096) entries per cycle.
-3. One `fdatasync` covers all entries in the batch.
+1. Every `Put` call enqueues a `WALEntry` to a channel; a `MultiPut` serializes all its records into one buffer and enqueues it with one channel send.
+2. A single flusher goroutine drains up to `WALMaxBatchEntries` (4096) records per cycle.
+3. The whole batch is written with one `write(2)`, and one `fdatasync` covers it.
 4. All pending callers unblock after the single fdatasync.
 
-Default flush window: **10 ms**. At 1000 writes/s, the batch is ~10 entries; at 100K writes/s the batch is ~1000 entries. Both pay one fdatasync.
+Default flush window: **15 ms** (`--wal-flush-window-ms`). At 1000 writes/s, the batch is ~15 entries; at 100K writes/s the batch is ~1500 entries. Both pay one fdatasync.
 
 ### WAL and VLog Concurrency
 
@@ -272,7 +320,7 @@ The emergency tier prevents a "death spiral" where high read EWMA permanently pa
     VLog[3] ──► /mnt/nvme3/vlog_active.dat
 ```
 
-All 8 NVMe disks receive writes in parallel — no single disk is a serialization point. The C++ io_uring layer (Linux only) uses a dedicated `PriorityScheduler` per disk with a 3-tier queue: reads get RT priority to prevent write bursts from causing read tail latency spikes.
+All 8 NVMe disks receive writes in parallel — no single disk is a serialization point.
 
 ---
 
@@ -281,9 +329,9 @@ All 8 NVMe disks receive writes in parallel — no single disk is a serializatio
 On unclean shutdown (crash, OOM kill, SIGKILL):
 
 1. **`replayWAL()`** opens `wal.log` on each disk.
-2. For each record (binary or legacy text): decode it and check its CRC32C.
+2. For each record (binary or legacy text): decode it and check its CRC32C. Crash replay, the PITR archiver and PITR restore all use the same decoder (`walReader`). A torn or corrupt record ends replay: everything before it is applied, and the server logs `[wal] replay of <path> stopped at byte N of M after K records`.
 3. **`applyWALReplay()`** rebuilds the in-memory `shardedIndex`.
 4. For KV-sep records (`vlogOffset > 0`): the VLog already has the value bytes; the WAL entry re-establishes the index pointer without re-reading the value.
 5. Legacy 6-, 7- and 8-field entries are still parsed for backward compatibility. An 8-field record replays with no transform flags, which is correct — it was written before the engine could record them.
 
-On clean shutdown (`SIGTERM`): `wal.truncate()` zeros the WAL file. Next startup sees an empty WAL and skips replay entirely — startup is O(1) instead of O(numLiveKeys).
+On clean shutdown (`SIGTERM`): the engine writes a compacted checkpoint WAL (one record per live key, tombstones dropped) to `wal.log.ckpt` and atomically renames it over `wal.log`, so a crash mid-checkpoint leaves the old WAL intact. Next startup replays O(numLiveKeys) records instead of the full write history. The checkpoint uses the current `--wal-format`.

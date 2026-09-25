@@ -47,6 +47,14 @@ CONCURRENCY=512 BULK_DUR=120 STRESS_DUR=300 \
 
 ## Reference Numbers
 
+> **Provenance:** added at v1.1.0 (2026-07-19); the Linux table is a
+> projection, not a measurement. They predate the one-`write(2)` WAL
+> flusher, one `pwrite` per VLog batch, the binary WAL, the cache write-around
+> for `MultiPut`, the ordered-index overwrite skip and the native index, all
+> of which change write-path numbers. The macOS figures also sit on a `fsync`
+> that does not flush the drive cache (see ARCHITECTURE.md, Durability).
+> Re-run before quoting them.
+
 ### macOS M-series (dev)
 | Metric | Value |
 |--------|-------|
@@ -94,6 +102,11 @@ NETS="go uring poll uring:2" ENGINES=native WINDOWS=5 ./scripts/net-bench.sh
 ENGINES="native bridge sqpoll map nocgo" NETS=go WINDOWS="5 1" ./scripts/net-bench.sh
 ```
 
+Defaults: `NETS="go uring"`, `ENGINES=native`, `WINDOWS=5`, `DURATION=15` s
+per read/mixed workload, `NET_THREADS` = CPU count. The C++ front-ends need
+the binary protocol, so the script drives reads and mixed with
+`loadtest --proto=binary`.
+
 | `ENGINES` value | Configuration |
 |---|---|
 | `native` | native C++ index, io_uring VLog bridge off — the default build |
@@ -119,6 +132,13 @@ Things to know when reading the table:
 - **The client runs on the same host and the data sits on tmpfs.** Compare rows
   with each other, not with other hardware. With fdatasync on RAM, the
   io_uring bridge has no real I/O to overlap.
+- **The C++ front-end is not faster overall.** On the 4-CPU CI runner
+  (2026-09-25, before disk-bound reads were deferred) it cut read P50 to
+  154 µs from 286 µs under `--net=go`, and poll read throughput was ~10%
+  higher, but read P99 was worse (~3.0 vs 1.8 ms), batch writes ~12% lower,
+  and io_uring did not beat poll. The best overall row was the Go front-end
+  with no C++ storage layer. On macOS only poll with one loop runs, and
+  loopback caps round trips at ~60K/s for both — measure on Linux.
 
 ## Ordered key index: measuring whether you need it
 
@@ -127,7 +147,10 @@ Every write maintains a skiplist mirroring all live keys so `RANGE` /
 and get nothing. `--disable-ordered-index` turns it off; `RANGE` and `SCANCUR`
 then return `ErrOrderedIndexDisabled` and everything else is unaffected.
 
-Measured cost on darwin/arm64, 18 cores:
+Measured cost on darwin/arm64, 18 cores (2026-09-21, before overwrites of
+a live key stopped re-inserting into the skiplist — that change took server
+batch writes 1.45M → 3.54M keys/s, so the ON column overstates today's cost
+for overwrite-heavy loads):
 
 | | ordered ON | ordered OFF | delta |
 |---|---|---|---|
