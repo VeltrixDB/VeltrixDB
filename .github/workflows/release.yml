@@ -11,6 +11,13 @@ on:
     workflows: ["CI"]
     types: [completed]
     branches: [main, master]
+  # Re-create the GitHub Release for a tag that already exists (e.g. after the
+  # release job failed). Does not create a tag or push an image.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to (re)create the release for, e.g. v1.9"
+        required: true
 
 permissions:
   contents: write   # create tags + releases
@@ -21,7 +28,7 @@ jobs:
   tag:
     name: Bump version tag
     runs-on: ubuntu-latest
-    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    if: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success' }}
     outputs:
       tag: ${{ steps.bump.outputs.tag }}
       prev_tag: ${{ steps.bump.outputs.prev_tag }}
@@ -83,55 +90,59 @@ jobs:
 
   # ── 3. Create GitHub Release with changelog ─────────────────────────────────
   # Runs after tagging only — independent of whether Docker push succeeded.
+  #
+  # Commit subjects are untrusted text: they are written to a notes FILE and
+  # never pasted into the script. Interpolating them with ${{ }} into a
+  # double-quoted --notes string broke v1.9 (a subject containing "quotes"
+  # split the argument) and let a crafted subject run shell commands.
   release:
     name: Create GitHub Release
     runs-on: ubuntu-latest
     needs: tag
+    if: ${{ always() && (needs.tag.result == 'success' || github.event_name == 'workflow_dispatch') }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Generate changelog
-        id: changelog
-        run: |
-          git fetch --tags --quiet
-          TAG="${{ needs.tag.outputs.tag }}"
-          PREV="${{ needs.tag.outputs.prev_tag }}"
-
-          if [ -z "$PREV" ]; then
-            NOTES=$(git log --pretty=format:"- %s (%h)" HEAD)
-          else
-            NOTES=$(git log --pretty=format:"- %s (%h)" "${PREV}..${TAG}")
-          fi
-
-          {
-            echo "notes<<__ENDNOTES__"
-            echo "$NOTES"
-            echo "__ENDNOTES__"
-          } >> "$GITHUB_OUTPUT"
-
       - name: Create release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          TAG_FROM_JOB: ${{ needs.tag.outputs.tag }}
+          PREV_FROM_JOB: ${{ needs.tag.outputs.prev_tag }}
+          TAG_FROM_INPUT: ${{ github.event.inputs.tag }}
         run: |
-          TAG="${{ needs.tag.outputs.tag }}"
-          PREV="${{ needs.tag.outputs.prev_tag }}"
+          set -euo pipefail
+          git fetch --tags --quiet
+          if [ -n "${TAG_FROM_INPUT:-}" ]; then
+            TAG="$TAG_FROM_INPUT"
+            git rev-parse -q --verify "refs/tags/$TAG" >/dev/null || { echo "tag $TAG does not exist"; exit 1; }
+            # previous v1.N tag by version order
+            PREV=$(git tag -l 'v1.*' --sort=-version:refname | grep -E '^v1\.[0-9]+$' \
+                   | awk -v t="$TAG" 'f{print; exit} $0==t{f=1}')
+          else
+            TAG="$TAG_FROM_JOB"
+            PREV="$PREV_FROM_JOB"
+          fi
           RANGE="${PREV:+${PREV}..}${TAG}"
 
+          {
+            echo "## What's changed in ${TAG}"
+            echo
+            git log --pretty=format:'- %s (%h)' "$RANGE"
+            echo
+            echo
+            echo "## Docker image"
+            echo
+            echo '```'
+            echo "docker pull ghcr.io/veltrixdb/veltrixdb:${TAG}"
+            echo '```'
+            echo
+            echo "## Full diff"
+            echo "https://github.com/${REPO}/compare/${RANGE}"
+          } > release-notes.md
+          cat release-notes.md
+
           gh release delete "$TAG" --yes 2>/dev/null || true
-
-          gh release create "$TAG" \
-            --title "VeltrixDB ${TAG}" \
-            --notes "## What's changed in ${TAG}
-
-          ${{ steps.changelog.outputs.notes }}
-
-          ## Docker image
-
-          \`\`\`
-          docker pull ghcr.io/veltrixdb/veltrixdb:${TAG}
-          \`\`\`
-
-          ## Full diff
-          https://github.com/${{ github.repository }}/compare/${RANGE}"
+          gh release create "$TAG" --title "VeltrixDB ${TAG}" --notes-file release-notes.md
