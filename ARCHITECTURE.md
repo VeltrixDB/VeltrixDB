@@ -317,6 +317,20 @@ Two consequences worth internalising:
 
 ---
 
+## Network front-ends (`--net`)
+
+`go` (default) is one goroutine per connection and serves everything.
+`cpp` / `uring` / `poll` is the C++ front-end in `netfront/`: one event loop
+per core, each with its own `SO_REUSEPORT` listener and io_uring (poll()
+elsewhere). A loop iteration reaps every completion, parses every complete
+frame from every connection, calls Go once (`vxnfExec`) for the whole set, and
+submits all sends and receives together — syscalls and Go transitions are per
+iteration, not per request. Reads are answered inline; writes run on
+goroutines and answer through a queue, and a connection with a write in
+flight is not parsed further, so each connection stays strictly ordered.
+Serves PUT GET DEL PING MPUT MGET of the binary protocol, standalone mode,
+no RBAC; TLS and the text protocol stay on Go.
+
 ## Cluster
 
 ```
