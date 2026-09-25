@@ -229,7 +229,7 @@ func NewVeltrixCollector(
 		compactionRuns:          desc("storage", "compaction_runs_total", "Total memtable-to-SSTable compaction runs."),
 		sstableCreations:        desc("storage", "sstable_creations_total", "Total SSTable files created."),
 		writeBackpressureEvents: desc("storage", "write_backpressure_events_total", "PUT operations delayed by back-pressure due to oversized dirty memtable."),
-		writeAdmissionThrottles: desc("storage", "write_admission_throttles_total", "PUT operations delayed by admission control (read P99 EWMA > 4ms)."),
+		writeAdmissionThrottles: desc("storage", "write_admission_throttles_total", "PUT operations delayed by admission control (read latency EWMA > 20 ms)."),
 
 		// read path
 		reads:          desc("storage", "reads_total", "Total GET operations completed."),
@@ -284,7 +284,7 @@ func NewVeltrixCollector(
 		vlogGarbageRatio:     desc("vlog", "garbage_ratio", "Fraction of VLog bytes that are dead (garbage). Triggers GC when > VLogGCThreshold.", "disk"),
 		vlogFileBytes:        desc("vlog", "file_bytes", "Current VLog file size in bytes per disk.", "disk"),
 		vlogGCSkippedRatio:   desc("vlog", "gc_skipped_ratio_total", "Times compactVLog exited early: GCRatio was below the threshold."),
-		vlogGCSkippedPaused:  desc("vlog", "gc_skipped_paused_total", "Times compactVLog exited early: GCPaused was true (read latency EWMA above 4ms)."),
+		vlogGCSkippedPaused:  desc("vlog", "gc_skipped_paused_total", "Times compactVLog exited early: GCPaused was true (read latency EWMA above 20 ms)."),
 		vlogGCSkippedEmpty:   desc("vlog", "gc_skipped_empty_total", "Times compactVLog exited early: zero live candidates found below the GC horizon."),
 		vlogGCReadErrors:     desc("vlog", "gc_read_errors_total", "ReadValue failures inside the GC candidate loop (skipped candidates)."),
 		vlogGCCASFails:       desc("vlog", "gc_cas_fails_total", "CAS misses in GC: a concurrent Put updated the entry before GC could move it."),

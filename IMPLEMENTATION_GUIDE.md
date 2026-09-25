@@ -522,12 +522,12 @@ Do not change `numShards` — the shard count is permanently baked into on-disk 
 
 | Metric | Type | Description |
 |--------|------|-------------|
-| `veltrixdb_reads_total` | Counter | Total GET operations |
-| `veltrixdb_writes_total` | Counter | Total PUT operations |
-| `veltrixdb_deletes_total` | Counter | Total DEL operations |
+| `veltrixdb_storage_reads_total` | Counter | Total GET operations |
+| `veltrixdb_storage_writes_total` | Counter | Total PUT operations |
+| `veltrixdb_storage_deletes_total` | Counter | Total DEL operations |
 | `veltrixdb_cache_hits_total` | Counter | LIRS cache hits |
 | `veltrixdb_cache_misses_total` | Counter | LIRS cache misses (includes key-not-found) |
-| `veltrixdb_wal_flushes_total` | Counter | WAL fdatasync count |
+| `veltrixdb_storage_wal_flushes_total` | Counter | WAL fdatasync count |
 | `veltrixdb_storage_read_latency_seconds` | Histogram | GET latency distribution |
 | `veltrixdb_storage_write_admission_throttles_total` | Counter | Writes delayed by admission control |
 | `veltrixdb_vlog_gc_runs_total` | Counter | VLog GC cycles |
@@ -538,11 +538,11 @@ Do not change `numShards` — the shard count is permanently baked into on-disk 
 | `veltrixdb_vlog_gc_read_errors_total` | Counter | VLog read errors during GC |
 | `veltrixdb_vlog_gc_cas_fails_total` | Counter | CAS failures during GC (concurrent writes) |
 | `veltrixdb_vlog_gc_candidates_total` | Counter | Entries scanned per GC run |
-| `veltrixdb_fd_failed_nodes` | Gauge | Nodes failure detector considers down |
-| `veltrixdb_cluster_members` | Gauge | Known cluster members |
+| `veltrixdb_failure_detector_nodes_failed_total` | Counter | Nodes marked FAILED (compare with `..._nodes_recovered_total`) |
+| `veltrixdb_cluster_nodes_total` | Gauge | Known cluster members |
 
 WAL batch size efficiency:
 ```promql
-rate(veltrixdb_writes_total[1m]) / rate(veltrixdb_wal_flushes_total[1m])
+rate(veltrixdb_storage_writes_total[1m]) / rate(veltrixdb_storage_wal_flushes_total[1m])
 ```
 Target > 100 at 10 ms window + 10K writes/s/disk.

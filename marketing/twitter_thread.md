@@ -13,12 +13,12 @@ Introducing VeltrixDB — built for NVMe, not RAM.
 
 ---
 
-**Tweet 2 — The cost story** [278 chars]
-1B keys × 128B values on Redis: ~250 GB RAM → $3,000–5,000/month.
+**Tweet 2 — The cost story** [~250 chars]
+Redis keeps every value in RAM. VeltrixDB keeps values on NVMe and only the index in RAM (~142 B/key).
 
-Same dataset on VeltrixDB: ~160 GB NVMe → $300–500/month.
+1B keys × 1 KB values: >1 TB RAM vs ~142–232 GB RAM + NVMe.
 
-That's not a rounding error. It's a 10× reduction in storage cost for identical data — because NVMe is cheap and RAM is not.
+Honest caveat: with tiny values the index is about as big as the data. The win grows with value size.
 
 ---
 
@@ -34,7 +34,7 @@ When you write 1 byte, we write ~1 byte to NVMe. That's it. Your drives last lon
 ---
 
 **Tweet 4 — WiscKey architecture** [269 chars]
-How do you get 1.0× write amplification?
+How do you get ~1× write amplification?
 
 WiscKey KV-separation: keys go in the index, values append once to NVMe and are never rewritten by compaction.
 
@@ -72,7 +72,7 @@ Production-grade from day one:
 
 • Kubernetes Operator with a CRD
 • Helm chart
-• 22 Prometheus alerts pre-configured
+• Prometheus alerts pre-configured
 • AES-256-GCM encryption
 • RBAC + audit logging
 • CDC for streaming changes downstream

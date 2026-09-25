@@ -24,9 +24,8 @@ kubectl describe pod -n veltrixdb POD
 
 | Log line | Cause | Fix |
 |----------|-------|-----|
-| `[wal] replay of … stopped at byte N of M after K records` | Torn final write on crash (small `M − N`), or WAL damage (large) — every record is CRC32C-checked and replay stops at the first bad one | Restart pod once; if recurring or `M − N` is large: `kubectl veltrix sync-from REPLICA_POD` |
+| `[wal] replay of … stopped at byte N of M after K records` | Torn final write on crash (small `M − N`), or WAL damage (large) — every record is CRC32C-checked and replay stops at the first bad one | Restart pod once; if recurring or `M − N` is large, the WAL is damaged: wipe this node and let replication refill it (§2), or restore from backup (§5) in standalone mode |
 | `panic: native index: insert failed (out of memory?)` | `vm.max_map_count` too low for the off-heap native index (cgo builds) | Apply `scripts/sysctl.conf` (`vm.max_map_count = 262144`) on the node; or set `VELTRIXDB_INDEX=map` to use the Go map index |
-| `cannot allocate memory` (vlog open) | Hugepages missing | `kubectl exec POD -- sysctl vm.nr_hugepages` — must be ≥ 512 |
 | `bad magic at offset O` | Silent disk corruption | Drain node, replace disk, re-join |
 | `encryption: no key in VELTRIXDB_ENCRYPTION_KEY` | Missing secret | `kubectl create secret generic veltrixdb-enc --from-literal=key=BASE64_32B` |
 
@@ -34,26 +33,34 @@ kubectl describe pod -n veltrixdb POD
 
 ## 2. Data corruption (SEV-0)
 
+The image is distroless (no shell, `curl` or `rm`), so commands that need
+tools run from your workstation, an ephemeral debug container that shares the
+server's process namespace (`--target`, the server's filesystem is then at
+`/proc/1/root`), or a node debug pod (host filesystem at `/host`).
+
 ```bash
 # Confirm
-kubectl exec -n veltrixdb POD -- curl -s localhost:2112/metrics | \
-  grep -E 'scrub_corruption_total|vlog_gc_read_errors_total'
+kubectl port-forward -n veltrixdb POD 2112:2112 &
+curl -s localhost:2112/metrics | grep -E 'scrub_corruption_total|vlog_gc_read_errors_total'
 
 # Find the bad disk
-kubectl logs -n veltrixdb POD | grep '\[scrub\] disk='
+kubectl logs -n veltrixdb POD | grep -E '\[scrub\] disk=.*MISMATCH'
 
 # Quarantine the pod
 kubectl label pod -n veltrixdb POD veltrixdb.io/quarantine=true --overwrite
 
-# Wipe and restart (replication refills automatically)
-kubectl exec -n veltrixdb POD -- rm -rf /mnt/nvme*/vlog_active.dat /mnt/nvme*/wal.log*
+# Wipe this node's data (raft / replicated modes only — replication refills it;
+# in standalone mode restore from backup instead, §5)
+kubectl debug -n veltrixdb POD -it --image=busybox:1.36 --target=veltrixdb -- \
+  sh -c 'rm -f /proc/1/root/mnt/nvme*/vlog_active.dat /proc/1/root/mnt/nvme*/wal.log*'
 kubectl delete pod -n veltrixdb POD
 
 # After replay completes
 kubectl label pod -n veltrixdb POD veltrixdb.io/quarantine- --overwrite
 
-# Root-cause
-kubectl exec -n veltrixdb POD -- smartctl -a /dev/nvme0n1
+# Root-cause: SMART data from the node
+kubectl debug node/NODE -it --image=ubuntu:24.04 -- \
+  chroot /host smartctl -a /dev/nvme0n1
 ```
 
 ---
@@ -62,15 +69,17 @@ kubectl exec -n veltrixdb POD -- smartctl -a /dev/nvme0n1
 
 ```bash
 kubectl get pods -n veltrixdb -o wide
-kubectl exec -n veltrixdb POD -- df -h /mnt/nvme*
-kubectl exec -n veltrixdb POD -- curl -s localhost:2112/metrics | grep wal_flushes_total
+kubectl debug -n veltrixdb POD -it --image=busybox:1.36 --target=veltrixdb -- \
+  sh -c 'df -h /proc/1/root/mnt/nvme*'
+kubectl port-forward -n veltrixdb POD 2112:2112 &
+curl -s localhost:2112/metrics | grep -E 'storage_wal_flushes_total|vlog_garbage_ratio'
 ```
 
 | Cause | Fix |
 |-------|-----|
-| Disk 100% full + GC paused | `kubectl veltrix checkpoint` |
+| Disk 100% full + GC paused | `kubectl veltrix checkpoint`; check `kubectl veltrix gc-status` |
 | GC can't keep up | `kubectl veltrix quota-set NS 1000 5000000` — throttle writes |
-| Network partition | `kubectl exec POD -- nc -zv OTHER_POD 9000` — check CNI/NetworkPolicies |
+| Network partition | `kubectl debug -n veltrixdb POD -it --image=busybox:1.36 -- nc -zv OTHER_POD 9000` — check CNI/NetworkPolicies |
 
 ---
 
@@ -80,9 +89,10 @@ kubectl exec -n veltrixdb POD -- curl -s localhost:2112/metrics | grep wal_flush
 # 1. Throttle writes
 kubectl veltrix quota-set tenant_42 1000 5000000
 
-# 2. Raise GC budget if hardware has headroom
-kubectl set env statefulset/veltrixdb -n veltrixdb \
-  VELTRIXDB_GC_CRITICAL_BPS=300000000   # 300 MB/s
+# 2. Watch GC work through it (ratio per disk, runs, emergency state).
+#    The bandwidth tiers are compile-time constants (200 MB/s at 50-65 %
+#    garbage, uncapped at >= 65 %) — there is no runtime knob to raise them.
+kubectl veltrix gc-status
 
 # 3. Long-term: add disks (scale volumeClaimTemplates, re-roll)
 ```

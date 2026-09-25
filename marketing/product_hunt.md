@@ -10,13 +10,13 @@ NVMe key-value store — 10× cheaper storage than Redis at scale
 
 VeltrixDB is an open-source distributed key-value database designed for NVMe SSDs. On a single AWS EC2 node (4× NVMe, YCSB 0.17.0, 100M keys, 200 threads) it served 427,697 reads/s at 461 µs average latency and 18,064 durable writes/s with an fsync on every write.
 
-The core insight is that RAM is expensive and NVMe is not. At 1 billion keys × 128-byte values, Redis requires ~250 GB of RAM — roughly $3,000–5,000/month depending on your cloud. VeltrixDB stores the same dataset in ~160 GB of NVMe for $300–500/month. Same data, 10× lower storage cost.
+The core insight is that RAM is expensive and NVMe is not. VeltrixDB keeps values on NVMe and only the index in RAM (~142 B/key measured). With 1 KB values that needs roughly 4–7× less RAM than keeping everything in memory; with tiny values the index is about as big as the data, so the saving grows with value size.
 
-The architecture that makes this work: WiscKey KV-separation, where values are appended once to NVMe and never rewritten by compaction. This produces write amplification of ~1.0× — versus 2–5× for Redis persistence and 10–30× for RocksDB/LSM-based systems. An 8192-shard index enables parallel per-disk I/O. A LIRS scan-resistant cache and group-commit WAL handle the rest.
+The architecture that makes this work: WiscKey KV-separation, where values are appended once to NVMe and never rewritten by compaction. Write amplification is ~1× by design (GC copies only still-live values) — versus the 10–30× typical of LSM compaction. An 8192-shard index enables parallel per-disk I/O. A LIRS scan-resistant cache and group-commit WAL handle the rest.
 
 Across those 100M operations there were zero errors and zero value-log GC emergency runs: space reclamation kept up with the write rate instead of falling behind. On cgo builds the key index lives off the Go heap; with 5M keys a full Go GC takes 0.27 ms instead of 21 ms.
 
-Production deployment is first-class: Kubernetes Operator with a CRD, Helm chart, 22 Prometheus alerts pre-configured, Raft replication, AES-256-GCM encryption, RBAC, audit logging, and CDC support. Six client SDKs cover Go, Java, Python, Node.js, Rust, and C++.
+Production deployment is first-class: Kubernetes Operator with a CRD, Helm chart, Prometheus alerts pre-configured, Raft replication, AES-256-GCM encryption, RBAC, audit logging, and CDC support. Six client SDKs cover Go, Java, Python, Node.js, Rust, and C++.
 
 What it doesn't do yet: no RESP protocol (can't drop-in replace Redis without code changes) and no managed cloud offering. These are real limitations worth knowing before you evaluate it.
 

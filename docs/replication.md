@@ -229,8 +229,8 @@ Anti-entropy ensures replicas that were temporarily unavailable (network partiti
 ### Lag Monitoring
 
 The `backgroundLagMonitor` runs every second, aggregating `LagBytes` and `LagNs` across all replicas into `ReplicationMetrics`. Exposed via Prometheus as:
-- `veltrixdb_replica_lag_bytes`
-- `veltrixdb_replica_lag_ns`
+- `veltrixdb_replication_lag_bytes`
+- `veltrixdb_replication_lag_nanoseconds`
 
 ### Tombstone Coordination
 

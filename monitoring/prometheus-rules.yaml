@@ -23,7 +23,8 @@ spec:
           annotations:
             summary: "VeltrixDB write admission throttle active on {{ $labels.node }}"
             description: >
-              Write admission control is throttling Puts because read EWMA > 4 ms.
+              Write admission control is throttling Puts because the read latency EWMA is above 20 ms
+              (it clears below 10 ms).
               Rate: {{ $value | humanize }}/s.
               Check veltrixdb_storage_read_latency_seconds histogram for root cause.
 
@@ -41,7 +42,7 @@ spec:
           annotations:
             summary: "VeltrixDB VLog GC paused on {{ $labels.node }}"
             description: >
-              VLog GC is paused because read latency EWMA > 4 ms and garbage ratio
+              VLog GC is paused because the read latency EWMA is above 20 ms and the garbage ratio
               is {{ $value | humanizePercentage }}. GC will auto-resume 4 min after
               reads return to normal. Check read latency immediately.
 
@@ -75,10 +76,10 @@ spec:
             summary: "VeltrixDB cache hit rate below 50% on {{ $labels.node }}"
             description: >
               Cache hit rate is {{ $value | humanizePercentage }} over the last 5 min.
-              Consider increasing --cache or --cache-max-size-mb, or check whether
+              Consider increasing --cache (MB), or check whether
               the keyspace is larger than the cache capacity.
 
-        # ── WAL flush latency ─────────────────────────────────────────────────
+        # ── Read latency ──────────────────────────────────────────────────────
         - alert: VeltrixDBHighReadLatency
           expr: |
             histogram_quantile(0.99,
@@ -95,30 +96,52 @@ spec:
               cache eviction storm, or disk saturation.
 
         # ── Node failure detector ─────────────────────────────────────────────
+        # There is no "currently failed" gauge; the heartbeat monitor exports
+        # cumulative failed / recovered counters. More failures than recoveries
+        # in the window means a peer is still down.
         - alert: VeltrixDBNodeFailed
-          expr: veltrixdb_fd_failed_nodes > 0
+          expr: |
+            increase(veltrixdb_failure_detector_nodes_failed_total[10m])
+              - increase(veltrixdb_failure_detector_nodes_recovered_total[10m]) > 0
           for: 1m
           labels:
             severity: critical
           annotations:
-            summary: "VeltrixDB cluster node failure detected on {{ $labels.node }}"
+            summary: "VeltrixDB cluster node failure detected by {{ $labels.node }}"
             description: >
-              {{ $value }} peer node(s) have missed heartbeats and are marked FAILED.
-              Check pod status and network connectivity. Quorum may be at risk.
+              {{ $value }} peer node(s) missed heartbeats and have not recovered in the
+              last 10 minutes. Check pod status and network connectivity. Quorum may
+              be at risk.
 
-        # ── Replication factor drop ───────────────────────────────────────────
-        - alert: VeltrixDBPartitionsUnderreplicated
+        # ── Cluster shrank ────────────────────────────────────────────────────
+        # The server exports no per-partition replica health, so this watches the
+        # registered node count instead: fewer nodes than an hour ago means some
+        # partitions are running below their replication factor.
+        - alert: VeltrixDBClusterShrank
           expr: |
-            veltrixdb_cluster_partitions_total - veltrixdb_cluster_healthy_partitions_total > 0
-          for: 2m
+            veltrixdb_cluster_nodes_total < max_over_time(veltrixdb_cluster_nodes_total[1h])
+          for: 5m
           labels:
             severity: warning
           annotations:
-            summary: "Some VeltrixDB partitions are under-replicated on {{ $labels.node }}"
+            summary: "VeltrixDB cluster has fewer nodes than an hour ago ({{ $labels.node }})"
             description: >
-              {{ $value }} partition(s) have fewer replicas than the configured
-              replication factor. This may be caused by a node failure or network
-              partition. Data durability is reduced until all partitions are healed.
+              {{ $labels.node }} now sees {{ $value }} registered node(s). Partitions
+              owned by the missing node(s) have fewer replicas until they return or
+              the ring is rebalanced (--auto-rebalance).
+
+        # ── Scrubber found corruption ─────────────────────────────────────────
+        - alert: VeltrixDBScrubCorruption
+          expr: |
+            increase(veltrixdb_scrub_corruption_total[15m]) > 0
+          labels:
+            severity: critical
+          annotations:
+            summary: "VeltrixDB background scrubber found a CRC mismatch on {{ $labels.node }}"
+            description: >
+              The scrubber read a VLog record with a bad magic or CRC32C. The server
+              log line "[scrub] disk=N offset=M ... MISMATCH" gives the disk and offset.
+              Treat the disk as suspect and restore the affected keys from a replica or backup.
 
     - name: veltrixdb.process
       interval: 60s
@@ -127,19 +150,19 @@ spec:
         # ── Disk space ────────────────────────────────────────────────────────
         - alert: VeltrixDBDiskUsageHigh
           expr: |
-            (
-              veltrixdb_storage_segment_bytes_total
-            ) / (
-              node_filesystem_size_bytes{mountpoint=~"/mnt/nvme.*"}
+            1 - (
+              node_filesystem_avail_bytes{mountpoint=~"/mnt/nvme.*"}
+                / node_filesystem_size_bytes{mountpoint=~"/mnt/nvme.*"}
             ) > 0.85
           for: 10m
           labels:
             severity: warning
           annotations:
-            summary: "VeltrixDB disk usage > 85% on {{ $labels.node }}"
+            summary: "VeltrixDB data disk > 85% full ({{ $labels.mountpoint }})"
             description: >
-              Segment file usage on disk {{ $labels.disk }} is {{ $value | humanizePercentage }}.
-              Run GC ('veltrix-admin compact') or add capacity.
+              {{ $labels.mountpoint }} is {{ $value | humanizePercentage }} full (node-exporter
+              filesystem metrics). Check veltrixdb_vlog_garbage_ratio: high garbage means
+              GC is behind ('veltrix-admin compact'); otherwise add capacity.
 
         # ── Process restart ───────────────────────────────────────────────────
         - alert: VeltrixDBProcessRestarted
