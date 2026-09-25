@@ -39,17 +39,23 @@ VeltrixDB P99 does not drift — the three-tier, admission-controlled VLog GC en
 
 ## Storage Cost at Scale
 
-| Keys | Value size | Redis RAM | VeltrixDB NVMe |
-|---|---|---|---|
-| 10M | 128 B | ~2.5 GB RAM | ~1.5 GB NVMe |
-| 100M | 128 B | ~25 GB RAM | ~15 GB NVMe |
-| 1B | 128 B | ~250 GB RAM | ~160 GB NVMe |
+| Keys | Value size | Redis RAM | VeltrixDB RAM (index) | VeltrixDB NVMe (values) |
+|---|---|---|---|---|
+| 100M | 128 B | ~25 GB | ~14–23 GB | ~15 GB |
+| 1B | 128 B | ~250 GB | ~142–232 GB | ~160 GB |
+| 100M | 1 KB | > 100 GB | ~14–23 GB | ~137 GB |
+| 1B | 1 KB | > 1 TB | ~142–232 GB | ~1.4 TB |
 
-RAM costs ~15–20× more per GB than NVMe SSD in cloud pricing.
-At 1 billion keys with 128-byte values:
+VeltrixDB's RAM column is the index: ~142 B/key with the native index
+(measured at 5M keys), plus ~90 B/key for the ordered index unless
+`--disable-ordered-index`; add whatever cache you configure. The Redis column
+is an estimate of values + per-key overhead; we have not measured it.
 
-- Redis: ~$3,000–5,000/month for the memory (r6g.16xlarge territory)
-- VeltrixDB: ~$300–500/month for NVMe (n2-highmem-64 local SSD, 3 nodes)
+**The RAM saving depends on value size.** With 128-byte values the index is
+about as large as the values, so VeltrixDB saves little RAM — its advantage
+there is NVMe durability without fork-based snapshots. With 1 KB values it
+needs roughly 4–7× less RAM. These rows are per-key arithmetic, not a
+billion-key benchmark.
 
 ---
 

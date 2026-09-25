@@ -6,7 +6,7 @@ After 18 months of building, we're open-sourcing VeltrixDB today.
 
 It's a distributed key-value database designed from scratch for NVMe SSDs. Here's the problem we were trying to solve:
 
-At 1 billion keys with 128-byte values, Redis requires ~250 GB of RAM. On GCP, that's roughly $3,000–5,000/month. The same dataset on NVMe costs ~$300–500/month. RAM is 15–20× more expensive per GB than SSD — and most KV workloads don't need full in-memory speed for every key, just for the hot ones.
+An in-memory store keeps every value in RAM, and RAM costs far more per GB than NVMe SSD — while most KV workloads only need in-memory speed for the hot keys. VeltrixDB keeps values on NVMe and only the index in RAM (~142 B/key). With 1 KB values that is roughly 4–7× less RAM; with very small values the index is about as big as the data, so the gain grows with value size.
 
 Existing disk-backed databases (RocksDB, LevelDB) have a different problem: LSM tree compaction rewrites your data 10–30× over its lifetime. Every byte you write eventually touches disk 10–30 times. That's SSD wear, it's write latency spikes, and it's unpredictable P99 under sustained write pressure.
 

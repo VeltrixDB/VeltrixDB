@@ -1,6 +1,6 @@
 # Show HN: VeltrixDB – an NVMe key-value store at 1/10th the RAM cost of Redis
 
-We built VeltrixDB because we kept running into the same problem: key-value workloads that fit fine on NVMe but forced us to pay for RAM anyway. Redis is excellent software, but at 1 billion keys × 128-byte values you're looking at ~250 GB of RAM ($3,000–5,000/month) versus ~160 GB of NVMe ($300–500/month). That's a 10× cost difference for the same data.
+We built VeltrixDB because we kept running into the same problem: key-value workloads that fit fine on NVMe but forced us to pay for RAM anyway. Redis is excellent software, but it keeps every value in RAM. VeltrixDB keeps values on NVMe and only the index in RAM (~142 B/key, plus ~90 B/key for the ordered index unless you turn it off). With 1 KB values that is roughly 4–7× less RAM; with 128-byte values the index is about as big as the values, so the saving there is small — we'd rather say that up front.
 
 **What it is**
 

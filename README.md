@@ -5,11 +5,12 @@
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 [![GitHub Stars](https://img.shields.io/github/stars/VeltrixDB/veltrixdb?style=social)](https://github.com/VeltrixDB/veltrixdb/stargazers)
 
-**NVMe-native distributed key-value database. 427K reads/s measured (YCSB). 1.0× write amplification. Kubernetes-first.**
+**NVMe-native distributed key-value database. 427K reads/s measured (YCSB). ~1× write amplification by design. Kubernetes-first.**
 
-Storing 1 billion keys in Redis costs ~$3,000–5,000/month in RAM.  
-The same dataset in VeltrixDB fits in ~160 GB of NVMe — roughly $300–500/month.  
-P99 latency that doesn't spike during compaction.
+An in-memory store keeps every value in RAM. VeltrixDB keeps values on NVMe and only the index in RAM:
+~142 B/key (plus ~90 B/key for the ordered index unless disabled). At 1 KB values that is roughly 4–7× less RAM;
+at 128 B values the index is about as large as the values, so the saving comes from larger values.  
+No LSM compaction, so no compaction-driven P99 spikes.
 
 ```bash
 docker run -p 9000:9000 ghcr.io/veltrixdb/veltrixdb:latest
@@ -56,15 +57,15 @@ Full methodology: [BENCHMARKING.md](BENCHMARKING.md)
 
 ### The problem with Redis at scale
 
-Redis is in-memory. At 1 billion keys with 128-byte values you need ~250 GB of RAM. In GCP that's an `r6g.16xlarge`-class node: ~$3,000–5,000/month. Cloud RAM costs 15–20× more per GB than NVMe SSD.
+Redis is in-memory: every value, hot or cold, is in RAM, plus Redis's own per-key overhead. Cloud RAM costs far more per GB than NVMe SSD, so the bill grows with the dataset.
 
-VeltrixDB stores values on NVMe with the index and hot data in DRAM. The same 1 billion keys fit in ~160 GB of NVMe. Three nodes cost ~$300–500/month.
+VeltrixDB stores values on NVMe and keeps the index (and whatever cache you configure) in DRAM. The index costs ~142 B/key with the native index (measured at 5M keys) plus ~90 B/key for the ordered index unless `--disable-ordered-index`; a 1 KB value packs into ~1.37 KB of NVMe. Worked through for 1 billion keys × 1 KB values: an in-memory store needs over 1 TB of RAM; VeltrixDB needs 142–232 GB of RAM for the index plus ~1.4 TB of NVMe. With 128-byte values the index is about as large as the values, so small-value workloads save little RAM. These are per-key arithmetic, not a billion-key benchmark.
 
 ### The problem with LSM trees (RocksDB, LevelDB)
 
 LSM compaction rewrites full key-value records to merge sorted runs. Typical write amplification is **10–30×** — every byte you write eventually lands on disk 10–30 times. That burns SSD write endurance and adds latency spikes during heavy compaction.
 
-VeltrixDB uses [WiscKey](https://www.usenix.org/conference/fast16/technical-sessions/presentation/lu) KV-separation: **values are written once to an append-only Value Log on NVMe and never rewritten**. Compaction only GCs dead space in the VLog. Write amplification is ~**1.0×**.
+VeltrixDB uses [WiscKey](https://www.usenix.org/conference/fast16/technical-sessions/presentation/lu) KV-separation: **values are written once to an append-only Value Log on NVMe**, and there is no LSM compaction. GC only copies still-live values out of mostly-dead regions of the VLog, so write amplification is ~**1×** by design (not a measured figure).
 
 ### Predictable P99
 
@@ -78,7 +79,7 @@ In the YCSB run above (100M operations): **zero errors and zero GC emergency eve
 
 **8192 shards, FNV-1a routing.** Each key hashes (FNV-1a & 0x1FFF) into 1 of 8192 shards. With 8 NVMe disks, shard `N` routes to disk `N % 8`. All 8 disks write in parallel — no single hot lock.
 
-**Values on NVMe, index in DRAM.** The in-memory index stores only a 64-byte pointer per key (disk offset, shard, size, TTL, version). Value bytes go directly to the per-disk append-only VLog. A cache hit is a DRAM lookup (**~92 ns** since the cache was sharded; it was 711 ns when a single mutex fronted it). A cache miss is one NVMe random read (~400 µs).
+**Values on NVMe, index in DRAM.** The in-memory index holds a 64-byte record per key (disk offset, shard, size, TTL, version) — ~142 B/key of RAM in practice with the native index, measured at 5M keys, plus ~90 B/key for the ordered index unless it is disabled. Value bytes go directly to the per-disk append-only VLog. A cache hit is a DRAM lookup (**~92 ns** since the cache was sharded; it was 711 ns when a single mutex fronted it). A cache miss is one NVMe random read (~400 µs).
 
 **Group-commit WAL.** A background flusher amortizes `fdatasync` across all writers within a configurable window (default 15 ms). Records are binary with a CRC32C over the whole record (replay still reads legacy text WALs). One `write(2)` and one `fdatasync` per batch instead of per write — 10–100× write throughput improvement at the cost of at most one window of durability latency.
 
