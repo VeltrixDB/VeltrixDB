@@ -474,7 +474,13 @@ jobs:
       # C++ engine fully on: native index + io_uring bridge on every engine.
       # This is the only job where concurrent MultiPut batches reach the
       # bridge's per-ring submit path (TestMultiPut_ConcurrentBatchExtents*).
+      # The io_uring VLog bridge is opt-in (VELTRIXDB_URING_BRIDGE, default
+      # off); force it on here so the one job that exercises the C++ storage
+      # path still covers it. "on", not "sqpoll": dozens of short-lived
+      # engines each spawning SQPOLL threads starve the runner (cgo_toggle.go).
       - name: storage tests with cgo enabled
+        env:
+          VELTRIXDB_URING_BRIDGE: "on"
         run: CGO_ENABLED=1 go test -timeout 300s -count=1 ./storage/...
 
       - name: full build via scripts/build.sh

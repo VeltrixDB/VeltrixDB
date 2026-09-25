@@ -50,3 +50,34 @@ func TestCGOEngineDisabled_EngineStillWorks(t *testing.T) {
 		t.Fatalf("Get = %q, %v; want \"value\", nil", got, err)
 	}
 }
+
+// The bridge is opt-in: anything but an explicit on/sqpoll must leave it off,
+// and an unknown value must be reported rather than silently accepted.
+func TestURingBridgeMode_Parsing(t *testing.T) {
+	cases := []struct {
+		val    string
+		want   uringBridgeMode
+		wantOK bool
+	}{
+		{"", uringBridgeOff, true}, {"off", uringBridgeOff, true}, {"0", uringBridgeOff, true},
+		{"on", uringBridgeOn, true}, {"1", uringBridgeOn, true}, {"ON", uringBridgeOn, true},
+		{"sqpoll", uringBridgeSQPoll, true}, {" SQPOLL ", uringBridgeSQPoll, true},
+		{"fast", uringBridgeOff, false},
+	}
+	for _, tc := range cases {
+		got, ok := parseURingBridgeMode(tc.val)
+		if got != tc.want || ok != tc.wantOK {
+			t.Errorf("parseURingBridgeMode(%q) = %v, %v; want %v, %v", tc.val, got, ok, tc.want, tc.wantOK)
+		}
+	}
+
+	// The master switch wins over an explicit opt-in.
+	t.Setenv(CGOEngineDisabledEnv, "1")
+	t.Setenv(URingBridgeEnv, "sqpoll")
+	cgoDisabledOnce = onceReset()
+	cgoDisabledVal = false
+	t.Cleanup(func() { cgoDisabledOnce = onceReset(); cgoDisabledVal = false })
+	if m, _ := uringBridgeModeFromEnv(); m != uringBridgeOff {
+		t.Errorf("with %s=1, mode = %v; want off", CGOEngineDisabledEnv, m)
+	}
+}

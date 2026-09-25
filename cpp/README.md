@@ -70,11 +70,18 @@ boundary or do not cross it.
 So: measure the Go path first, and only reach for C++ where a benchmark shows
 Go cannot get there.
 
-## Turning it off
+## Turning it off (and on)
 
 `VELTRIXDB_DISABLE_CGO_ENGINE=1` skips constructing the io_uring bridge and
-the C++ batch engine, leaving the pure-Go paths in place. No effect on a
-`CGO_ENABLED=0` build, where both are already stubs.
+the C++ batch engine, and selects the Go map index, leaving the pure-Go paths
+in place. No effect on a `CGO_ENABLED=0` build, where all are already stubs.
+
+The io_uring VLog bridge alone is opt-in: `VELTRIXDB_URING_BRIDGE=on` (no
+SQPOLL) or `=sqpoll`. Default off, because a VLog batch is already one pwrite
+and one fdatasync, and on a 4-CPU runner the bridge with SQPOLL, with the
+batch engine and native index also on, cost ~35% of batch-write throughput.
+Opt in only after measuring on the target hardware
+(`ENGINES="native bridge sqpoll" scripts/net-bench.sh`).
 
 Both used to be unconditional: with cgo compiled in, every
 `NewStorageEngine` created an io_uring bridge with SQPOLL (a busy-polling

@@ -3,6 +3,7 @@ package storage
 import (
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 )
 
@@ -60,4 +61,62 @@ func cgoEngineDisabled() bool {
 		cgoDisabledVal = v == "yes" || v == "on"
 	})
 	return cgoDisabledVal
+}
+
+// URingBridgeEnv selects the io_uring VLog write bridge on a Linux cgo build:
+//
+//	off     (default) VLogBatcher.Flush uses pwrite + fdatasync
+//	on      io_uring bridge, no SQPOLL
+//	sqpoll  io_uring bridge with an SQPOLL kernel thread per ring
+//
+// VELTRIXDB_DISABLE_CGO_ENGINE=1 forces off.
+//
+// # Why off is the default
+//
+// A VLog batch is already ONE pwrite and one fdatasync (invariant 42), so the
+// bridge can save at most one syscall per batch, and SQPOLL spends a kernel
+// thread busy-polling for sq_poll_idle_ms to save it. On the 4-CPU CI runner
+// the bridge (then unconditional, with SQPOLL) cut batch writes from 1.77M
+// to 1.12M keys/s and raised batch P99 from ~12.7 to ~19 ms (net-bench,
+// 2026-09-25). Opt in and measure on the target hardware.
+const URingBridgeEnv = "VELTRIXDB_URING_BRIDGE"
+
+type uringBridgeMode int
+
+const (
+	uringBridgeOff uringBridgeMode = iota
+	uringBridgeOn
+	uringBridgeSQPoll
+)
+
+// parseURingBridgeMode maps the env value to a mode; unknown values are off
+// and reported through ok=false so the engine can log them.
+func parseURingBridgeMode(v string) (m uringBridgeMode, ok bool) {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "", "0", "off", "false", "no":
+		return uringBridgeOff, true
+	case "1", "on", "true", "yes":
+		return uringBridgeOn, true
+	case "sqpoll":
+		return uringBridgeSQPoll, true
+	}
+	return uringBridgeOff, false
+}
+
+// uringBridgeModeFromEnv is read once per engine construction.
+func uringBridgeModeFromEnv() (uringBridgeMode, bool) {
+	if cgoEngineDisabled() {
+		return uringBridgeOff, true
+	}
+	return parseURingBridgeMode(os.Getenv(URingBridgeEnv))
+}
+
+func (m uringBridgeMode) String() string {
+	switch m {
+	case uringBridgeOn:
+		return "on"
+	case uringBridgeSQPoll:
+		return "sqpoll"
+	}
+	return "off"
 }

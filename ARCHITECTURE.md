@@ -312,8 +312,8 @@ The Go layer is fully functional on its own. C++ is an optional Linux accelerato
 
 Two consequences worth internalising:
 
-- **The Docker image is `CGO_ENABLED=1`** (native index + io_uring bridge). Kubernetes' RuntimeDefault seccomp profile blocks `io_uring_setup`, in which case the bridge does not start and VLog batches use pwrite; the native index needs no privileges. `--build-arg CGO_ENABLED=0` builds the old pure-Go static image.
-- **CI job `node-6-cpp` compiles the C++** — the CMake target, the cgo shims, and `scripts/build.sh` end to end — and runs the storage suite with the C++ engine on. `node-5-race` runs the native index under `-race`. Every other job is `CGO_ENABLED=0`.
+- **The Docker image is `CGO_ENABLED=1`** (native index; the io_uring VLog bridge is opt-in via `VELTRIXDB_URING_BRIDGE=on|sqpoll`). Kubernetes' RuntimeDefault seccomp profile blocks `io_uring_setup`, in which case an opted-in bridge does not start and VLog batches use pwrite; the native index needs no privileges. `--build-arg CGO_ENABLED=0` builds the old pure-Go static image.
+- **CI job `node-6-cpp` compiles the C++** — the CMake target, the cgo shims, and `scripts/build.sh` end to end — and runs the storage suite with the C++ engine and the io_uring bridge on. `node-5-race` runs the native index under `-race`. Every other job is `CGO_ENABLED=0`.
 
 ---
 

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"hash/crc32"
 	"log"
+	"os"
 	"runtime"
 	"strings"
 	"sync"
@@ -371,19 +372,25 @@ func NewStorageEngine(cfg *StorageConfig) (*StorageEngine, error) {
 		}
 	}
 
-	// Create the io_uring storage bridge and wire it into every VLog.
-	// The bridge owns 8 SQPOLL rings (one per NVMe disk) and fixed-buffer
-	// pools registered once with the kernel.  VLogBatcher.Flush will route
-	// writes through the bridge (1 io_uring_submit per batch) instead of N
-	// separate pwrite syscalls.  nil on macOS dev / CGO_ENABLED=0.
+	// Optionally create the io_uring storage bridge (one ring per disk) and
+	// wire it into every VLog, so VLogBatcher.Flush submits its one write
+	// through io_uring instead of pwrite. Off unless VELTRIXDB_URING_BRIDGE
+	// asks for it — see URingBridgeEnv. nil on macOS / CGO_ENABLED=0.
 	var storageBridge *cgoStorageBridge
-	if cfg.KeyValueSeparation && len(vlogs) > 0 && !cgoEngineDisabled() {
-		storageBridge = newCGOStorageBridge(len(vlogs), true /*sqPoll*/)
+	bridgeMode, bridgeModeOK := uringBridgeModeFromEnv()
+	if !bridgeModeOK {
+		log.Printf("[storage] %s=%q not recognised (off|on|sqpoll) — io_uring bridge off",
+			URingBridgeEnv, os.Getenv(URingBridgeEnv))
+	}
+	if cfg.KeyValueSeparation && len(vlogs) > 0 && bridgeMode != uringBridgeOff {
+		storageBridge = newCGOStorageBridge(len(vlogs), bridgeMode == uringBridgeSQPoll)
 		if storageBridge != nil {
 			for _, vl := range vlogs {
 				vl.SetStorageBridge(storageBridge)
 			}
+			log.Printf("[storage] io_uring VLog bridge on  mode=%s  rings=%d", bridgeMode, len(vlogs))
 		} else {
+			log.Printf("[storage] io_uring bridge (%s) unavailable — VLog batches use pwrite", bridgeMode)
 		}
 	}
 
@@ -833,6 +840,39 @@ var ErrKeyExpired = errors.New("key expired")
 //  3. Dirty value still in RAM (written but not yet flushed to segment).
 //  4. Segment file read via DiskOffset + SegmentID — CRC32C verified.
 func (se *StorageEngine) Get(key string) ([]byte, error) {
+	v, _, err := se.get(key, getFull)
+	return v, err
+}
+
+// GetNoIO is Get without step 4: it answers from the cache, the index (absent,
+// tombstoned, expired) or a dirty in-RAM value, and when the value can only
+// come from disk it returns needIO=true instead of reading it. Finish such a
+// key with GetAfterNoIO, not Get, so the read is counted once.
+//
+// For callers that must not block on disk — the C++ network front-end answers
+// reads inline on its event-loop thread, and one VLog read there stalls every
+// other connection on that loop.
+func (se *StorageEngine) GetNoIO(key string) (value []byte, needIO bool, err error) {
+	return se.get(key, getNoIO)
+}
+
+// GetAfterNoIO completes a key GetNoIO reported as needIO. Same result as
+// Get. GetNoIO counted the cache miss; the read and its latency sample are
+// recorded here, once.
+func (se *StorageEngine) GetAfterNoIO(key string) ([]byte, error) {
+	v, _, err := se.get(key, getAfterNoIO)
+	return v, err
+}
+
+type getMode uint8
+
+const (
+	getFull      getMode = iota // Get
+	getNoIO                     // stop before disk; report needIO
+	getAfterNoIO                // the disk half of a GetNoIO that reported needIO
+)
+
+func (se *StorageEngine) get(key string, mode getMode) (_ []byte, needIO bool, _ error) {
 	_, span := tracing.Start(context.Background(), "engine.Get")
 	defer span.End()
 	if span.IsRecording() {
@@ -840,8 +880,13 @@ func (se *StorageEngine) Get(key string) ([]byte, error) {
 	}
 
 	start := time.Now()
-	se.metrics.Reads.Add(1)
 	defer func() {
+		// A GetNoIO that stops for disk records nothing: GetAfterNoIO records
+		// this read, including the disk time the sample is mostly about.
+		if needIO {
+			return
+		}
+		se.metrics.Reads.Add(1)
 		elapsed := time.Since(start)
 		ns := elapsed.Nanoseconds()
 		se.metrics.ObserveReadLatency(elapsed.Seconds())
@@ -904,10 +949,14 @@ func (se *StorageEngine) Get(key string) ([]byte, error) {
 		value, hit = se.cache.Get(key)
 	}
 	if hit {
-		se.metrics.CacheHits.Add(1)
-		return value, nil
+		if mode != getAfterNoIO { // GetNoIO already counted this key's cache miss
+			se.metrics.CacheHits.Add(1)
+		}
+		return value, false, nil
 	}
-	se.metrics.CacheMisses.Add(1)
+	if mode != getAfterNoIO {
+		se.metrics.CacheMisses.Add(1)
+	}
 
 	// Step 2: Index Vault. The shardedIndex.get() call already does a bloom
 	// pre-check when blooms are installed; we count its negative hits here so
@@ -920,45 +969,48 @@ func (se *StorageEngine) Get(key string) ([]byte, error) {
 				se.metrics.BloomFilterSkipped.Add(1)
 			}
 		}
-		return nil, ErrKeyNotFound
+		return nil, false, ErrKeyNotFound
 	}
 	if entry.IsTombstone() {
-		return nil, ErrKeyNotFound
+		return nil, false, ErrKeyNotFound
 	}
 
 	nowUs := time.Now().UnixMicro()
 	if entry.IsExpired(nowUs) {
 		se.index.markTombstone(key, nowUs)
 		se.cache.Evict(key)
-		return nil, ErrKeyExpired
+		return nil, false, ErrKeyExpired
 	}
 
 	// Step 3: Dirty value in RAM (pre-flush).
 	if dirtyValue != nil {
 		se.cache.Put(key, dirtyValue)
-		return dirtyValue, nil
+		return dirtyValue, false, nil
 	}
 
 	// Step 4: Persistent storage read — VLog (KV-separation) or segment file.
 	if entry.DiskOffset > 0 {
+		if mode == getNoIO {
+			return nil, true, nil
+		}
 		if se.config.KeyValueSeparation && len(se.vlogs) > 0 {
 			vlogIdx := int(entry.SegmentID) % len(se.vlogs)
 			value, err := se.vlogs[vlogIdx].ReadValue(int64(entry.DiskOffset), entry.ValueSize)
 			if err != nil {
 				se.noteDiskError(vlogIdx, "vlog read", err)
-				return nil, fmt.Errorf("vlog read: %w", err)
+				return nil, false, fmt.Errorf("vlog read: %w", err)
 			}
 			if entry.IsEncrypted() {
 				pt, derr := Decrypt(value)
 				if derr != nil {
-					return nil, fmt.Errorf("vlog decrypt: %w", derr)
+					return nil, false, fmt.Errorf("vlog decrypt: %w", derr)
 				}
 				value = pt
 			}
 			if entry.IsCompressed() {
 				decoded, derr := Decompress(value, entry.UncompressedSize)
 				if derr != nil {
-					return nil, fmt.Errorf("vlog decompress: %w", derr)
+					return nil, false, fmt.Errorf("vlog decompress: %w", derr)
 				}
 				value = decoded
 			}
@@ -968,32 +1020,32 @@ func (se *StorageEngine) Get(key string) ([]byte, error) {
 			if entry.SchemaVersion < CurrentSchemaVersion {
 				migrated, _, merr := MigrateOnRead(entry.SchemaVersion, value)
 				if merr != nil {
-					return nil, fmt.Errorf("schema migrate: %w", merr)
+					return nil, false, fmt.Errorf("schema migrate: %w", merr)
 				}
 				value = migrated
 			}
 			se.metrics.VLogReads.Add(1)
 			se.cache.Put(key, value)
-			return value, nil
+			return value, false, nil
 		}
 		if int(entry.SegmentID) < len(se.segments) {
 			sw := se.segments[entry.SegmentID]
 			value, err := sw.ReadValue(int64(entry.DiskOffset), entry.KeySize, entry.ValueSize)
 			if err != nil {
-				return nil, fmt.Errorf("segment read: %w", err)
+				return nil, false, fmt.Errorf("segment read: %w", err)
 			}
 			if computeCRC32C(value) != entry.CRC32C {
-				return nil, fmt.Errorf("CRC32C mismatch for key %s: data corruption", key)
+				return nil, false, fmt.Errorf("CRC32C mismatch for key %s: data corruption", key)
 			}
 			if entry.Flags&FlagReadRepairNeeded != 0 {
 				entry.Flags &^= FlagReadRepairNeeded
 			}
 			se.cache.Put(key, value)
-			return value, nil
+			return value, false, nil
 		}
 	}
 
-	return nil, ErrKeyNotFound
+	return nil, false, ErrKeyNotFound
 }
 
 // ── Delete path ───────────────────────────────────────────────────────────────
