@@ -251,22 +251,13 @@ func TestWAL_TombstoneEntry(t *testing.T) {
 		t.Fatalf("tombstone append: %v", err)
 	}
 
-	data, err := os.ReadFile(filepath.Join(dir, "wal.log"))
+	// Decode rather than grep: records are binary, and a scan for '|' used to
+	// trip over whatever the timestamp bytes happened to be (flaky).
+	got, err := replayWAL(filepath.Join(dir, "wal.log"))
 	if err != nil {
-		t.Fatalf("read: %v", err)
+		t.Fatalf("replay: %v", err)
 	}
-	// Tombstone field is the second pipe-delimited field and must be "1".
-	content := string(data)
-	if len(content) < 3 {
-		t.Fatalf("WAL file too short: %q", content)
-	}
-	// Find first '|' and check the byte after it is '1'.
-	for i, ch := range content {
-		if ch == '|' {
-			if i+1 < len(content) && content[i+1] != '1' {
-				t.Errorf("tombstone field should be '1', got '%c' in %q", content[i+1], content)
-			}
-			break
-		}
+	if len(got) != 1 || !got[0].isTombstone || got[0].key != "dead-key" || got[0].version != 99 {
+		t.Fatalf("replayed %+v, want one tombstone for dead-key at version 99", got)
 	}
 }

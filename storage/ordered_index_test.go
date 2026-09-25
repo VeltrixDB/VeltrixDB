@@ -570,3 +570,48 @@ func TestRangeScanNS_NamespaceIsolation(t *testing.T) {
 		}
 	}
 }
+
+// TestOrderedIndex_OverwriteSkipsInsertButStaysVisible: put only inserts into
+// the skiplist when the key was not live. Overwrites, and a delete followed by
+// a re-put, must still leave the key visible to scans exactly once.
+func TestOrderedIndex_OverwriteSkipsInsertButStaysVisible(t *testing.T) {
+	se, err := NewStorageEngine(testStorageConfig(t.TempDir()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer se.Close()
+	for i := 0; i < 3; i++ {
+		if err := se.Put("ow", []byte{byte('a' + i)}, -1); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := se.Delete("gone"); err != nil && !errors.Is(err, ErrKeyNotFound) {
+		t.Fatal(err)
+	}
+	for _, step := range []func() error{
+		func() error { return se.Put("back", []byte("1"), -1) },
+		func() error { return se.Delete("back") },
+		func() error { return se.Put("back", []byte("2"), -1) },
+	} {
+		if err := step(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	kvs, err := se.RangeScan("", "", 0, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]string{}
+	for _, kv := range kvs {
+		if _, dup := got[kv.Key]; dup {
+			t.Fatalf("key %q returned twice", kv.Key)
+		}
+		got[kv.Key] = string(kv.Value)
+	}
+	if got["ow"] != "c" || got["back"] != "2" || len(got) != 2 {
+		t.Fatalf("scan = %v, want ow=c back=2", got)
+	}
+	if se.index.ordered.Len() != 2 {
+		t.Fatalf("ordered index holds %d keys, want 2", se.index.ordered.Len())
+	}
+}

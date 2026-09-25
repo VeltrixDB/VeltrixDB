@@ -5,6 +5,7 @@ import (
 	"log"
 	"net/http"
 	"runtime/pprof"
+	"runtime/trace"
 	"strconv"
 	"time"
 )
@@ -19,6 +20,7 @@ import (
 // process does today; this keeps it that way by construction.
 //
 //	/debug/pprof/profile?seconds=N   CPU profile (default 30 s)
+//	/debug/pprof/trace?seconds=N     execution trace (default 5 s) — `go tool trace`
 //	/debug/pprof/<name>              heap, goroutine, allocs, block, mutex, threadcreate
 //
 // Both are `go tool pprof`-compatible.
@@ -39,6 +41,22 @@ func servePprof(addr string) {
 		case <-r.Context().Done():
 		}
 		pprof.StopCPUProfile()
+	})
+	mux.HandleFunc("/debug/pprof/trace", func(w http.ResponseWriter, r *http.Request) {
+		secs, _ := strconv.Atoi(r.URL.Query().Get("seconds"))
+		if secs <= 0 {
+			secs = 5
+		}
+		w.Header().Set("Content-Type", "application/octet-stream")
+		if err := trace.Start(w); err != nil {
+			http.Error(w, err.Error(), http.StatusConflict)
+			return
+		}
+		select {
+		case <-time.After(time.Duration(secs) * time.Second):
+		case <-r.Context().Done():
+		}
+		trace.Stop()
 	})
 	mux.HandleFunc("/debug/pprof/", func(w http.ResponseWriter, r *http.Request) {
 		name := r.URL.Path[len("/debug/pprof/"):]
