@@ -5,6 +5,8 @@ VeltrixDB uses two replication mechanisms that work at different layers:
 1. **Raft Consensus** (`consensus/raft.go`) — synchronous, strongly consistent replication of the write-ahead log across a Raft group. This is the primary durability guarantee.
 2. **Replication Engine** (`replication/engine.go`) — asynchronous (or quorum/strong) replication of writes to replica nodes, used for read scaling, geographic distribution, and cross-cluster DR.
 
+Both need the Go network front-end (`--net=go`, the default). `cmd/server` refuses `--net=cpp|uring|poll` with `--mode=raft` or `--mode=replicated`: the C++ front-end is standalone-only and its writes would bypass Raft and replication.
+
 ---
 
 ## Layer 1: Raft Consensus Replication
@@ -129,6 +131,10 @@ Raft state (`CurrentTerm`, `VotedFor`, log entries) is persisted to `<dataDir>/r
 ```
 
 If the process crashes mid-write, the old `raft_state.gob` is untouched. The new file is only visible after the rename succeeds.
+
+Once the retained log reaches `SnapshotThreshold` entries (default 8192) and the state machine implements `SnapshotStateMachine`, the applied prefix is replaced by a snapshot in `<dataDir>/raft_snapshot.gob` (same temp-file + fsync + rename pattern). On restart the snapshot is restored before the log tail is replayed; a follower that needs compacted entries receives one `InstallSnapshot` RPC.
+
+Raft state is separate from the storage engine's own WAL, which each node replays on startup independently (see [node-lifecycle.md](node-lifecycle.md#crash-recovery-on-the-crashed-node)).
 
 ### Raft Election Constants
 

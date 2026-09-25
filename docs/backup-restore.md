@@ -17,6 +17,8 @@ VeltrixDB stores data across two files per disk:
 
 The in-memory index is **not** backed up — it is fully rebuilt from the WAL on startup (see Crash Recovery in `storage.md`). Backing up the WAL + VLog is sufficient.
 
+**WAL encoding.** The backed-up `wal.log` and PITR archive segments are written in the engine's `--wal-format` — binary by default; the `veltrixdb-backup` CLI, which opens the engine itself, always writes binary, and `restore-pitr` always appends binary records. Any build that reads binary WAL also reads legacy text, so restoring into the same or a newer build always works. A pre-binary build cannot read binary records: to restore into one, restore with the current build, start the server once with `--wal-format=text` and stop it cleanly (the shutdown checkpoint rewrites `wal.log` as text), then start the older build. Keys containing `|` or a newline are not crash-safe in the text format.
+
 ---
 
 ## Full Backup
@@ -126,7 +128,7 @@ BackupEngine.IncrementalBackup(destDir, baseManifest)
     └─ 3. Write manifest.json with BaseBackupDir = base backup ID
 ```
 
-**Each incremental WAL is a complete snapshot** — it covers all live keys at that moment, not just changed keys. The WAL is small (one line per live key, no values), so copying it fully each time is cheap.
+**Each incremental WAL is a complete snapshot** — it covers all live keys at that moment, not just changed keys. The WAL is small (one record per live key, no values in KV-separation mode), so copying it fully each time is cheap.
 
 **The VLog delta is append-only** — it captures exactly `[baseEnd, curEnd)` bytes. Because VLog offsets are stable (values are never moved except by GC), these byte ranges are self-contained.
 
@@ -293,6 +295,8 @@ The archiver never blocks the group-commit path: it runs in its own goroutine, r
 
 **Why self-contained segments?** In KV-separation mode the live WAL stores only a VLog offset per record. VLog GC relocates and discards superseded records, so an archived offset would silently rot. The archiver therefore embeds the value bytes into the segment at archive time — an archive segment is replayable forever, independent of the VLog it came from.
 
+The archiver reads the stored blob (`diskLen` bytes) and undoes compression and encryption per the record's `xflags`, so **archived values are plaintext** even when encryption at rest is on — protect the archive directory accordingly. (Earlier builds read transformed values with the plaintext length, failed the CRC and counted them as skipped, so compressed or encrypted values were missing from the archive.) The archiver, PITR restore and crash replay all decode WAL bytes with the same reader, which accepts binary and legacy text records mixed.
+
 ### Archive Directory Layout
 
 ```
@@ -357,7 +361,7 @@ What happens (`storage.RestorePITR`):
 
 1. Read the base manifest (must be a **full** backup) and refuse non-empty target dirs.
 2. Restore the base backup (same code path as `restore`).
-3. For each disk, walk archive segments in sequence order, verify CRCs, and append every record with `base_version < version ≤ target` (or `timestamp ≤ target`) to the restored `wal.log`.
+3. For each disk, walk archive segments in sequence order, verify each segment's CRC32C, and append every record with `base_version < version ≤ target` (or `timestamp ≤ target`) to the restored `wal.log`.
 4. On the next engine startup, normal WAL replay applies them: values are re-appended to the VLog, tombstones re-delete keys, and the engine's version counter resumes past the last applied write.
 
 ```go
@@ -373,7 +377,7 @@ applied, err := storage.RestorePITR(baseDir, archiveDir, target, destDirs)
 | Granularity | Exact to a single write (`version:N`) or to a wall-clock timestamp (entry timestamps are assigned at `Put()` time) |
 | Durability boundary | Only fdatasync-covered WAL bytes are archived — a segment never contains a torn record |
 | Deletes | Tombstones are archived and replayed; restoring past a delete removes the key |
-| Archive corruption | Detected via per-segment CRC32C before replay; restore aborts |
+| Archive corruption | Detected via per-segment CRC32C before replay; restore aborts. Binary records also carry their own CRC32C, checked on decode |
 | Lower bound | Targets at or before the base backup's `engine_version` are rejected — restore the base (or an older base) directly |
 | Coverage requirement | Archiving must be running from before the base backup until the target moment; pruned segments shrink the restorable window |
 | GC race window | If VLog GC reclaims a superseded value in the (interval-sized) window before it is archived, that brief intermediate value is skipped (`EntriesSkipped` counter); the final state of the key is always correct |

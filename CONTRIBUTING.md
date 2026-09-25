@@ -22,8 +22,12 @@ Thank you for your interest in contributing. VeltrixDB is a production-grade sto
 git clone https://github.com/VeltrixDB/veltrixdb
 cd veltrixdb
 
-# Go-only build (works on macOS and Linux)
+# Build. cgo is on by default: this compiles the off-heap native index and the
+# C++ network front-end (a C++ compiler is required; on Linux also liburing)
 go build ./...
+
+# Pure-Go build (Go map index, no C++ at all)
+CGO_ENABLED=0 go build ./...
 
 # Run tests
 go test ./...
@@ -38,13 +42,13 @@ go run ./cmd/server -addr :9000 -data ./dev-data -cache 256
 ./scripts/bench.sh
 ```
 
-For the C++ io_uring layer (Linux only):
+For the full C++ build, CMake plus the io_uring layer (Linux only):
 ```bash
 # Requires liburing, GCC/Clang with C++20 support
 VERSION=1.0.0 ./scripts/build.sh --output ./dist
 ```
 
-macOS is fully supported for development with the Go-only build. The C++ layer is Linux-only and not required for most contributions.
+macOS is fully supported for development. A cgo build there uses the native index and the poll() backend of the C++ front-end. The io_uring code (the opt-in VLog write bridge and the `netfront/` io_uring backend) and the C++ batch engine are Linux-only and not required for most contributions. Set `VELTRIXDB_INDEX=map` to run a cgo build on the Go map index.
 
 ---
 
@@ -54,9 +58,12 @@ macOS is fully supported for development with the Go-only build. The C++ layer i
 
 ```bash
 go test ./...
+CGO_ENABLED=0 go test ./...     # most CI jobs run pure Go
 ./tests/e2e/run_all.sh
 ./scripts/bench.sh
 ```
+
+If you edited C++ that a `storage/cgo_*_linux.cpp` shim `#include`s from `cpp/src/`, run `go test -a`. The Go build cache does not track included files, so a plain `go test` can run a stale object (CLAUDE.md invariant 44). If you changed `netfront/`, also run its tests on Linux with `VXNF_TEST_BACKEND=uring` (see [docs/TESTING_GUIDE.md](docs/TESTING_GUIDE.md)).
 
 `bench.sh` has two hard pass/fail gates:
 - **Density gate**: `bytes/record ≤ 1.2 × (24 + value_size)` — block packing must be working
@@ -74,10 +81,12 @@ Both gates must pass on your branch before submitting.
 - `MarkDead` must be called whenever a key's VLog pointer is superseded (Invariant 17)
 - `FlagPacked` must be sourced from `entry.IsPacked()` on the superseded entry when calling `MarkDead`
 - `--local-ssd-interface=NVME` is required on GKE — document any Kubernetes change accordingly
+- The WAL flusher issues one `write(2)` per group-commit batch, and a VLog batch is one `pwrite` plus one `fdatasync` (Invariants 41–42) — never reintroduce per-entry syscalls
+- The C++ network front-end (`netfront/`) must keep per-connection order and never read from disk on a loop thread (Invariant 50)
 
 ### 3. No performance regressions
 
-If your change touches the hot path (Put, Get, WAL flush, VLog append), run the load test and include before/after numbers in your PR description:
+If your change touches the hot path (Put, Get, WAL flush, VLog append, the index), run the load test and include before/after numbers in your PR description:
 
 ```bash
 # 30-second mixed benchmark
@@ -86,6 +95,8 @@ go run ./cmd/loadtest \
   --mode=mixed --concurrency=64 --duration=30 \
   --num-keys=1000000 --value-size=128 --read-ratio=0.7
 ```
+
+For network front-end or C++ storage changes, measure on Linux with `scripts/net-bench.sh` or the `Net front-end` workflow (see [BENCHMARKING.md](BENCHMARKING.md)). A Mac cannot show networking gains, because loopback caps round trips at ~60K/s for both front-ends.
 
 ### 4. Keep PRs focused
 

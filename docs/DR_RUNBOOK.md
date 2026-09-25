@@ -24,7 +24,8 @@ kubectl describe pod -n veltrixdb POD
 
 | Log line | Cause | Fix |
 |----------|-------|-----|
-| `WAL replay corruption at offset N` | Partial write on crash | Restart pod once; if recurring: `kubectl veltrix sync-from REPLICA_POD` |
+| `[wal] replay of … stopped at byte N of M after K records` | Torn final write on crash (small `M − N`), or WAL damage (large) — every record is CRC32C-checked and replay stops at the first bad one | Restart pod once; if recurring or `M − N` is large: `kubectl veltrix sync-from REPLICA_POD` |
+| `panic: native index: insert failed (out of memory?)` | `vm.max_map_count` too low for the off-heap native index (cgo builds) | Apply `scripts/sysctl.conf` (`vm.max_map_count = 262144`) on the node; or set `VELTRIXDB_INDEX=map` to use the Go map index |
 | `cannot allocate memory` (vlog open) | Hugepages missing | `kubectl exec POD -- sysctl vm.nr_hugepages` — must be ≥ 512 |
 | `bad magic at offset O` | Silent disk corruption | Drain node, replace disk, re-join |
 | `encryption: no key in VELTRIXDB_ENCRYPTION_KEY` | Missing secret | `kubectl create secret generic veltrixdb-enc --from-literal=key=BASE64_32B` |
@@ -45,7 +46,7 @@ kubectl logs -n veltrixdb POD | grep '\[scrub\] disk='
 kubectl label pod -n veltrixdb POD veltrixdb.io/quarantine=true --overwrite
 
 # Wipe and restart (replication refills automatically)
-kubectl exec -n veltrixdb POD -- rm -rf /mnt/nvme*/vlog_active.dat /mnt/nvme*/wal_*
+kubectl exec -n veltrixdb POD -- rm -rf /mnt/nvme*/vlog_active.dat /mnt/nvme*/wal.log*
 kubectl delete pod -n veltrixdb POD
 
 # After replay completes
@@ -105,6 +106,8 @@ veltrixdb-backup download --provider=s3 --bucket=my-bucket \
   --cloud-path=veltrixdb-backups/$(date +%F) --dest=/tmp/restore
 veltrixdb-backup restore --chain=/tmp/restore --data-dirs=/data-new
 ```
+
+Backups and PITR restores write a binary WAL; restoring into a build that predates the binary WAL needs the §8 procedure first. See [backup-restore.md](backup-restore.md).
 
 Or via Kubernetes volume snapshots:
 ```bash
@@ -172,7 +175,8 @@ Each `wal.log` is copied to `wal.log.prerepair.<timestamp>` before anything is
 written. The repair is exact, not heuristic: `IndexEntry.CRC32C` is the CRC of
 the **plaintext** and survived the bug, so the tool tries the four possible
 interpretations of each on-disk blob and accepts only the one reproducing that
-CRC. Anything else is reported and left untouched. It is idempotent.
+CRC. Anything else is reported and left untouched. It is idempotent. The
+repaired `wal.log` is written in the binary WAL format (§8).
 
 ### Step 3 — verify
 
@@ -185,6 +189,28 @@ all healthy.
 No interpretation matched the stored CRC. Either the scan ran without the
 encryption key — re-run with `--encrypt` and the correct key — or those
 records are genuinely corrupt and need §5 restore-from-backup.
+
+## 8. WAL format: upgrade and rollback
+
+WAL records are binary by default. Replay reads binary and legacy text records
+in any mix, so **upgrading needs no step**: the new build replays the existing
+text WAL and appends binary records after it.
+
+A build that predates the binary WAL cannot read it. To roll back:
+
+```bash
+# 1. On the CURRENT build, restart once writing the legacy text WAL
+#    (logs "[wal] WARNING: --wal-format=text ...")
+veltrixdb --wal-format=text ...        # add to the StatefulSet args, re-roll
+# 2. Stop it CLEANLY (SIGTERM, not SIGKILL) — the shutdown checkpoint
+#    rewrites wal.log as text
+kubectl scale statefulset/veltrixdb --replicas=0 -n veltrixdb
+# 3. Deploy the older build
+```
+
+If the node crashed instead of stopping cleanly, repeat steps 1–2. While
+running with `--wal-format=text`, keys containing `|` or a newline are not
+crash-safe: a crash can drop every acknowledged write after such a key.
 
 ## Contact
 

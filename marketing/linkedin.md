@@ -12,17 +12,16 @@ Existing disk-backed databases (RocksDB, LevelDB) have a different problem: LSM 
 
 VeltrixDB uses a research technique called WiscKey (FAST '16, by Lu et al. at University of Wisconsin) to get around this. The core idea: separate keys from values at the storage layer. Keys and metadata live in a DRAM index. Values are written once to an append-only Value Log on NVMe and never rewritten. Compaction only reclaims dead space — it doesn't move live data. Write amplification drops to ~1.0×.
 
-Benchmark results on a 3-node GKE cluster (8 NVMe disks per node, 1 billion keys, 30 minutes sustained):
+Benchmark results (YCSB 0.17.0, single AWS EC2 node with 4 NVMe disks, 100M keys, 200 threads):
 
-→ 7.2M reads/second  
-→ 1.8M writes/second  
-→ P99 latency: 510 µs (blended)  
-→ Zero GC emergency events  
+→ 427,697 reads/second (461 µs average latency)  
+→ 18,064 durable writes/second (fsync on every write)  
+→ Zero errors and zero value-log GC emergency runs across 100M operations  
 → ~160 GB storage for 1B × 128B values
 
 We've also built the operational layer we wish existed: a Kubernetes Operator with auto-resharding and self-healing, a Helm chart with 22 Prometheus alerting rules, a cloud-agnostic NVMe provisioner for GKE/EKS/AKS, and client SDKs for Go, Java, Python, Node.js, Rust, and C++.
 
-What's NOT ready: Redis protocol compatibility (RESP is on the roadmap), a managed cloud offering, and Raft log snapshots for large clusters. We'd rather ship an honest v1 than oversell it.
+What's NOT ready: Redis protocol compatibility (RESP is on the roadmap) and a managed cloud offering. We'd rather ship an honest v1 than oversell it.
 
 Apache 2.0. The code is at github.com/VeltrixDB/veltrixdb.
 
@@ -38,13 +37,13 @@ If you're paying Redis bills at scale, or running into write amplification issue
 
 We open-sourced VeltrixDB today — a distributed KV database for NVMe SSDs.
 
-The short version: Redis at 1B keys costs ~$4K/month in RAM. The same workload on VeltrixDB costs ~$400/month on NVMe. Write amplification is ~1.0× (vs 10-30× for LSM trees). P99 latency stays flat under sustained write pressure.
+The short version: Redis at 1B keys costs ~$4K/month in RAM. The same workload on VeltrixDB costs ~$400/month on NVMe. Write amplification is ~1.0× (vs 10-30× for LSM trees). No compaction rewrites, so no compaction-driven P99 spikes.
 
-3-node benchmark: 7.2M reads/s, P99 510 µs, zero GC emergencies in 30 minutes.
+Single-node YCSB: 427K reads/s, 18K fsync'd writes/s, zero errors across 100M ops.
 
 Apache 2.0 → github.com/VeltrixDB/veltrixdb
 
-What gaps exist: no Redis protocol compatibility yet, no managed cloud, no Raft snapshots.
+What gaps exist: no Redis protocol compatibility yet, no managed cloud.
 
 Happy to go deeper on the architecture if anyone's curious. 
 

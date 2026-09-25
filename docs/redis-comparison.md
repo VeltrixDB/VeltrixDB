@@ -12,7 +12,9 @@ GC pause spikes under write pressure.
 
 **VeltrixDB** stores values on NVMe SSDs with a DRAM index and LIRS cache. Predictable
 P99 latency under sustained load, 25× storage density, and GC that cannot be permanently
-paused.
+paused. On cgo builds (the default, including the Docker image) the index lives off the
+Go heap in C++ tables, so Go's garbage collector does not scan it: with 5M keys a full
+GC takes 0.27 ms instead of 21 ms.
 
 ---
 
@@ -20,16 +22,18 @@ paused.
 
 | Percentile | Redis (cache hit) | VeltrixDB (cache hit) | VeltrixDB (NVMe miss) |
 |---|---|---|---|
-| P50 read | ~100 µs (network) | ~220 ns | ~400 µs |
+| P50 read | ~100 µs (network) | ~92 ns (in-process) | ~400 µs |
 | P99 read | ~1–50 ms (GC spikes) | ~510 µs | ~1 ms |
 | P50 write | ~200 µs | ~17 µs per key | — |
 | P99 write | spikes during compaction | ~42 µs (stable) | — |
 
 > Redis P99 numbers are from production reports under mixed read/write load with AOF enabled.
-> VeltrixDB numbers are from a 30-minute sustained 80R/20W benchmark on GKE n2-highmem-64 (8x NVMe).
+> VeltrixDB cache-hit P50 is the in-process lookup (~92 ns since the cache was sharded). The other
+> VeltrixDB numbers are from an internal 30-minute sustained 80R/20W run on GKE n2-highmem-64
+> (8x NVMe) that has not been reproduced with a published harness; see Benchmark Reference.
 
 The key difference is the **shape** of P99 over time. Redis P99 is low until it isn't.
-VeltrixDB P99 does not drift — the three-tier GC and RT-priority NVMe queue enforce a ceiling.
+VeltrixDB P99 does not drift — the three-tier, admission-controlled VLog GC enforces a ceiling.
 
 ---
 
@@ -87,7 +91,8 @@ Use VeltrixDB when:
   dashboards show Redis P99 spikes during AOF rewrite or keyspace expiry, VeltrixDB's
   three-tier GC is designed for this exact problem
 - **You're doing bulk writes at high concurrency** — MultiPut with 1024-entry batches
-  achieves ~446K batch ops/s per node vs Redis pipelining which is limited by single-
+  measured 1.77M keys/s (8 clients, 4-CPU CI runner, tmpfs, same-host client) and 3.54M
+  keys/s (8 clients, macOS, 1M-key space) vs Redis pipelining which is limited by single-
   threaded command processing
 - **You're running on Kubernetes with local NVMe** — first-class Kubernetes Operator,
   Helm chart, and GKE local SSD auto-detection
@@ -99,7 +104,8 @@ Use VeltrixDB when:
 
 ## Migrating from Redis
 
-VeltrixDB uses a simple text protocol compatible with `nc`:
+VeltrixDB uses a simple text protocol compatible with `nc` (served by the default
+`--net=go` front-end; the opt-in C++ front-end, `--net=cpp`, speaks only the binary protocol):
 
 ```bash
 # Redis
@@ -138,7 +144,7 @@ MultiPut/MultiGet map to Redis pipelines. SETNX, INCR, DECR, CAS are supported.
 
 | Feature | Redis | VeltrixDB |
 |---|---|---|
-| In-memory speed (P50) | ✅ ~100 µs | ✅ ~220 ns |
+| In-memory speed (P50) | ✅ ~100 µs | ✅ ~92 ns (in-process cache hit) |
 | Predictable P99 under writes | ⚠️ spikes | ✅ bounded |
 | NVMe storage tier | ❌ | ✅ |
 | Write amplification | ⚠️ 2–30× | ✅ ~1.0× |
@@ -159,8 +165,11 @@ MultiPut/MultiGet map to Redis pipelines. SETNX, INCR, DECR, CAS are supported.
 
 ## Benchmark Reference
 
-All VeltrixDB numbers below are from a 3-node GKE cluster (n2-highmem-64, 8×375 GB
-NVMe per node, raw block device VLog, Linux 6.6, `--read-heavy` preset).
+All VeltrixDB numbers below are from an internal 3-node GKE cluster run (n2-highmem-64,
+8×375 GB NVMe per node, raw block device VLog, Linux 6.6, `--read-heavy` preset). It is
+historical, predates the current storage and network changes, and has not been reproduced
+with a published harness. Reproducible single-node YCSB numbers are in
+[BENCHMARK_RESULTS.md](../BENCHMARK_RESULTS.md).
 
 ```
 3-node cluster · 80R/20W · 30 minutes sustained · 1 billion keys

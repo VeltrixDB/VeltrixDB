@@ -10,7 +10,7 @@
 #   gcc/g++ 11+, cmake 3.20+, liburing-dev, go 1.19+
 #
 # The resulting tarball contains:
-#   veltrixdb          — statically linked binary
+#   veltrixdb          — server binary (static with --go-only / CGO_ENABLED=0; cgo links libstdc++ and liburing)
 #   config.yaml.example
 #   scripts/sysctl.conf
 #   scripts/hugepages.sh
@@ -48,7 +48,7 @@ echo ""
 
 # ── Step 1: Build C++ shared objects (Linux only) ────────────────────────────
 if [[ "${GO_ONLY}" == "false" && "${GOOS}" == "linux" ]]; then
-  echo "--- Building C++ engine (io_uring ART scheduler) ---"
+  echo "--- Building C++ static library (cpp/, CMake) ---"
 
   CPP_BUILD_DIR="${REPO_ROOT}/cpp/build"
   mkdir -p "${CPP_BUILD_DIR}"
@@ -77,8 +77,11 @@ fi
 echo ""
 echo "--- Building Go control plane ---"
 
-# CGO_ENABLED=0 for a fully static binary (no libc dependency).
-# On Linux prod builds, set CGO_ENABLED=1 if C++ ART integration is used.
+# CGO_ENABLED=0 for a fully static binary (no libc dependency, Go map index).
+# CGO_ENABLED=1 — forced below when the C++ build ran — compiles in the
+# off-heap native index (on by default; needs vm.max_map_count >= 262144,
+# see sysctl.conf), the batch engine and the opt-in io_uring VLog bridge.
+# The ART index / scheduler in the CMake archive are linked but not called.
 CGO_ENABLED="${CGO_ENABLED:-0}"
 
 LDFLAGS=(

@@ -6,13 +6,13 @@ This document maps VeltrixDB's built-in capabilities to the SOC 2 Trust Service 
 |-----|---|---|---|
 | CC6.1 | Logical access controls | RBAC (`-auth-config`), per-namespace tenancy, mTLS (`-tls-cert`/`-tls-key`/`-tls-ca`) | Provision unique users per service, rotate credentials, deny network ingress to admin port |
 | CC6.6 | Restrict data transmission to authorized parties | TLS 1.3 listener (`-tls-addr`), mTLS client cert verification | Use mTLS in production; load only signed certs |
-| CC6.7 | Encrypted data at rest | AES-256-GCM at rest (`EncryptionEnabled=true`); key sourced from `VELTRIXDB_ENCRYPTION_KEY` env or `EncryptionKeyPath` file | Manage the master key in KMS / sealed secret; never commit key material to source |
-| CC6.8 | Anti-malware / image hygiene | Single-binary distribution; `Dockerfile` is FROM scratch + minimal CA bundle | Scan published images (Trivy / Snyk); pin SHA256 in Helm chart |
+| CC6.7 | Encrypted data at rest | AES-256-GCM at rest (`EncryptionEnabled=true`); key sourced from `VELTRIXDB_ENCRYPTION_KEY` env or `EncryptionKeyPath` file | Manage the master key in KMS / sealed secret; never commit key material to source. PITR archive segments hold values decrypted — encrypt and access-restrict the archive location |
+| CC6.8 | Anti-malware / image hygiene | Single-binary distribution; `Dockerfile` runtime stage is `gcr.io/distroless/cc-debian12` (glibc, no shell) | Scan published images (Trivy / Snyk); pin SHA256 in Helm chart |
 | CC7.1 | Detection of vulnerabilities | `govulncheck` runs in CI (`.github/workflows/ci.yml`) | Triage vulncheck output weekly; subscribe to Go security mailing list |
 | CC7.2 | Monitoring of components | Prometheus metrics (130+ series), `/healthz` and `/readyz` endpoints, `PrometheusRule` for 22 default alerts (write/read latency, GC, scrub corruption, slow disk, replication, cluster) | Run a Prometheus / Alertmanager stack with paging integration; review alert noise quarterly |
 | CC7.3 | Anomaly identification | Slow-op trace ring buffer at `/traces` (50 ms threshold); per-disk latency EWMA; scrub corruption counter | Define normal-baseline; alert on deviations |
 | CC7.4 | Security incident response | DR runbook (`docs/DR_RUNBOOK.md`) | Rehearse the runbook quarterly; capture post-mortems |
-| CC7.5 | Recovery from incidents | Backup via VolumeSnapshot; replica resync; raw-mode crash recovery (Invariant 27); WAL replay | Test restore at least twice a year; maintain quorum across availability zones |
+| CC7.5 | Recovery from incidents | Backup via VolumeSnapshot or `veltrixdb-backup` (full, incremental, PITR); replica resync; raw-mode crash recovery (Invariant 27); WAL replay | Test restore at least twice a year; maintain quorum across availability zones |
 | CC8.1 | Authorization of changes | Helm chart values are versioned; `cluster.replicationFactor` is enforced via PDB | Require PR review on all `values.yaml` changes; block deploys outside change windows |
 | A1.1 | Process capacity | Per-disk throughput / latency / file-bytes metrics; admission control with documented thresholds (Invariant 22) | Capacity plan against `vlog_file_bytes` growth; pre-provision before crossing 70 % |
 | A1.2 | Backup of data | VLog + WAL durably fdatasync'd; WAL group commit (Invariant 19, 20); checkpoint endpoint at `/admin/checkpoint` | Schedule snapshot job; verify by occasional restore-to-staging |
@@ -20,7 +20,7 @@ This document maps VeltrixDB's built-in capabilities to the SOC 2 Trust Service 
 | C1.1 | Confidentiality of information | At-rest encryption + audit log of mutating ops (`AuditLogPath` config) | Ship audit log to immutable retention (Loki / S3 Object Lock); restrict who can read it |
 | C1.2 | Disposal of confidential information | `BLKDISCARD` on raw NVMe (Invariant 26); `fallocate(PUNCH_HOLE)` on file-backed disks during VLog GC | Document key destruction in tenant offboarding |
 | PI1.1 | Processing integrity inputs | Binary protocol size caps; per-namespace quotas (`SetNamespaceLimit`); rate-limit on writes | Enable quotas per tenant from day one |
-| PI1.4 | Output completeness/accuracy | CRC32C on every VLog record (write + read verification); background scrubber re-validates (50 MB/s default) | Alert on `scrub_corruption_total > 0` (already in chart) |
+| PI1.4 | Output completeness/accuracy | CRC32C on every VLog record (write + read verification) and on every WAL record (binary format, the default: the whole record, header included; verified on crash replay and PITR restore); background scrubber re-validates (50 MB/s default) | Alert on `scrub_corruption_total > 0` (already in chart) |
 | PI1.5 | Processing integrity errors | Admission control + GC emergency logs; scrubber emits `[scrub] disk=N offset=O ...` for every detection | Forward error logs to SIEM; on-call must be paged on corruption |
 
 ## Audit evidence checklist

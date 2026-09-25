@@ -3,6 +3,8 @@
 
 > All VeltrixDB numbers are from actual benchmarks run on AWS EC2 (495 GB RAM, 4× 873 GB NVMe).  
 > Redis, ScyllaDB, and Aerospike numbers are from their official benchmarks and widely-cited third-party tests on comparable hardware.
+>
+> **The VeltrixDB YCSB numbers are historical and from the pure-Go build.** They predate the binary WAL, the one-`write(2)`-per-batch WAL flusher, the ordered-index fix, the off-heap native index and the opt-in C++ network front-end. Later measurements (different machines, stated in [BENCHMARK_RESULTS.md](BENCHMARK_RESULTS.md#later-measurements)) are not YCSB and are not substituted into these tables.
 
 ---
 
@@ -96,7 +98,7 @@ ScyllaDB is a distributed wide-column store (Cassandra-compatible) built in C++ 
 ## 3. VeltrixDB vs Aerospike
 
 ### Architecture difference
-Aerospike is the closest architectural match — both use a hybrid approach with index in RAM and values on NVMe SSD. Aerospike is written in C with years of NVMe optimization. VeltrixDB uses Go + C++ (io_uring, WiscKey KV separation).
+Aerospike is the closest architectural match — both use a hybrid approach with index in RAM and values on NVMe SSD. Aerospike is written in C with years of NVMe optimization. VeltrixDB is Go with WiscKey KV separation; on cgo builds (the default) the index lives off the Go heap in per-shard C++ tables, and the VLog read path is Go `pread`. Connections are served goroutine-per-connection by default; `--net=cpp` is an opt-in, experimental C++ event-loop front-end (one loop per core, binary PUT/GET/DEL/PING/MPUT/MGET only).
 
 ### Write comparison
 
@@ -105,9 +107,9 @@ Aerospike is the closest architectural match — both use a hybrid approach with
 | Throughput (single node) | 18,064 ops/sec | 100K–500K ops/sec |
 | Avg latency | 11 ms | 1–5 ms |
 | Durability | ✅ fsync every write | ✅ Configurable (default: durable) |
-| io_uring | ✅ | ✅ |
+| io_uring | Opt-in VLog write bridge, off by default | ✅ |
 
-**Aerospike writes are 5–25× faster.** This is the most significant gap. Root cause: Aerospike uses a 5–10 µs group-commit window vs VeltrixDB's current 5 ms. Lowering VeltrixDB's `--wal-flush-window-ms` to 0.1 ms with enough threads could close this gap but requires further optimization.
+**Aerospike writes are 5–25× faster.** This is the most significant gap. Root cause: Aerospike uses a 5–10 µs group-commit window vs VeltrixDB's current 5 ms. Lowering VeltrixDB's `--wal-flush-window-ms` (whole milliseconds; 0 flushes without waiting) with enough threads could narrow this gap but requires further optimization.
 
 ### Read comparison
 
@@ -116,9 +118,9 @@ Aerospike is the closest architectural match — both use a hybrid approach with
 | Throughput (single node) | 427,697 ops/sec | 500K–2M ops/sec |
 | Avg latency | 461 µs | 100–500 µs |
 | P99 latency | 2.77 ms | <1 ms |
-| NVMe read path | io_uring SQPOLL | Custom I/O layer |
+| NVMe read path | Go `pread` (4 KB-aligned) | Custom I/O layer |
 
-**Aerospike reads are 1.2–4× faster.** Aerospike's C-based stack and years of NVMe tuning give it an edge. VeltrixDB's C++ io_uring path (SQPOLL, O_DIRECT) is the same technology — the gap is in maturity and per-operation overhead.
+**Aerospike reads are 1.2–4× faster.** Aerospike's C-based stack and years of NVMe tuning give it an edge. VeltrixDB's read path is Go `pread`; a C++ VLog reader and io_uring read scheduler exist under `cpp/` but have no Go call site and do not run.
 
 ### When to choose which
 | Use case | Winner |
@@ -174,7 +176,7 @@ Aerospike Enterprise and ScyllaDB Enterprise have licensing costs. VeltrixDB is 
 ## Where VeltrixDB Needs Work
 
 ### 1. Write throughput gap vs Aerospike / ScyllaDB
-18K vs 100K–500K ops/sec. The WAL group-commit window (5 ms) is the primary bottleneck. Lowering it with the io_uring write path active can push this toward 100K+.
+18K vs 100K–500K ops/sec for per-key durable writes (YCSB, historical). The WAL group-commit window (5 ms) is the primary bottleneck. Batched writes are a different picture: 8 clients × 1024-key MPUT later measured 1.77M keys/s (4-CPU CI runner, tmpfs, same-host client) and 3.54M keys/s (macOS, 1M-key space). The io_uring write bridge is not the lever: on that CI runner the C++ storage layer with the bridge on measured 1.12M vs 1.77M keys/s with it off, so it is opt-in.
 
 ### 2. Write P99 latency
 47 ms P99 writes vs Aerospike's 1–5 ms. The 5 ms flush window inherently adds tail latency on bursty workloads.
@@ -189,8 +191,8 @@ Aerospike has 15+ years of NVMe optimization. ScyllaDB has been production-harde
 | Improvement | Expected Write Impact | Status |
 |-------------|----------------------|--------|
 | WAL window 1 ms + 500 threads | ~50K–80K ops/sec | Configurable now |
-| io_uring write path (C++) | ~100K–200K ops/sec | Implemented, needs activation |
-| WAL window 0.1 ms + io_uring | ~200K–400K ops/sec | Requires testing |
+| io_uring write path (C++) | Not a gain so far: C++ storage layer all on (bridge, batch engine, native index) 1.12M vs 1.77M keys/s all off (CI batch writes); per-part attribution pending | Implemented, opt-in (`VELTRIXDB_URING_BRIDGE=on\|sqpoll`) |
+| WAL window 0 ms + io_uring | ~200K–400K ops/sec | Requires testing |
 | Parallel WAL per disk (4 disks) | 4× current | Architecture supports it |
 
 ---

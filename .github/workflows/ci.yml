@@ -278,11 +278,12 @@ jobs:
             --branch "${{ github.ref_name }}"
 
   # ── Node 5: race detector ─────────────────────────────────────────────────
-  # -race REQUIRES cgo, and enabling cgo silently switches the storage engine
-  # onto the C++ path: every NewStorageEngine would build an io_uring bridge
-  # with SQPOLL (a busy-polling kernel thread per ring) plus NumCPU() C++
-  # worker threads. A test suite constructs dozens of engines, and on a 2-core
-  # runner that starved the job into a 30-minute timeout (SIGTERM, exit 143).
+  # -race REQUIRES cgo, and enabling cgo switches the storage engine onto the
+  # C++ path: every NewStorageEngine starts NumCPU() C++ batch-engine threads
+  # (and, before VELTRIXDB_URING_BRIDGE made it opt-in, an io_uring bridge
+  # with SQPOLL — a busy-polling kernel thread per ring). A test suite
+  # constructs dozens of engines, and on a 2-core runner that starved the job
+  # into a 30-minute timeout (SIGTERM, exit 143).
   #
   # So: cgo ON (for -race), C++ engine OFF (via VELTRIXDB_DISABLE_CGO_ENGINE).
   # This job is here to find data races in the Go logic; node-6-cpp is what

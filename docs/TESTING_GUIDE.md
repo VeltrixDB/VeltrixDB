@@ -20,6 +20,56 @@ go test ./replication/...  # async, quorum, strong modes
 go test -race -timeout 600s -count=1 ./storage/...
 ```
 
+### cgo vs pure Go
+
+`go test` builds with cgo by default, so `storage/` runs on the off-heap
+native index (`storage/native_index.cpp`, cgo + Go >= 1.21, macOS included)
+and `netfront/` is compiled. On Linux a cgo build also links liburing. Most CI
+jobs run `CGO_ENABLED=0`, which uses the Go map index and skips the
+cgo-tagged tests (`storage/index_table_native_test.go`,
+`netfront/netfront_test.go`).
+
+| Knob | Effect |
+|------|--------|
+| `CGO_ENABLED=0` | Pure Go: map index, no C++ |
+| `VELTRIXDB_INDEX=map` / `=native` | Force the index implementation on a cgo build |
+| `VELTRIXDB_DISABLE_CGO_ENGINE=1` | No C++ batch engine or io_uring bridge. Also selects the map index unless `VELTRIXDB_INDEX=native` |
+| `VELTRIXDB_URING_BRIDGE=on` | Exercise the opt-in io_uring VLog write bridge (Linux cgo). Use `on`, not `sqpoll`, in tests: many short-lived SQPOLL engines starve a runner |
+
+The native index's correctness oracle is `TestEntryTable_NativeMatchesMap`,
+which compares it with the map under forced hash collisions and edge-case keys.
+
+**After editing C++ that a `storage/cgo_*_linux.cpp` shim `#include`s from
+`cpp/src/`, run `go test -a`.** The build cache does not track included
+files, so a plain `go test` can silently re-run the stale object (CLAUDE.md
+invariant 44). `storage/native_index.cpp` and `netfront/netfront.cpp` live in
+their package directories and are tracked normally.
+
+### Network front-end tests (`netfront/`)
+
+```bash
+# poll() backend — runs anywhere cgo does, including macOS
+go test -v -count=1 ./netfront/...
+
+# io_uring backend — Linux with liburing; fails if io_uring is unavailable
+VXNF_TEST_BACKEND=uring go test -v -count=1 -timeout 600s ./netfront/...
+```
+
+These cover per-connection ordering (`TestNetfront_PipelineOrder`), deferred
+disk reads (`TestNetfront_DeferredReadBlocksLaterBatches`,
+`TestNetfront_DeferredReadNoHeadOfLine`) and shutdown with writes in flight.
+The `Net front-end` workflow (`.github/workflows/net-bench.yml`) runs them on
+Linux with `uring`, with `poll`, and with `uring` under `-race`.
+
+### What CI runs
+
+| Job | Build | Scope |
+|-----|-------|-------|
+| node-1 … node-4 | `CGO_ENABLED=0` | build, vet, unit, cluster, integration |
+| node-5-race | cgo, `VELTRIXDB_DISABLE_CGO_ENGINE=1`, `VELTRIXDB_INDEX=native` | `-race` in four groups: storage, server, cluster, rest |
+| node-6-cpp | CMake + cgo shims + `scripts/build.sh` | `./storage/...` with cgo and `VELTRIXDB_URING_BRIDGE=on` |
+| Net front-end | cgo, liburing | `./netfront/...` tests plus `scripts/net-bench.sh` |
+
 ### Writing a new test that needs an engine
 
 Build the config with **`testStorageConfig()`** (`storage/testconfig_test.go`),
@@ -105,7 +155,9 @@ The bench exits 0 only if both gates pass:
 - **Density gate**: `bytes/record ≤ 1.2 × (24 + value_size)` — packing is working
 - **GC emergency gate**: `gc_emergency_runs Δ == 0` — no GC death spirals
 
-See [BENCHMARKING.md](../BENCHMARKING.md) for full details.
+See [BENCHMARKING.md](../BENCHMARKING.md) for full details, including
+`scripts/net-bench.sh`, which compares `--net=go|uring|poll` and storage
+configurations on Linux.
 
 ---
 
@@ -113,9 +165,10 @@ See [BENCHMARKING.md](../BENCHMARKING.md) for full details.
 
 | Package | Tests |
 |---------|-------|
-| `storage/` | engine CRUD, WAL group-commit, LIRS cache, bloom filters, compression, atomic ops (CAS/INCR/DECR/SETNX), transactions, secondary indexes, quotas, CDC broker, backup, tiered storage |
+| `storage/` | engine CRUD, WAL group-commit, binary/text WAL decoding and crash replay, native vs map index, `GetNoIO`, LIRS cache, bloom filters, compression, atomic ops (CAS/INCR/DECR/SETNX), transactions, secondary indexes, quotas, CDC broker, backup, tiered storage |
 | `consensus/` | Raft election, log replication, quorum commit, persistence, heartbeat, stale vote rejection |
 | `cluster/` | failure detection, partition map assignment, rebalance, consistent hashing |
 | `replication/` | async/quorum/strong write, vector clocks, anti-entropy, tombstone GC, replica lag |
+| `netfront/` | C++ front-end: binary ops, batches, pipeline order, deferred reads, many connections (cgo only) |
 | `tests/integration/` | 3-node cluster, crash recovery, failover, backup/restore |
 | `tests/e2e/` | full stack, binary protocol, namespaces, auth, stress |

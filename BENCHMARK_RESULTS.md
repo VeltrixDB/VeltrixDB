@@ -2,6 +2,12 @@
 **Date:** June 9, 2026  
 **Dataset:** 100 Million Keys · 100 Byte Values · 4× NVMe Disks · 400 GB Cache
 
+> **Historical, pure-Go build.** This run predates the binary WAL, the
+> one-`write(2)`-per-batch WAL flusher, the ordered-index fix, the off-heap
+> native index (cgo builds, now the default and the Docker image) and the
+> opt-in C++ network front-end. The numbers are kept as recorded; later
+> measurements are under [Later measurements](#later-measurements).
+
 ---
 
 ## Test Environment
@@ -171,6 +177,25 @@ P99     ████████████████░░░░░░░░
 4. **Durability**: Every single write is crash-safe (WAL + fdatasync). Redis requires special configuration for the same guarantee, and pays a similar performance cost when enabled.
 
 5. **100% read hit rate**: With proper dataset sizing (`recordcount` matching `operationcount`), zero NOT_FOUND errors across 10 million reads.
+
+---
+
+## Later measurements
+
+Not YCSB and not this machine; each row states its conditions.
+
+| Measurement | Result | Conditions |
+|-------------|--------|------------|
+| Server batch writes, 8 clients × 1024-key MPUT, 1M-key space | **3.54M keys/s, P99 4.2 ms** (1.45M, 9.6 ms before the ordered-index fix) | macOS |
+| Batch writes, Go front-end, C++ storage off | **1.77M keys/s, P99 12.2–12.7 ms** | 4-CPU CI runner, tmpfs, client on same host |
+| Reads, same configuration | **177–182K ops/s, P99 1.8–2.0 ms** | same |
+| Mixed-workload write P99, 1 ms flush window | **2.57 ms** | same |
+| Batch writes, C++ storage layer all on (io_uring bridge + SQPOLL, batch engine, native index) | 1.12M keys/s | same; per-part attribution pending |
+| C++ network front-end (`--net=cpp`, opt-in) vs Go | read P50 154 vs 286 µs, poll read throughput 194K vs 177K ops/s; read P99 ~3.0 vs 1.8 ms, batch writes ~12% lower | same, measured before disk reads moved off the loop; not faster overall |
+| Native index vs Go map, 5M keys | full GC 21 → 0.27 ms, settled RSS 168 → 142 B/key, ~19 ns more per cache-miss lookup | engine benchmark |
+
+Reproduce the CI rows with `scripts/net-bench.sh` or the `Net front-end`
+workflow (see BENCHMARKING.md).
 
 ---
 
