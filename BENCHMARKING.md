@@ -78,6 +78,48 @@ curl -s :2112/metrics | grep -E "gc_(run|emerg|skipp)|latency"
 
 ---
 
+## Network front-ends and storage configurations (`net-bench.sh`)
+
+`scripts/net-bench.sh` starts a fresh server per combination and runs batch
+write (8 × 1024-key MPUT, `BATCH_DURATION`, default 10 s), read (64 binary
+GET clients) and mixed (70/30) workloads, then prints one markdown table
+(also to `$GITHUB_STEP_SUMMARY`). The `Net front-end` GitHub workflow runs it
+on Linux, where the io_uring code exists.
+
+```bash
+# Front-ends (NET:N = N event loops for a C++ front-end)
+NETS="go uring poll uring:2" ENGINES=native WINDOWS=5 ./scripts/net-bench.sh
+
+# Storage configurations under the Go front-end
+ENGINES="native bridge sqpoll map nocgo" NETS=go WINDOWS="5 1" ./scripts/net-bench.sh
+```
+
+| `ENGINES` value | Configuration |
+|---|---|
+| `native` | native C++ index, io_uring VLog bridge off — the default build |
+| `inline` | `native`, but the C++ front-end reads disk on its loop thread (`VELTRIXDB_NET_DEFER_READS=0`) |
+| `bridge` / `sqpoll` | `native` + `VELTRIXDB_URING_BRIDGE=on` / `sqpoll` |
+| `map` | Go map index, bridge off |
+| `nocgo` | `VELTRIXDB_DISABLE_CGO_ENGINE=1`: map index, no C++ storage layer |
+
+Things to know when reading the table:
+
+- **Every overwrite appends to the WAL and VLog**, and nothing reclaims space
+  during a run. One combination leaves ~5-10 GB, so each data dir is deleted
+  when its combination finishes. On a tmpfs `DATA_ROOT` of 6 GB, keeping them
+  made every later write fail with ENOSPC.
+- **Each workload runs under a watchdog** (duration + `WATCHDOG_SLACK`, default
+  60 s). On a hang the script dumps native thread stacks (gdb) and the Go
+  goroutine dump (SIGQUIT), records a FAILED row, and moves on.
+- **C++ front-ends log per-stage latency at shutdown**, and the script copies
+  it into the summary. The buckets are log2, so `p99<=8ms` means the 99th
+  percentile is in [4, 8) ms. `cb_enter` is the time a loop thread waits for a
+  Go P before `vxnfExec` runs. When it is high, the loops are competing with Go
+  for CPUs; try fewer loops (`uring:2`).
+- **The client runs on the same host and the data sits on tmpfs.** Compare rows
+  with each other, not with other hardware. With fdatasync on RAM, the
+  io_uring bridge has no real I/O to overlap.
+
 ## Ordered key index: measuring whether you need it
 
 Every write maintains a skiplist mirroring all live keys so `RANGE` /

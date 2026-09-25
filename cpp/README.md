@@ -83,7 +83,7 @@ batch engine and native index also on, cost ~35% of batch-write throughput.
 Opt in only after measuring on the target hardware
 (`ENGINES="native bridge sqpoll" scripts/net-bench.sh`).
 
-Both used to be unconditional: with cgo compiled in, every
+Before either knob existed both were unconditional: with cgo compiled in, every
 `NewStorageEngine` created an io_uring bridge with SQPOLL (a busy-polling
 kernel thread per ring) and `runtime.NumCPU()` C++ worker threads, with no
 opt-out short of rebuilding. Fine for a long-lived server on dedicated

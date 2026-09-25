@@ -82,7 +82,7 @@ In the YCSB run above (100M operations): **zero errors and zero GC emergency eve
 
 **LIRS cache.** Scan-resistant eviction: large sequential reads don't evict your hot keys. Small values (≤256 B) get higher eviction priority, keeping the working set in RAM even under mixed workloads.
 
-**C++ acceleration (cgo builds).** With `CGO_ENABLED=1` the Index Vault moves off the Go heap into C++ shard tables (full GC with 5M keys: 21 ms → 0.27 ms; RSS 168 → 142 B/key), and on Linux VLog batch writes go through an `io_uring` bridge. The VLog read path and the LIRS cache stay in Go.
+**C++ acceleration (cgo builds).** With `CGO_ENABLED=1` the Index Vault moves off the Go heap into C++ shard tables (full GC with 5M keys: 21 ms → 0.27 ms; RSS 168 → 142 B/key), and an opt-in `io_uring` bridge (`VELTRIXDB_URING_BRIDGE=on|sqpoll`, Linux, default off) can submit VLog batch writes. The VLog read path and the LIRS cache stay in Go. `--net=cpp|uring|poll` swaps the Go listener for a C++ event-loop front-end (binary PUT GET DEL PING MPUT MGET, standalone mode); reads that need disk are handed to goroutines so they never stall a loop. Compare configurations with `scripts/net-bench.sh` ([BENCHMARKING.md](BENCHMARKING.md#network-front-ends-and-storage-configurations-net-benchsh)).
 
 > The Docker image is built `CGO_ENABLED=1`. The benchmarks above predate that and are the pure-Go path. An ART index and a priority io_uring scheduler exist under `cpp/` but have no Go call site and do not run; see [cpp/README.md](cpp/README.md).
 

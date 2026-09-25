@@ -303,7 +303,7 @@ The Go layer is fully functional on its own. C++ is an optional Linux accelerato
 | Vectorized batch put | `batch_engine.cpp` | Yes — cgo shim in `storage/` |
 | SQPOLL SSTable reader | `uring_reader.cpp` | Yes — cgo shim |
 | NUMA thread pinning | `numa_topology.cpp` | Yes — cgo shim |
-| 8-ring SQPOLL write bridge | `storage_bridge.cpp` | Yes — via `storage_bridge_capi.h`, CMake static lib |
+| 8-ring io_uring VLog write bridge | `storage_bridge.cpp` | Yes, **opt-in** — `VELTRIXDB_URING_BRIDGE=on` (no SQPOLL) or `sqpoll`; default off |
 | ART index | `art.cpp` | **No** — compiled into the CMake lib, but no Go call site |
 | Priority io_uring scheduler | `scheduler.cpp` | **No** — same |
 | LIRS cache / shard / write path / defragmenter | `lirs_cache.cpp`, `shard.cpp`, `write_path.cpp`, `defragmenter.cpp` | **No** — same |
@@ -325,9 +325,16 @@ per core, each with its own `SO_REUSEPORT` listener and io_uring (poll()
 elsewhere). A loop iteration reaps every completion, parses every complete
 frame from every connection, calls Go once (`vxnfExec`) for the whole set, and
 submits all sends and receives together — syscalls and Go transitions are per
-iteration, not per request. Reads are answered inline; writes run on
-goroutines and answer through a queue, and a connection with a write in
-flight is not parsed further, so each connection stays strictly ordered.
+iteration, not per request. Reads that need no disk (cache hit, absent key,
+dirty value) are answered inline via `StorageEngine.GetNoIO`. Reads that need
+a VLog read, and all writes, run on goroutines and answer through a queue. A
+connection with such a request in flight is not parsed further
+(`vxnf_defer` for reads), so each connection stays strictly ordered, and one
+disk read never stalls the other connections on its loop.
+`VELTRIXDB_NET_DEFER_READS=0` answers disk reads inline instead, for A/B runs.
+At shutdown the server logs a per-stage latency breakdown: loop iteration,
+cgo callback entry, `vxnfExec`, PUT scheduling and engine time,
+respond-to-wake, and deferred chains.
 Serves PUT GET DEL PING MPUT MGET of the binary protocol, standalone mode,
 no RBAC; TLS and the text protocol stay on Go.
 

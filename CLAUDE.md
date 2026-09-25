@@ -77,7 +77,7 @@ curl http://localhost:2112/readyz
 
 | File | Purpose |
 |------|---------|
-| `storage/engine.go` | `StorageEngine`: Put/Get/Delete, per-disk WAL routing, compaction dispatch; pipelined value transform = compress → encrypt → VLog (Get reverses: decrypt → decompress → migrate-on-read) |
+| `storage/engine.go` | `StorageEngine`: Put/Get/Delete, per-disk WAL routing, compaction dispatch; pipelined value transform = compress → encrypt → VLog (Get reverses: decrypt → decompress → migrate-on-read); `GetNoIO` / `GetAfterNoIO` split a read at the disk step (invariant 50f) |
 | `storage/bloom_shard.go` | Lock-free per-shard Bloom: `Add`/`MayContain` via atomic-uint64 CAS; `installBlooms` allocates 8192 filters at startup; `vacuumBloomFilters` rebuilds from live index every defrag pass |
 | `storage/scrubber.go` | One goroutine per VLog walks records at `ScrubMBPerSec`; honors `GCPaused`; CRC mismatch increments `ScrubCorruption` and emits structured log line with disk + offset |
 | `storage/atomic_ops.go` | `CompareAndSwap` / `Increment` / `Decrement` / `SetIfNotExists`; holds shard write lock for the whole RMW; installs into `shard.entries` (via `swap`, which also keeps `keyCount` right) without re-locking; saturating arithmetic on INCR overflow |
@@ -124,7 +124,7 @@ curl http://localhost:2112/readyz
 | `storage/index_hugepage_linux.go` | `HugepageAlloc` / `HugepageFree`: 2 MB hugepage mmap for Go Index Vault (Linux); falls back to regular mmap |
 | `storage/mlockall_linux.go` | `LockProcessMemory` / `SetMemoryRLimitLock`: mlockall(MCL_CURRENT\|MCL_FUTURE\|MCL_ONFAULT) to prevent swap eviction at 1B+ key scale |
 | `cmd/server/main.go` | TCP server: binary + text protocol, `binPayloadPool`, flag parsing; `--net` picks the Go server or the C++ front-end; `--pprof-addr` (pprof.go) serves CPU/heap/trace profiles on a separate listener |
-| `netfront/` | C++ network front-end (invariant 50): `netfront.cpp` event loops (io_uring / poll), `netfront.go` cgo binding + `vxnfExec` executing each loop iteration's requests against the engine |
+| `netfront/` | C++ network front-end (invariant 50): `netfront.cpp` event loops (io_uring / poll), `netfront.go` cgo binding + `vxnfExec` executing each loop iteration's requests against the engine; `stats.go` per-stage latency histograms (`LatencyReport`, logged at shutdown) |
 | `cmd/server/readv_linux.go` | `readvInto` + `setSocketRecvBuf`: scatter-gather readv(2) + SO_RCVBUF 256 KB hint on accept |
 | `client/tcp.go` | `TCPConn`: persistent TCP connection, Put/Get/Delete/Ping/Info/Redial |
 | `cmd/loadtest/main.go` | Concurrent load tester: per-goroutine conn + RNG, latency percentiles |
