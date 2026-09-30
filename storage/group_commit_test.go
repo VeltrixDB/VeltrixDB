@@ -6,10 +6,11 @@ package storage
 // the comparison means the same thing on a laptop, whose fsync returns at the
 // drive cache, as on Linux NVMe. Run the table with:
 //
-//	go test ./storage -run TestGroupCommit_LatencyTable -v
+//	VELTRIX_GC_TABLE=1 go test ./storage -run TestGroupCommit_LatencyTable -v
 
 import (
 	"fmt"
+	"os"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -121,8 +122,8 @@ func TestGroupCommit_AdaptiveGates(t *testing.T) {
 
 // TestGroupCommit_LatencyTable prints the comparison table (no gates).
 func TestGroupCommit_LatencyTable(t *testing.T) {
-	if testing.Short() {
-		t.Skip("timing table")
+	if os.Getenv("VELTRIX_GC_TABLE") == "" {
+		t.Skip("set VELTRIX_GC_TABLE=1 (≈25 s timing table; the nightly workflow runs it)")
 	}
 	const window = 15 * time.Millisecond
 	for _, sync := range []time.Duration{300 * time.Microsecond, 2 * time.Millisecond} {

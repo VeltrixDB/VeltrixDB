@@ -4,6 +4,7 @@ package main
 // distributed search across a rebalanced two-node cluster.
 
 import (
+	"errors"
 	"fmt"
 	"math/rand"
 	"strings"
@@ -380,5 +381,40 @@ func TestSearchFanout_UnreachablePeer(t *testing.T) {
 	}
 	if _, err := c.VSearch("pv", []float32{1, 0}, 1, storage.VectorSearchOptions{}); err != nil {
 		t.Fatalf("search with the dead peer marked failed: %v", err)
+	}
+}
+
+// TestSearchRefusedWhileRebuilding: after a restart the indexes are loaded
+// in the background; until that finishes a search is refused (it would miss
+// vectors) unless --search-allow-partial.
+func TestSearchRefusedWhileRebuilding(t *testing.T) {
+	eng := newFSMTestEngine(t)
+	_ = eng.RegisterVectorNamespace("rb", 2)
+	_ = eng.PutVector("rb", "a", []float32{1, 0})
+	c := newStandaloneCoordinator(eng)
+
+	eng.BeginSearchRebuild()
+	for name, run := range map[string]func() error{
+		"vector": func() error { _, err := c.VSearch("rb", []float32{1, 0}, 1, storage.VectorSearchOptions{}); return err },
+		"text":   func() error { _, err := c.TSearch("rb", "x", 1, nil); return err },
+		"hybrid": func() error { _, err := c.HSearch("rb", []float32{1, 0}, "", 1, storage.HybridOptions{}); return err },
+	} {
+		if err := run(); !errors.Is(err, storage.ErrSearchRebuilding) {
+			t.Fatalf("%s during rebuild: err=%v, want ErrSearchRebuilding", name, err)
+		}
+	}
+	c.searchAllowPartial = true
+	if got, err := c.VSearch("rb", []float32{1, 0}, 1, storage.VectorSearchOptions{}); err != nil || len(got) != 1 {
+		t.Fatalf("allow-partial during rebuild: %+v err=%v", got, err)
+	}
+	c.searchAllowPartial = false
+	if _, _, err := eng.RebuildSearchIndexes(); err != nil {
+		t.Fatal(err)
+	}
+	if ready, loaded, total := eng.SearchIndexStatus(); !ready || loaded != total || total != 1 {
+		t.Fatalf("after rebuild: ready=%v %d/%d", ready, loaded, total)
+	}
+	if got, err := c.VSearch("rb", []float32{1, 0}, 1, storage.VectorSearchOptions{}); err != nil || len(got) != 1 {
+		t.Fatalf("after rebuild: %+v err=%v", got, err)
 	}
 }

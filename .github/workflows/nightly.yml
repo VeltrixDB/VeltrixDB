@@ -1,0 +1,182 @@
+name: Nightly hardening
+
+# Long-running checks that do not fit the per-PR budget:
+#   real-embeddings  recall gates on GloVe-100 (100K real word vectors)
+#   search-soak      concurrent vector/text writes + searches vs an oracle
+#   crash-chaos      SIGKILL mid-write, restart, every acknowledged write visible
+#   perf-tables      adaptive group commit and vector memory tables (no gates)
+#   kv-soak          scripts/soak.sh (manual runs only: set kv_soak_hours)
+
+on:
+  schedule:
+    - cron: "30 1 * * *" # 01:30 UTC daily
+  workflow_dispatch:
+    inputs:
+      soak_duration:
+        description: "search soak duration (Go duration)"
+        default: "20m"
+      chaos_cycles:
+        description: "crash/restart cycles"
+        default: "10"
+      kv_soak_hours:
+        description: "hours of scripts/soak.sh (0 = skip)"
+        default: "0"
+
+permissions:
+  contents: read
+
+jobs:
+  real-embeddings:
+    name: "Real embeddings — GloVe-100 recall gates"
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.21"
+          cache: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: cache dataset
+        uses: actions/cache@v4
+        with:
+          path: /tmp/ann
+          key: ann-glove-100-angular-100k-500-v1
+      - name: fetch + convert GloVe-100 (first 100K words, 500 queries)
+        run: |
+          pip install --quiet h5py numpy
+          if [ ! -f /tmp/ann/glove-100-angular.train.fvecs ]; then
+            python scripts/ann-dataset.py glove-100-angular /tmp/ann --train 100000 --test 500
+            rm -f /tmp/ann/glove-100-angular.hdf5   # keep the cache small
+          fi
+          ls -la /tmp/ann
+      - name: mount tmpfs for test scratch
+        run: |
+          sudo mkdir -p /mnt/veltrix-tmp
+          sudo mount -t tmpfs -o size=2G,mode=1777 tmpfs /mnt/veltrix-tmp
+      - name: recall on real embeddings
+        env:
+          VELTRIX_ANN_DIR: /tmp/ann
+          TMPDIR: /mnt/veltrix-tmp
+        run: |
+          set -o pipefail
+          CGO_ENABLED=0 go test -v -timeout 50m -count=1 -run TestRealEmbeddings ./storage/ \
+            2>&1 | tee /tmp/real.txt
+          {
+            echo "### GloVe-100 (100K × 100, 500 queries), recall@10"
+            echo '```'
+            grep -E 'real_embeddings_test.go' /tmp/real.txt | sed -E 's/^ *real_embeddings_test.go:[0-9]+: //'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  search-soak:
+    name: "Search soak (${{ inputs.soak_duration || '20m' }})"
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.21"
+          cache: true
+      - name: build server
+        run: CGO_ENABLED=0 go build -o /tmp/veltrixdb ./cmd/server
+      - name: soak
+        env:
+          VELTRIX_SERVER_BIN: /tmp/veltrixdb
+          VELTRIX_SOAK_DURATION: ${{ inputs.soak_duration || '20m' }}
+        run: |
+          set -o pipefail
+          CGO_ENABLED=0 go test -v -timeout 40m -count=1 -run TestSearchSoak ./tests/integration/ \
+            2>&1 | tee /tmp/soak.txt
+          { echo "### Search soak"; echo '```'; grep -E 'soak_test.go' /tmp/soak.txt | tail -25; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: search-soak-output
+          path: /tmp/soak.txt
+          retention-days: 14
+
+  crash-chaos:
+    name: "Crash chaos (${{ inputs.chaos_cycles || '10' }} SIGKILL cycles)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.21"
+          cache: true
+      - name: build server
+        run: CGO_ENABLED=0 go build -o /tmp/veltrixdb ./cmd/server
+      - name: SIGKILL / restart cycles
+        env:
+          VELTRIX_SERVER_BIN: /tmp/veltrixdb
+          VELTRIX_CHAOS_CYCLES: ${{ inputs.chaos_cycles || '10' }}
+        run: |
+          set -o pipefail
+          CGO_ENABLED=0 go test -v -timeout 25m -count=1 -run TestSearchCrashRecovery ./tests/integration/ \
+            2>&1 | tee /tmp/chaos.txt
+          { echo "### Crash chaos"; echo '```'; grep -E 'soak_test.go' /tmp/chaos.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: crash-chaos-output
+          path: /tmp/chaos.txt
+          retention-days: 14
+
+  perf-tables:
+    name: "Perf tables — group commit, vector memory"
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.21"
+          cache: true
+      - name: mount tmpfs for test scratch
+        run: |
+          sudo mkdir -p /mnt/veltrix-tmp
+          sudo mount -t tmpfs -o size=1G,mode=1777 tmpfs /mnt/veltrix-tmp
+      - name: tables
+        env:
+          TMPDIR: /mnt/veltrix-tmp
+          VELTRIX_VECTOR_MEMORY: "1"
+          VELTRIX_GC_TABLE: "1"
+        run: |
+          set -o pipefail
+          CGO_ENABLED=0 go test -v -timeout 25m -count=1 \
+            -run 'TestGroupCommit_LatencyTable|TestVectorMemoryTable' ./storage/ 2>&1 | tee /tmp/tables.txt
+          {
+            echo "### Group commit (emulated fdatasync) and vector memory (768-dim)"
+            echo '```'
+            grep -E 'group_commit_test.go|vector_memory_test.go' /tmp/tables.txt | sed -E 's/^ *[a-z_]+_test.go:[0-9]+: //'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  kv-soak:
+    name: "KV soak (scripts/soak.sh)"
+    if: github.event_name == 'workflow_dispatch' && inputs.kv_soak_hours != '0'
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.21"
+          cache: true
+      - name: soak
+        env:
+          SOAK_HOURS: ${{ inputs.kv_soak_hours }}
+          SOAK_DATA: /tmp/veltrixdb-soak
+          SOAK_OUT: /tmp/soak-out
+        run: ./scripts/soak.sh
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kv-soak
+          path: /tmp/soak-out
+          retention-days: 14

@@ -546,17 +546,23 @@ func rerankPlan(pq bool, k, ef int) (kk, efOut int) {
 // vectors and returns the best k (all if k ≤ 0). A hit whose vector can no
 // longer be read (deleted meanwhile) is dropped.
 func (se *StorageEngine) rerankVectors(ns string, dim int, q []float32, hits []VectorMatch, k int) []VectorMatch {
+	// One MultiGet (parallel reads) instead of a Get per candidate: PQ
+	// re-ranks the whole beam, and serial VLog reads made that the bulk of
+	// query latency (GloVe-100, int8, ef=64: p50 1.9 ms, p99 13.8 ms).
+	keys := make([]string, len(hits))
+	for i, h := range hits {
+		keys[i] = VectorPersistKey(ns, h.ID)
+	}
 	out := hits[:0]
-	for _, h := range hits {
-		blob, err := se.Get(VectorPersistKey(ns, h.ID))
+	for i, r := range se.MultiGet(keys) {
+		if !r.Found {
+			continue // deleted meanwhile
+		}
+		vec, err := decodeVector(r.Value, dim)
 		if err != nil {
 			continue
 		}
-		vec, err := decodeVector(blob, dim)
-		if err != nil {
-			continue
-		}
-		out = append(out, VectorMatch{ID: h.ID, Score: dot(q, vec)})
+		out = append(out, VectorMatch{ID: hits[i].ID, Score: dot(q, vec)})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Score > out[j].Score })
 	if k > 0 && len(out) > k {

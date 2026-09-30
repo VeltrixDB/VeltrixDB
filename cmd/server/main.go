@@ -484,12 +484,16 @@ func main() {
 	// Rebuild the in-RAM vector indexes from persisted "@vec/..." keys once
 	// the background WAL replay has finished. VSET/VSEARCH work immediately;
 	// vectors written before the restart become searchable when this completes.
+	// Searches are refused (not answered from a half-loaded index) until this
+	// finishes, unless --search-allow-partial.
+	engine.BeginSearchRebuild()
 	go func() {
 		<-engine.ReplayDone
-		if n, rerr := engine.RebuildVectorIndexes(); rerr != nil {
-			log.Printf("[vector] rebuild failed: %v", rerr)
-		} else if n > 0 {
-			log.Printf("[vector] rebuilt %d persisted vectors", n)
+		t0 := time.Now()
+		if nv, nd, rerr := engine.RebuildSearchIndexes(); rerr != nil {
+			log.Printf("[search] rebuild failed: %v", rerr)
+		} else {
+			log.Printf("[search] rebuilt %d vectors and %d text documents in %s", nv, nd, time.Since(t0).Round(time.Millisecond))
 		}
 	}()
 
@@ -1286,6 +1290,11 @@ func handleTextConn(conn net.Conn, br *bufio.Reader, engine *storage.StorageEngi
 				m.CompactionRuns.Load(),
 				engine.GetVersion(),
 			)
+			if ready, loaded, total := engine.SearchIndexStatus(); ready {
+				info += " search_ready=1"
+			} else {
+				info += fmt.Sprintf(" search_ready=0 search_loaded=%d/%d", loaded, total)
+			}
 			for _, ds := range engine.GetDiskStats() {
 				info += fmt.Sprintf(" disk[%d]=%s:%.1fMB", ds.DiskIdx, ds.Path, float64(ds.SegmentBytes)/1e6)
 			}
