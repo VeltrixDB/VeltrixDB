@@ -180,6 +180,32 @@ func (se *StorageEngine) DropFieldIndex(name string) error {
 	return nil
 }
 
+// indexDefPrefix is the reserved key family that replicates secondary-index
+// definitions in replicated mode: "@idxdef/<name>" → field. The Put / Delete
+// hooks (search_hooks.go) create / drop the index on every node that applies
+// the key; partition transfer copies these keys to every node.
+const indexDefPrefix = "@idxdef/"
+
+// IndexDefKey is the reserved key carrying index name's definition.
+func IndexDefKey(name string) string { return indexDefPrefix + name }
+
+// applyIndexDef creates the index a replicated "@idxdef/" key describes.
+func (se *StorageEngine) applyIndexDef(key string, field []byte) error {
+	return se.CreateFieldIndex(key[len(indexDefPrefix):], string(field))
+}
+
+// dropIndexDef drops the index a deleted "@idxdef/" key described; an index
+// already gone is not an error.
+func (se *StorageEngine) dropIndexDef(key string) error {
+	name := key[len(indexDefPrefix):]
+	for _, d := range se.ListFieldIndexes() {
+		if d.Name == name {
+			return se.DropFieldIndex(name)
+		}
+	}
+	return nil
+}
+
 // ListFieldIndexes returns a snapshot of the persisted index definitions.
 func (se *StorageEngine) ListFieldIndexes() []FieldIndexDef {
 	se.fieldIdxMu.Lock()

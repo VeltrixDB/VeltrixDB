@@ -11,7 +11,77 @@ Releases are cut automatically on every merge to `main` (GitHub release +
 
 ## [Unreleased]
 
+### Added
+
+- Vector search: multiple namespaces on the wire (`VSET id NS ns ...`,
+  binary `VSETNS` 0x08), metadata-filtered search (`VSEARCH k [NS ns] [EF n]
+  [FILTER field op value] ...`, binary `VSEARCHX` 0x1E) and deletes (`VDEL`,
+  binary 0x1F; routed through raft as `opVDel` and replicated as a `@vec/`
+  tombstone). Go clients: `VSetNS`, `VSearchWithOptions`, `VDel`.
+- `StorageEngine.SearchVectorWithOptions` (beam width + `VectorFilter`) and
+  `UnloadVectorKey`; `VectorIndexStats` reports tombstones, compactions,
+  quantization and approximate bytes.
+- int8 vector quantization per namespace (`VCREATE ns dim QUANT int8`,
+  `CreateVectorNamespace`): RAM holds dim + 4 bytes per vector instead of
+  4 × dim, and the top 4 × k graph candidates are re-ranked against the
+  float32 vectors persisted in the VLog. Settings persist under `@vecns/<ns>`;
+  re-running `VCREATE` with another mode re-encodes the namespace.
+- BM25 full-text search (`TSET` / `TDEL` / `TSEARCH`, `PutText` /
+  `SearchText`) and hybrid vector + text search fused by weighted Reciprocal
+  Rank Fusion (`HSEARCH`, `SearchHybrid`, `FuseRRF`). Binary protocol: one
+  multiplexed `SEARCH` opcode (0x1C) with sub-ops. Go clients: `VCreate`,
+  `TSet`, `TDel`, `TSearch`, `HSearch`.
+- Distributed search: in raft / replicated mode vector, text and hybrid
+  searches, `QUERY` and `IDXQUERY` run on every non-failed node (over the
+  transfer listener, with its TLS settings) and are merged; BM25 is scored
+  with cluster-wide statistics. Flags `--search-fanout` (default true) and
+  `--search-timeout-ms` (2000). A peer that does not answer fails the request
+  and is named in the error; `--search-allow-partial` returns the rest.
+- `--cluster-secret-file` / `VELTRIXDB_CLUSTER_SECRET`: HMAC-SHA256 request
+  signing (with a 5-minute clock-skew window) on the transfer listener, which
+  serves both key migration and distributed search. Without a secret or mTLS
+  the server warns that the listener is unauthenticated.
+- `IDXCREATE` / `IDXDROP` replicate in replicated mode (via `@idxdef/<name>`
+  keys, copied to every node on rebalance); they were node-local before.
+- CI job `node-7-search`: recall / ranking gates on a fixed dataset, the
+  search tests under `-race`, and a real 3-process cluster end-to-end test.
+
+### Changed
+
+- HNSW neighbours are chosen with the paper's diversity heuristic
+  (keepPrunedConnections) instead of plain top-M.
+- Updating a vector tombstones the old node and links a fresh one; the old
+  code rewrote the vector in place and kept edges from the old position.
+- Inserts plan under the index read lock and link under the write lock, so
+  searches are no longer blocked for a whole insert, and
+  `RebuildVectorIndexes` loads on GOMAXPROCS workers.
+- Vector indexes belong to the `StorageEngine` rather than a package global.
+- `LookupBySecondary` (IDXQUERY, QUERY `=`) walks the ordered key index in
+  O(log N + matches) instead of all 8192 shards, when the ordered index is on.
+
 ### Fixed
+
+- int8 namespaces searched with a narrower beam than float32 ones: the
+  re-rank candidate count (4 × k) replaced the default ef instead of only
+  raising it, so k = 10 walked with ef = 40, not 64 (recall@10 0.85 vs 0.93 on
+  the quality-gate data; now 0.92).
+- The BM25 tokenizer split words at combining marks, breaking Devanagari,
+  Tamil and other Indic words (e.g. "दुनिया") into fragments.
+- Text documents and vector-namespace settings were run through secondary
+  index extractors, so a document like `dim=8` got index entries.
+- `TSEARCH` with k = 0 (all matches) was rejected on the text protocol.
+- Partition transfer after a rebalance moved `@vec/` keys without updating
+  either node's vector index: moved vectors were unsearchable on the new owner
+  and still returned by the old one. Search indexes now follow every Put /
+  Delete of their reserved keys (replication, raft, snapshot restore,
+  transfer), and the ring places a record's vector, text and secondary-index
+  keys on the record's own node, so filters see the record after a rebalance.
+- Vector search widened its beam by the number of deleted vectors, so heavy
+  deletes degraded every query toward a full scan. Tombstones are now
+  traversed but not counted, and a background compaction rebuilds the graph
+  once they exceed 30 % (and 1024) of the nodes.
+- A replica applying a replicated `@vec/` tombstone deleted the key but left
+  the vector searchable in its RAM index.
 
 - Help text: the admission-control metrics said the read-latency threshold is
   4 ms (it is 20 ms), and `--data-dirs` said the WAL lives on the first disk

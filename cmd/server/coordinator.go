@@ -115,6 +115,14 @@ type coordinator struct {
 	// linReads (raft mode, --linearizable-reads): GET runs the ReadIndex fence
 	// on the leader before reading; followers redirect with MOVED.
 	linReads bool
+
+	// Distributed search (search_fanout.go): peers are queried through the
+	// transfer agent's listener. ta == nil or searchFanout == false keeps
+	// every search local.
+	ta                 *cluster.TransferAgent
+	searchFanout       bool
+	searchAllowPartial bool
+	searchTimeout      time.Duration
 }
 
 // readIndexTimeout bounds one linearizable-read fence (quorum heartbeat round
@@ -606,13 +614,41 @@ func (c *coordinator) VSet(ns, id string, vec []float32) error {
 	return fmt.Errorf("coordinator: bad mode")
 }
 
-// IdxCreate routes secondary-index creation.  NOTE (replicated mode): index
-// metadata is node-local — replicas index incoming writes only if the same
-// index is created on them too; raft mode replicates the metadata itself.
+// VDel routes a vector delete from vector namespace ns.
+func (c *coordinator) VDel(ns, id string) error {
+	switch c.mode {
+	case modeStandalone:
+		return c.engine.DeleteVector(ns, id)
+	case modeRaft:
+		res, err := c.submitForResult(fsmCmd{Op: opVDel, Ns: ns, Key: id})
+		if err != nil {
+			return err
+		}
+		return res.err
+	case modeReplicated:
+		if err := c.engine.DeleteVector(ns, id); err != nil {
+			return err
+		}
+		// Replicas see a tombstone on the "@vec/" key; their applyFn drops
+		// the id from the RAM index as well.
+		return c.replicateWrite(storage.VectorPersistKey(ns, id), nil, 0, true)
+	}
+	return fmt.Errorf("coordinator: bad mode")
+}
+
+// IdxCreate routes secondary-index creation. Raft mode replays it as an FSM
+// op; replicated mode creates it locally (surfacing validation errors), then
+// writes the "@idxdef/<name>" key through the replicated Put path, whose
+// hook creates the same index on every replica.
 func (c *coordinator) IdxCreate(name, field string) error {
 	switch c.mode {
-	case modeStandalone, modeReplicated:
+	case modeStandalone:
 		return c.engine.CreateFieldIndex(name, field)
+	case modeReplicated:
+		if err := c.engine.CreateFieldIndex(name, field); err != nil {
+			return err
+		}
+		return c.Put(storage.IndexDefKey(name), []byte(field), -1)
 	case modeRaft:
 		res, err := c.submitForResult(fsmCmd{Op: opIdxCreate, Key: name, Field: field})
 		if err != nil {
@@ -626,8 +662,14 @@ func (c *coordinator) IdxCreate(name, field string) error {
 // IdxDrop routes secondary-index removal (see IdxCreate note).
 func (c *coordinator) IdxDrop(name string) error {
 	switch c.mode {
-	case modeStandalone, modeReplicated:
+	case modeStandalone:
 		return c.engine.DropFieldIndex(name)
+	case modeReplicated:
+		if err := c.engine.DropFieldIndex(name); err != nil {
+			return err
+		}
+		// The replicated tombstone's hook drops it on every replica.
+		return c.Delete(storage.IndexDefKey(name))
 	case modeRaft:
 		res, err := c.submitForResult(fsmCmd{Op: opIdxDrop, Key: name})
 		if err != nil {

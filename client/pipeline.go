@@ -30,6 +30,10 @@ const (
 	binVSearch   byte = 0x27
 	binQuery     byte = 0x28
 	binGetVer    byte = 0x29
+	binVSetNS    byte = 0x08
+	binVSearchX  byte = 0x1E
+	binVDel      byte = 0x1F
+	binSearch    byte = 0x1C
 
 	binOK       byte = 0x00
 	binErr      byte = 0x01
@@ -537,6 +541,12 @@ func (bc *BinaryConn) VSearch(k int, query []float32) ([]VectorResult, error) {
 	if err := bc.w.Flush(); err != nil {
 		return nil, err
 	}
+	return bc.readVectorResults()
+}
+
+// readVectorResults parses a VSEARCH / VSEARCHX response:
+// [1B OK][4B count] + count × [2B idLen][4B score float32][id].
+func (bc *BinaryConn) readVectorResults() ([]VectorResult, error) {
 	var respHdr [5]byte
 	if _, err := io.ReadFull(bc.r, respHdr[:]); err != nil {
 		return nil, fmt.Errorf("vsearch resp: %w", err)
@@ -562,6 +572,251 @@ func (bc *BinaryConn) VSearch(k int, query []float32) ([]VectorResult, error) {
 		out = append(out, VectorResult{ID: string(id), Score: float64(score)})
 	}
 	return out, nil
+}
+
+// writeFloats appends vec as dim × 4B float32 LE.
+func (bc *BinaryConn) writeFloats(vec []float32) error {
+	var fb [4]byte
+	for _, f := range vec {
+		binary.LittleEndian.PutUint32(fb[:], math.Float32bits(f))
+		if _, err := bc.w.Write(fb[:]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// VSetNS sends VSETNS (0x08): store a vector under id in vector namespace
+// ns. The namespace dimensionality is fixed by its first VSET.
+//
+// Request: [0x08][2B idLen][4B dim] + [2B nsLen] + ns + id + dim × 4B float32 LE
+func (bc *BinaryConn) VSetNS(ns, id string, vec []float32) error {
+	var hdr [9]byte
+	hdr[0] = binVSetNS
+	binary.LittleEndian.PutUint16(hdr[1:3], uint16(len(id)))
+	binary.LittleEndian.PutUint32(hdr[3:7], uint32(len(vec)))
+	binary.LittleEndian.PutUint16(hdr[7:9], uint16(len(ns)))
+	if _, err := bc.w.Write(hdr[:]); err != nil {
+		return err
+	}
+	if _, err := bc.w.WriteString(ns + id); err != nil {
+		return err
+	}
+	if err := bc.writeFloats(vec); err != nil {
+		return err
+	}
+	if err := bc.w.Flush(); err != nil {
+		return err
+	}
+	status, payload, err := bc.readResp()
+	if err != nil {
+		return err
+	}
+	if status != binOK {
+		return fmt.Errorf("vsetns %s/%s: %s", ns, id, payload)
+	}
+	return nil
+}
+
+// VectorSearchOptions are the optional VSEARCHX clauses. Zero value =
+// namespace "default", default ef, no filter.
+type VectorSearchOptions struct {
+	NS string // "" = "default"
+	Ef int    // 0 = server default beam width
+	// Filter restricts results to vectors whose KV record (key == id)
+	// satisfies "FilterField FilterOp FilterValue"; FilterField "" = none.
+	FilterField, FilterOp, FilterValue string
+}
+
+// VSearchWithOptions sends VSEARCHX (0x1E): top-k by cosine similarity in a
+// namespace, with an optional beam width and metadata filter.
+//
+// Request:  [0x1E][2B k][4B dim] + [2B nsLen][2B ef][2B fieldLen][2B opLen][2B valueLen]
+//
+//   - ns + field + op + value + dim × 4B float32 LE
+//
+// Response: as VSearch.
+func (bc *BinaryConn) VSearchWithOptions(k int, query []float32, opts VectorSearchOptions) ([]VectorResult, error) {
+	ns := opts.NS
+	if ns == "" {
+		ns = "default"
+	}
+	var hdr [17]byte
+	hdr[0] = binVSearchX
+	binary.LittleEndian.PutUint16(hdr[1:3], uint16(k))
+	binary.LittleEndian.PutUint32(hdr[3:7], uint32(len(query)))
+	binary.LittleEndian.PutUint16(hdr[7:9], uint16(len(ns)))
+	binary.LittleEndian.PutUint16(hdr[9:11], uint16(opts.Ef))
+	binary.LittleEndian.PutUint16(hdr[11:13], uint16(len(opts.FilterField)))
+	binary.LittleEndian.PutUint16(hdr[13:15], uint16(len(opts.FilterOp)))
+	binary.LittleEndian.PutUint16(hdr[15:17], uint16(len(opts.FilterValue)))
+	if _, err := bc.w.Write(hdr[:]); err != nil {
+		return nil, err
+	}
+	if _, err := bc.w.WriteString(ns + opts.FilterField + opts.FilterOp + opts.FilterValue); err != nil {
+		return nil, err
+	}
+	if err := bc.writeFloats(query); err != nil {
+		return nil, err
+	}
+	if err := bc.w.Flush(); err != nil {
+		return nil, err
+	}
+	return bc.readVectorResults()
+}
+
+// VDel sends VDEL (0x1F): delete vector id from namespace ns.
+//
+// Request: [0x1F][2B idLen][4B nsLen] + ns + id
+func (bc *BinaryConn) VDel(ns, id string) error {
+	var hdr [7]byte
+	hdr[0] = binVDel
+	binary.LittleEndian.PutUint16(hdr[1:3], uint16(len(id)))
+	binary.LittleEndian.PutUint32(hdr[3:7], uint32(len(ns)))
+	if _, err := bc.w.Write(hdr[:]); err != nil {
+		return err
+	}
+	if _, err := bc.w.WriteString(ns + id); err != nil {
+		return err
+	}
+	if err := bc.w.Flush(); err != nil {
+		return err
+	}
+	status, payload, err := bc.readResp()
+	if err != nil {
+		return err
+	}
+	if status != binOK {
+		return fmt.Errorf("vdel %s/%s: %s", ns, id, payload)
+	}
+	return nil
+}
+
+// SEARCH (0x1C) sub-operations.
+const (
+	searchSubVCreate uint16 = 1
+	searchSubTSet    uint16 = 2
+	searchSubTDel    uint16 = 3
+	searchSubTSearch uint16 = 4
+	searchSubHSearch uint16 = 5
+)
+
+// TextSearchOptions are the optional TSEARCH clauses. Zero value =
+// namespace "default", no filter.
+type TextSearchOptions struct {
+	NS string // "" = "default"
+	// Filter on the KV record whose key is the document id; FilterField "" = none.
+	FilterField, FilterOp, FilterValue string
+}
+
+// HybridSearchOptions are the optional HSEARCH clauses.
+type HybridSearchOptions struct {
+	NS    string   // "" = "default"
+	Alpha *float64 // vector weight in [0, 1]; nil = 0.5
+	Ef    int      // vector beam width; 0 = default
+	// Candidates per list before fusion; 0 = max(50, 4k).
+	Candidates                         int
+	FilterField, FilterOp, FilterValue string
+}
+
+func nsOrDefault(ns string) string {
+	if ns == "" {
+		return "default"
+	}
+	return ns
+}
+
+func u32Field(n int) []byte {
+	var b [4]byte
+	binary.LittleEndian.PutUint32(b[:], uint32(n))
+	return b[:]
+}
+
+// sendSearch writes one SEARCH frame: [0x1C][2B subop][4B payloadLen] +
+// fields, each [4B len][bytes].
+func (bc *BinaryConn) sendSearch(subop uint16, fields ...[]byte) error {
+	total := 0
+	for _, f := range fields {
+		total += 4 + len(f)
+	}
+	var hdr [7]byte
+	hdr[0] = binSearch
+	binary.LittleEndian.PutUint16(hdr[1:3], subop)
+	binary.LittleEndian.PutUint32(hdr[3:7], uint32(total))
+	if _, err := bc.w.Write(hdr[:]); err != nil {
+		return err
+	}
+	for _, f := range fields {
+		if _, err := bc.w.Write(u32Field(len(f))); err != nil {
+			return err
+		}
+		if _, err := bc.w.Write(f); err != nil {
+			return err
+		}
+	}
+	return bc.w.Flush()
+}
+
+func (bc *BinaryConn) searchOK(op string, subop uint16, fields ...[]byte) error {
+	if err := bc.sendSearch(subop, fields...); err != nil {
+		return err
+	}
+	status, payload, err := bc.readResp()
+	if err != nil {
+		return err
+	}
+	if status != binOK {
+		return fmt.Errorf("%s: %s", op, payload)
+	}
+	return nil
+}
+
+// VCreate creates or reconfigures vector namespace ns (SEARCH subop 1).
+// quant is "" / "none" (float32 in RAM) or "int8" (≈4× less RAM; results
+// are re-ranked against the full-precision vectors).
+func (bc *BinaryConn) VCreate(ns string, dim int, quant string) error {
+	return bc.searchOK("vcreate", searchSubVCreate, []byte(ns), u32Field(dim), []byte(quant))
+}
+
+// TSet stores text as document id of text namespace ns (SEARCH subop 2).
+func (bc *BinaryConn) TSet(ns, id, text string) error {
+	return bc.searchOK("tset", searchSubTSet, []byte(nsOrDefault(ns)), []byte(id), []byte(text))
+}
+
+// TDel deletes document id from text namespace ns (SEARCH subop 3).
+func (bc *BinaryConn) TDel(ns, id string) error {
+	return bc.searchOK("tdel", searchSubTDel, []byte(nsOrDefault(ns)), []byte(id))
+}
+
+// TSearch returns the top-k documents for query by BM25 (SEARCH subop 4).
+func (bc *BinaryConn) TSearch(k int, query string, opts TextSearchOptions) ([]VectorResult, error) {
+	if err := bc.sendSearch(searchSubTSearch, []byte(nsOrDefault(opts.NS)), u32Field(k), []byte(query),
+		[]byte(opts.FilterField), []byte(opts.FilterOp), []byte(opts.FilterValue)); err != nil {
+		return nil, err
+	}
+	return bc.readVectorResults()
+}
+
+// HSearch runs a hybrid vector + BM25 search fused by reciprocal rank
+// (SEARCH subop 5). vec or query may be empty (the other half runs alone).
+// Scores are RRF scores.
+func (bc *BinaryConn) HSearch(k int, vec []float32, query string, opts HybridSearchOptions) ([]VectorResult, error) {
+	alpha := float32(math.NaN())
+	if opts.Alpha != nil {
+		alpha = float32(*opts.Alpha)
+	}
+	vb := make([]byte, 4*len(vec))
+	for i, f := range vec {
+		binary.LittleEndian.PutUint32(vb[4*i:], math.Float32bits(f))
+	}
+	var ab [4]byte
+	binary.LittleEndian.PutUint32(ab[:], math.Float32bits(alpha))
+	if err := bc.sendSearch(searchSubHSearch, []byte(nsOrDefault(opts.NS)), u32Field(k), u32Field(opts.Ef),
+		ab[:], u32Field(opts.Candidates), vb, []byte(query),
+		[]byte(opts.FilterField), []byte(opts.FilterOp), []byte(opts.FilterValue)); err != nil {
+		return nil, err
+	}
+	return bc.readVectorResults()
 }
 
 // Query sends QUERY (0x28): field-predicate query over namespace ns.

@@ -61,6 +61,11 @@ func (se *StorageEngine) MultiPut(reqs []MultiPutRequest) []error {
 				se.applySecondaryIndexes(r.Key, oldVals[i], r.Value)
 			}
 		}
+		for i, r := range reqs {
+			if errs[i] == nil && isSearchKey(r.Key) {
+				se.onSearchKeyPut(r.Key, r.Value)
+			}
+		}
 		return errs
 	}
 

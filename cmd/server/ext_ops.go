@@ -33,6 +33,99 @@ const defaultVectorNS = "default"
 // maxExtStrLen bounds every variable-length string field in extended frames.
 const maxExtStrLen = 1 << 20
 
+// SEARCH (0x1C) sub-operations — see the handler for field layouts.
+const (
+	searchSubVCreate = 1
+	searchSubTSet    = 2
+	searchSubTDel    = 3
+	searchSubTSearch = 4
+	searchSubHSearch = 5
+)
+
+// maxSearchPayload bounds one SEARCH frame (a 1 MB document plus framing).
+const maxSearchPayload = 2 << 20
+
+// searchFields reads a SEARCH payload's length-prefixed fields in order;
+// the first failure sticks in err and later reads return zero values.
+type searchFields struct {
+	fields [][]byte
+	next   int
+	err    error
+}
+
+func parseSearchFields(p []byte) (*searchFields, error) {
+	f := &searchFields{}
+	for len(p) > 0 {
+		if len(p) < 4 {
+			return nil, fmt.Errorf("truncated SEARCH field header")
+		}
+		n := int(binary.LittleEndian.Uint32(p))
+		p = p[4:]
+		if n > len(p) {
+			return nil, fmt.Errorf("SEARCH field length %d exceeds payload", n)
+		}
+		f.fields = append(f.fields, p[:n])
+		p = p[n:]
+	}
+	return f, nil
+}
+
+func (f *searchFields) raw() []byte {
+	if f.err != nil {
+		return nil
+	}
+	if f.next >= len(f.fields) {
+		f.err = fmt.Errorf("SEARCH frame is missing field %d", f.next+1)
+		return nil
+	}
+	b := f.fields[f.next]
+	f.next++
+	return b
+}
+
+func (f *searchFields) str() string { return string(f.raw()) }
+
+func (f *searchFields) u32() uint32 {
+	b := f.raw()
+	if f.err == nil && len(b) != 4 {
+		f.err = fmt.Errorf("SEARCH field %d: want 4 bytes, got %d", f.next, len(b))
+	}
+	if f.err != nil {
+		return 0
+	}
+	return binary.LittleEndian.Uint32(b)
+}
+
+func (f *searchFields) f32() float32 { return math.Float32frombits(f.u32()) }
+
+func (f *searchFields) vec() []float32 {
+	b := f.raw()
+	if f.err == nil && len(b)%4 != 0 {
+		f.err = fmt.Errorf("SEARCH vector field is %d bytes, not a multiple of 4", len(b))
+	}
+	if f.err != nil || len(b) == 0 {
+		return nil
+	}
+	if len(b)/4 > 4096 {
+		f.err = fmt.Errorf("vector dim out of range: %d", len(b)/4)
+		return nil
+	}
+	v := make([]float32, len(b)/4)
+	for i := range v {
+		v[i] = math.Float32frombits(binary.LittleEndian.Uint32(b[4*i:]))
+	}
+	return v
+}
+
+// filter reads the trailing (field, op, value) triple; field "" = none.
+func (f *searchFields) filter() *storage.VectorFilter {
+	field, op, value := f.str(), f.str(), f.str()
+	if f.err != nil || field == "" {
+		return nil
+	}
+	return &storage.VectorFilter{Field: field, Op: op, Value: value}
+}
+
 // handleExtOp dispatches one extended opcode. keyLen/valLen are the two
 // standard header fields, reinterpreted per opcode (see the constants in
 // main.go for each layout).
@@ -97,6 +190,41 @@ func handleExtOp(cmd byte, keyLen, valLen int, br *bufio.Reader, bw *bufio.Write
 			}
 		}
 		return nil
+	}
+
+	// readVec reads dim × 4B float32 LE.
+	readVec := func(dim int) ([]float32, error) {
+		raw := make([]byte, 4*dim)
+		if _, err := io.ReadFull(br, raw); err != nil {
+			return nil, err
+		}
+		vec := make([]float32, dim)
+		for i := range vec {
+			vec[i] = math.Float32frombits(binary.LittleEndian.Uint32(raw[4*i:]))
+		}
+		return vec, nil
+	}
+
+	// writeVectorMatches emits [1B OK][4B count] + count × [2B idLen][4B score float32 LE][id].
+	writeVectorMatches := func(matches []storage.VectorMatch) error {
+		var hdr [5]byte
+		hdr[0] = binStatusOK
+		binary.LittleEndian.PutUint32(hdr[1:], uint32(len(matches)))
+		if _, err := bw.Write(hdr[:]); err != nil {
+			return err
+		}
+		var ent [6]byte
+		for _, m := range matches {
+			binary.LittleEndian.PutUint16(ent[0:2], uint16(len(m.ID)))
+			binary.LittleEndian.PutUint32(ent[2:6], math.Float32bits(m.Score))
+			if _, err := bw.Write(ent[:]); err != nil {
+				return err
+			}
+			if _, err := bw.WriteString(m.ID); err != nil {
+				return err
+			}
+		}
+		return bw.Flush()
 	}
 
 	switch cmd {
@@ -274,9 +402,9 @@ func handleExtOp(cmd byte, keyLen, valLen int, br *bufio.Reader, bw *bufio.Write
 		if err, ok := checkPerm(security.PermRead); !ok {
 			return err
 		}
-		keys := engine.LookupBySecondary(name, value)
-		if limit := int(int32(valLen)); limit > 0 && len(keys) > limit {
-			keys = keys[:limit]
+		keys, err := coord.IdxQuery(name, value, int(int32(valLen)))
+		if err != nil {
+			return sendErr(err.Error())
 		}
 		var hdr [5]byte
 		hdr[0] = binStatusOK
@@ -342,28 +470,200 @@ func handleExtOp(cmd byte, keyLen, valLen int, br *bufio.Reader, bw *bufio.Write
 		for i := range query {
 			query[i] = math.Float32frombits(binary.LittleEndian.Uint32(raw[4*i:]))
 		}
-		matches, err := engine.SearchVector(defaultVectorNS, query, keyLen)
+		matches, err := coord.VSearch(defaultVectorNS, query, keyLen, storage.VectorSearchOptions{})
 		if err != nil {
 			return sendErr(err.Error())
 		}
-		var hdr [5]byte
-		hdr[0] = binStatusOK
-		binary.LittleEndian.PutUint32(hdr[1:], uint32(len(matches)))
-		if _, err := bw.Write(hdr[:]); err != nil {
+		return writeVectorMatches(matches)
+
+	// ── VSETNS (0x08) ───────────────────────────────────────────────────────
+	// Header: keyLen=idLen, valLen=dim. Extra: [2B nsLen].
+	// Body: ns + id + dim × 4B float32 LE.
+	case binCmdVSetNS:
+		dim := valLen
+		if dim <= 0 || dim > 4096 {
+			return sendErr(fmt.Sprintf("vector dim out of range: %d", dim))
+		}
+		var extra [2]byte
+		if _, err := io.ReadFull(br, extra[:]); err != nil {
 			return err
 		}
-		var ent [6]byte
-		for _, m := range matches {
-			binary.LittleEndian.PutUint16(ent[0:2], uint16(len(m.ID)))
-			binary.LittleEndian.PutUint32(ent[2:6], math.Float32bits(m.Score))
-			if _, err := bw.Write(ent[:]); err != nil {
-				return err
-			}
-			if _, err := bw.WriteString(m.ID); err != nil {
-				return err
-			}
+		ns, err := readStr(int(binary.LittleEndian.Uint16(extra[:])))
+		if err != nil {
+			return err
 		}
-		return bw.Flush()
+		id, err := readStr(keyLen)
+		if err != nil {
+			return err
+		}
+		vec, err := readVec(dim)
+		if err != nil {
+			return err
+		}
+		if err, ok := checkPerm(security.PermWrite); !ok {
+			return err
+		}
+		if err := coord.VSet(ns, id, vec); err != nil {
+			return sendErr(err.Error())
+		}
+		return sendResp(binStatusOK, nil)
+
+	// ── VSEARCHX (0x1E) ─────────────────────────────────────────────────────
+	// Header: keyLen=k, valLen=dim.
+	// Extra: [2B nsLen][2B ef][2B fieldLen][2B opLen][2B valueLen].
+	// Body: ns + field + op + value + dim × 4B float32 LE.
+	// fieldLen=0 → no filter; ef=0 → default beam width.
+	// Response: as VSEARCH.
+	case binCmdVSearchX:
+		dim := valLen
+		if dim <= 0 || dim > 4096 {
+			return sendErr(fmt.Sprintf("vector dim out of range: %d", dim))
+		}
+		var extra [10]byte
+		if _, err := io.ReadFull(br, extra[:]); err != nil {
+			return err
+		}
+		ns, err := readStr(int(binary.LittleEndian.Uint16(extra[0:2])))
+		if err != nil {
+			return err
+		}
+		ef := int(binary.LittleEndian.Uint16(extra[2:4]))
+		field, err := readStr(int(binary.LittleEndian.Uint16(extra[4:6])))
+		if err != nil {
+			return err
+		}
+		op, err := readStr(int(binary.LittleEndian.Uint16(extra[6:8])))
+		if err != nil {
+			return err
+		}
+		value, err := readStr(int(binary.LittleEndian.Uint16(extra[8:10])))
+		if err != nil {
+			return err
+		}
+		query, err := readVec(dim)
+		if err != nil {
+			return err
+		}
+		if err, ok := checkPerm(security.PermRead); !ok {
+			return err
+		}
+		opts := storage.VectorSearchOptions{Ef: ef}
+		if field != "" {
+			opts.Filter = &storage.VectorFilter{Field: field, Op: op, Value: value}
+		}
+		matches, err := coord.VSearch(ns, query, keyLen, opts)
+		if err != nil {
+			return sendErr(err.Error())
+		}
+		return writeVectorMatches(matches)
+
+	// ── SEARCH (0x1C) ───────────────────────────────────────────────────────
+	// Header: keyLen=subop, valLen=payloadLen. Payload: fields, each
+	// [4B len LE][bytes]; u32 fields are 4 bytes LE, f32 fields IEEE-754 bits.
+	//   1 VCREATE: ns, dim u32, quant ("" | none | int8)                → OK
+	//   2 TSET:    ns, id, text                                        → OK
+	//   3 TDEL:    ns, id                                              → OK
+	//   4 TSEARCH: ns, k u32, query, filterField, filterOp, filterValue → matches
+	//   5 HSEARCH: ns, k u32, ef u32, alpha f32 (NaN = default 0.5),
+	//              candidates u32, vec (dim × 4B, may be empty), query,
+	//              filterField, filterOp, filterValue                   → matches
+	// filterField "" = no filter. Matches are encoded as in VSEARCH.
+	case binCmdSearch:
+		if valLen < 0 || valLen > maxSearchPayload {
+			return sendErr(fmt.Sprintf("search payload too large: %d", valLen))
+		}
+		payload := make([]byte, valLen)
+		if _, err := io.ReadFull(br, payload); err != nil {
+			return err
+		}
+		f, err := parseSearchFields(payload)
+		if err != nil {
+			return sendErr(err.Error())
+		}
+		write := keyLen == searchSubVCreate || keyLen == searchSubTSet || keyLen == searchSubTDel
+		perm := security.PermRead
+		if write {
+			perm = security.PermWrite
+		}
+		if err, ok := checkPerm(perm); !ok {
+			return err
+		}
+		switch keyLen {
+		case searchSubVCreate:
+			ns, dim, quant := f.str(), f.u32(), f.str()
+			if f.err != nil {
+				return sendErr(f.err.Error())
+			}
+			err = coord.VCreate(ns, int(dim), quant)
+		case searchSubTSet:
+			ns, id, text := f.str(), f.str(), f.str()
+			if f.err != nil {
+				return sendErr(f.err.Error())
+			}
+			err = coord.TSet(ns, id, text)
+		case searchSubTDel:
+			ns, id := f.str(), f.str()
+			if f.err != nil {
+				return sendErr(f.err.Error())
+			}
+			err = coord.TDel(ns, id)
+		case searchSubTSearch:
+			ns, k, query := f.str(), f.u32(), f.str()
+			filter := f.filter()
+			if f.err != nil {
+				return sendErr(f.err.Error())
+			}
+			matches, serr := coord.TSearch(ns, query, int(k), filter)
+			if serr != nil {
+				return sendErr(serr.Error())
+			}
+			return writeVectorMatches(matches)
+		case searchSubHSearch:
+			ns, k, ef := f.str(), f.u32(), f.u32()
+			alpha := f.f32()
+			cand := f.u32()
+			vec := f.vec()
+			query := f.str()
+			filter := f.filter()
+			if f.err != nil {
+				return sendErr(f.err.Error())
+			}
+			opts := storage.HybridOptions{Ef: int(ef), Candidates: int(cand), Filter: filter}
+			if !math.IsNaN(float64(alpha)) {
+				a := float64(alpha)
+				opts.Alpha = &a
+			}
+			matches, serr := coord.HSearch(ns, vec, query, int(k), opts)
+			if serr != nil {
+				return sendErr(serr.Error())
+			}
+			return writeVectorMatches(matches)
+		default:
+			return sendErr(fmt.Sprintf("unknown SEARCH subop %d", keyLen))
+		}
+		if err != nil {
+			return sendErr(err.Error())
+		}
+		return sendResp(binStatusOK, nil)
+
+	// ── VDEL (0x1F) ─────────────────────────────────────────────────────────
+	// Header: keyLen=idLen, valLen=nsLen. Body: ns + id.
+	case binCmdVDel:
+		ns, err := readStr(valLen)
+		if err != nil {
+			return err
+		}
+		id, err := readStr(keyLen)
+		if err != nil {
+			return err
+		}
+		if err, ok := checkPerm(security.PermWrite); !ok {
+			return err
+		}
+		if err := coord.VDel(ns, id); err != nil {
+			return sendErr(err.Error())
+		}
+		return sendResp(binStatusOK, nil)
 
 	// ── QUERY (0x28) ────────────────────────────────────────────────────────
 	// Header: keyLen=nsLen, valLen=limit. Extra: [2B fieldLen][2B opLen][2B valueLen].
@@ -395,7 +695,7 @@ func handleExtOp(cmd byte, keyLen, valLen int, br *bufio.Reader, bw *bufio.Write
 		if err, ok := checkPerm(security.PermRead); !ok {
 			return err
 		}
-		entries, err := engine.QueryNS(ns, field, op, value, int(int32(valLen)))
+		entries, err := coord.Query(ns, field, op, value, int(int32(valLen)))
 		if err != nil {
 			return sendErr(err.Error())
 		}

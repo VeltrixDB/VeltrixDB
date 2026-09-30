@@ -68,7 +68,25 @@ Linux with `uring`, with `poll`, and with `uring` under `-race`.
 | node-1 … node-4 | `CGO_ENABLED=0` | build, vet, unit, cluster, integration |
 | node-5-race | cgo, `VELTRIXDB_DISABLE_CGO_ENGINE=1`, `VELTRIXDB_INDEX=native` | `-race` in four groups: storage, server, cluster, rest |
 | node-6-cpp | CMake + cgo shims + `scripts/build.sh` | `./storage/...` with cgo and `VELTRIXDB_URING_BRIDGE=on` |
+| node-7-search | `CGO_ENABLED=0` + cgo for `-race` | search regression: recall / ranking gates (`TestSearchQualityGate*`, numbers in the job summary), the search / hook / routing / signing tests under `-race`, and `TestSearchCluster_EndToEnd` on a real 3-process cluster |
 | Net front-end | cgo, liburing | `./netfront/...` tests plus `scripts/net-bench.sh` |
+
+### Search quality gates
+
+`storage/search_quality_test.go` pins recall@10 on a fixed, seeded, clustered
+dataset (float32 at default ef and ef=256, int8 after re-rank, an indexed
+filter forced onto the graph path, and after deleting 40 %), plus a labelled
+BM25 / hybrid corpus. It runs without `-race` (skipped there) and logs the
+measured values:
+
+```bash
+go test ./storage -run TestSearchQualityGate -v
+```
+
+A change that lowers a value below its gate fails CI even if every other test
+passes — it is how the int8 path searching with a narrower beam than float32
+was found. If a change is meant to move the numbers, update the measured
+values in the file's comment together with the gates.
 
 ### Writing a new test that needs an engine
 

@@ -441,6 +441,12 @@ term/leader, peers, partition epoch, and per-replica replication lag.
   replicated mode ships their composite-key KV effects as ordinary
   replication traffic (the replica's apply hook also refreshes its in-RAM
   vector index for `@vec/` keys).
+- Vector / text / hybrid search (`cmd/server/search_fanout.go`) fans out to
+  every non-failed node over the transfer listener and merges; BM25 runs in
+  two phases so every node scores with cluster-wide statistics. The ring
+  routes `@vec/`, `@txt/` and `@idx/` keys as the record they belong to
+  (`cluster.RoutingKey`), so a rebalance keeps them with their record, and
+  `@vecns/` namespace settings are copied to every node rather than moved.
 - Raft reads: local by default; linearizable via `--linearizable-reads`
   (ReadIndex fence).
 - **Auto-rebalance is wired** (`cmd/server/rebalancer.go`): membership

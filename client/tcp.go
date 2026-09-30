@@ -371,15 +371,114 @@ func (tc *TCPConn) VSet(key string, vec []float32) error {
 	return tc.simpleOK(sb.String())
 }
 
+// VSetNS sends VSET <key> NS <ns> <floats...>.
+func (tc *TCPConn) VSetNS(ns, key string, vec []float32) error {
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "VSET %s NS %s", key, ns)
+	for _, f := range vec {
+		sb.WriteByte(' ')
+		sb.WriteString(strconv.FormatFloat(float64(f), 'g', -1, 32))
+	}
+	return tc.simpleOK(sb.String())
+}
+
+// VDel sends VDEL <key> NS <ns>.
+func (tc *TCPConn) VDel(ns, key string) error {
+	return tc.simpleOK(fmt.Sprintf("VDEL %s NS %s", key, ns))
+}
+
+// VCreate sends VCREATE <ns> <dim> [QUANT <quant>].
+func (tc *TCPConn) VCreate(ns string, dim int, quant string) error {
+	cmd := fmt.Sprintf("VCREATE %s %d", ns, dim)
+	if quant != "" {
+		cmd += " QUANT " + quant
+	}
+	return tc.simpleOK(cmd)
+}
+
+// TSet sends TSET <id> NS <ns> TEXT <text>. The text protocol is
+// line-based, so text must not contain newlines (use BinaryConn).
+func (tc *TCPConn) TSet(ns, id, text string) error {
+	if strings.ContainsAny(text, "\r\n") {
+		return fmt.Errorf("tset: text protocol cannot carry newlines; use BinaryConn")
+	}
+	return tc.simpleOK(fmt.Sprintf("TSET %s NS %s TEXT %s", id, nsOrDefault(ns), text))
+}
+
+// TDel sends TDEL <id> NS <ns>.
+func (tc *TCPConn) TDel(ns, id string) error {
+	return tc.simpleOK(fmt.Sprintf("TDEL %s NS %s", id, nsOrDefault(ns)))
+}
+
+// TSearch sends TSEARCH <k> NS <ns> [FILTER f op v] QUERY <query>.
+func (tc *TCPConn) TSearch(k int, query string, opts TextSearchOptions) ([]VectorResult, error) {
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "TSEARCH %d NS %s", k, nsOrDefault(opts.NS))
+	if opts.FilterField != "" {
+		fmt.Fprintf(&sb, " FILTER %s %s %s", opts.FilterField, opts.FilterOp, opts.FilterValue)
+	}
+	fmt.Fprintf(&sb, " QUERY %s", query)
+	return tc.matchList(sb.String())
+}
+
+// HSearch sends HSEARCH <k> NS <ns> [EF n] [ALPHA a] [CAND n] [FILTER f op v]
+// [VEC floats...] QUERY <query>.
+func (tc *TCPConn) HSearch(k int, vec []float32, query string, opts HybridSearchOptions) ([]VectorResult, error) {
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "HSEARCH %d NS %s", k, nsOrDefault(opts.NS))
+	if opts.Ef > 0 {
+		fmt.Fprintf(&sb, " EF %d", opts.Ef)
+	}
+	if opts.Alpha != nil {
+		fmt.Fprintf(&sb, " ALPHA %g", *opts.Alpha)
+	}
+	if opts.Candidates > 0 {
+		fmt.Fprintf(&sb, " CAND %d", opts.Candidates)
+	}
+	if opts.FilterField != "" {
+		fmt.Fprintf(&sb, " FILTER %s %s %s", opts.FilterField, opts.FilterOp, opts.FilterValue)
+	}
+	if len(vec) > 0 {
+		sb.WriteString(" VEC")
+		for _, f := range vec {
+			sb.WriteByte(' ')
+			sb.WriteString(strconv.FormatFloat(float64(f), 'g', -1, 32))
+		}
+	}
+	fmt.Fprintf(&sb, " QUERY %s", query)
+	return tc.matchList(sb.String())
+}
+
 // VSearch sends VSEARCH <k> <floats...> and returns the top-k matches.
 func (tc *TCPConn) VSearch(k int, query []float32) ([]VectorResult, error) {
+	return tc.VSearchWithOptions(k, query, VectorSearchOptions{})
+}
+
+// VSearchWithOptions sends VSEARCH <k> [NS ns] [EF n] [FILTER f op v] <floats...>.
+// Filter values are whitespace-delimited on the text protocol, so they
+// cannot contain spaces (use BinaryConn for those).
+func (tc *TCPConn) VSearchWithOptions(k int, query []float32, opts VectorSearchOptions) ([]VectorResult, error) {
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "VSEARCH %d", k)
+	if opts.NS != "" {
+		fmt.Fprintf(&sb, " NS %s", opts.NS)
+	}
+	if opts.Ef > 0 {
+		fmt.Fprintf(&sb, " EF %d", opts.Ef)
+	}
+	if opts.FilterField != "" {
+		fmt.Fprintf(&sb, " FILTER %s %s %s", opts.FilterField, opts.FilterOp, opts.FilterValue)
+	}
 	for _, f := range query {
 		sb.WriteByte(' ')
 		sb.WriteString(strconv.FormatFloat(float64(f), 'g', -1, 32))
 	}
-	fmt.Fprintln(tc.w, sb.String())
+	return tc.matchList(sb.String())
+}
+
+// matchList sends cmd and reads "id score" lines up to END.
+func (tc *TCPConn) matchList(cmd string) ([]VectorResult, error) {
+	fmt.Fprintln(tc.w, cmd)
 	if err := tc.w.Flush(); err != nil {
 		return nil, err
 	}
@@ -401,7 +500,7 @@ func (tc *TCPConn) VSearch(k int, query []float32) ([]VectorResult, error) {
 		}
 		score, err := strconv.ParseFloat(line[sp+1:], 64)
 		if err != nil {
-			return nil, fmt.Errorf("vsearch: bad score line %q", line)
+			return nil, fmt.Errorf("bad score line %q", line)
 		}
 		out = append(out, VectorResult{ID: line[:sp], Score: score})
 	}

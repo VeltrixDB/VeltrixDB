@@ -3,26 +3,46 @@ package storage
 // hnsw.go — Hierarchical Navigable Small World graph (Malkov & Yashunin,
 // arXiv:1603.09320) for approximate nearest-neighbour vector search.
 //
-// Replaces the brute-force scan that previously backed SearchVector: query
-// cost drops from O(N×D) to roughly O(log N × M × D) at >0.95 recall for the
-// default parameters. All vectors are L2-normalized before insertion, so
-// similarity is the plain dot product (cosine).
+// Query cost is roughly O(log N × M × D) at >0.95 recall for the default
+// parameters. All vectors are L2-normalized before insertion, so similarity
+// is the plain dot product (cosine).
 //
 // Design notes:
 //   - Level assignment is DETERMINISTIC per id (hash-derived, not RNG), so
 //     every replica that inserts the same ids builds a structurally similar
 //     graph regardless of insert order or process restarts.
-//   - Updates replace the vector in place and keep existing edges; the graph
-//     re-optimises on subsequent inserts. Restart rebuild produces a fresh
-//     optimal graph (RebuildVectorIndexes).
-//   - Deletes tombstone the node: it stays as a routing waypoint but is
-//     filtered from results. Live count is tracked separately.
-//   - Concurrency: one RWMutex per index — writers exclusive, searches shared.
+//   - Neighbours are chosen with the paper's diversity heuristic (Algorithm
+//     4, keepPrunedConnections): a candidate closer to an already-selected
+//     neighbour than to the base node is skipped first, so clustered data
+//     keeps long-range edges. Plain top-M selection loses recall there.
+//   - An update tombstones the old node and inserts a fresh one, so the
+//     new position gets its own edges. Rewriting the vector in place would
+//     leave edges that point at the old neighbourhood.
+//   - Deletes tombstone the node: it stays as a routing waypoint but never
+//     enters a result set. Search does NOT widen ef by the tombstone count
+//     (that degrades to a full scan as deletes pile up); tombstones are
+//     traversed but not counted, and compaction (below) removes them.
+//   - Compaction: once tombstones exceed hnswCompactRatio of all nodes (and
+//     at least hnswCompactMinDead), a background goroutine rebuilds a fresh
+//     graph from the live nodes, replays the writes that landed meanwhile
+//     (vi.pending) and swaps it in under the write lock. vi.epoch counts the
+//     swaps; node indices are only stable within one epoch.
+//   - Quantization (VectorIndex.quant): each node keeps int8 codes plus one
+//     float32 scale instead of float32 components — dim+4 bytes instead of
+//     4×dim. The graph is built and walked on these approximate similarities;
+//     the engine re-ranks the survivors against the full float32 vectors it
+//     persists in the VLog (vector_index.go), so RAM holds only the codes.
+//   - Concurrency: one RWMutex per index. An insert runs its expensive
+//     candidate search under the READ lock (planInsert) and takes the write
+//     lock only to link the node (commitInsert), so searches and other
+//     inserts' planning proceed in parallel. A plan made in an older epoch
+//     is discarded and redone.
 
 import (
-	"container/heap"
 	"hash/fnv"
 	"math"
+	"sort"
+	"sync"
 )
 
 const (
@@ -30,18 +50,39 @@ const (
 	hnswMmax0          = 32  // max out-edges on layer 0
 	hnswEfConstruction = 200 // beam width while inserting
 	hnswEfSearch       = 64  // beam width while querying (raised to k when k larger)
+
+	// Compaction trigger: tombstones must be at least this many AND more
+	// than this fraction of all nodes.
+	hnswCompactMinDead = 1024
+	hnswCompactRatio   = 0.3
+
+	// A filtered search stops after visiting this many nodes per unit of ef
+	// (plus hnswFilterVisitBase). Without a cap, a filter that matches
+	// almost nothing walks the whole graph, evaluating the filter per node.
+	hnswFilterVisitPerEf = 20
+	hnswFilterVisitBase  = 10000
 )
 
 // hnswInvLogM = 1/ln(M) — the level multiplier from the paper.
 var hnswInvLogM = 1.0 / math.Log(float64(hnswM))
 
 type hnswNode struct {
-	id      string
-	vec     []float32
+	id  string
+	vec []float32 // never mutated after insert (updates add a new node); nil when quantized
+	// Quantized form (VectorIndex.quant): vec[i] ≈ code[i] × scale.
+	code    []int8
+	scale   float32
 	level   int
 	deleted bool
 	// neighbors[l] lists node indices adjacent at layer l (0..level).
 	neighbors [][]int32
+}
+
+// hnswOp is a write recorded while a compaction is running; it is replayed
+// onto the fresh graph before the swap.
+type hnswOp struct {
+	id  string
+	vec []float32 // nil = delete
 }
 
 // hnswLevelForID derives the node's top layer deterministically from its id:
@@ -60,92 +101,283 @@ func hnswLevelForID(id string) int {
 	return int(-math.Log(u) * hnswInvLogM)
 }
 
+// dot is unrolled by 4 with independent accumulators, which breaks the
+// add-dependency chain and lets the compiler drop bounds checks (b is
+// re-sliced to len(a)). About 2–3× the plain loop on amd64/arm64.
 func dot(a, b []float32) float32 {
-	var s float32
-	for i := range a {
-		s += a[i] * b[i]
+	n := len(a)
+	b = b[:n]
+	var s0, s1, s2, s3 float32
+	i := 0
+	for ; i+4 <= n; i += 4 {
+		s0 += a[i] * b[i]
+		s1 += a[i+1] * b[i+1]
+		s2 += a[i+2] * b[i+2]
+		s3 += a[i+3] * b[i+3]
 	}
-	return s
+	for ; i < n; i++ {
+		s0 += a[i] * b[i]
+	}
+	return (s0 + s1) + (s2 + s3)
 }
 
-// simHeap is a heap of (similarity, node index) pairs. minFirst selects
-// between a min-heap (results set — evict worst) and a max-heap (candidate
-// frontier — expand best).
+// dotF32I8 is dot with an int8 right-hand side, unrolled like dot.
+func dotF32I8(a []float32, c []int8) float32 {
+	n := len(a)
+	c = c[:n]
+	var s0, s1, s2, s3 float32
+	i := 0
+	for ; i+4 <= n; i += 4 {
+		s0 += a[i] * float32(c[i])
+		s1 += a[i+1] * float32(c[i+1])
+		s2 += a[i+2] * float32(c[i+2])
+		s3 += a[i+3] * float32(c[i+3])
+	}
+	for ; i < n; i++ {
+		s0 += a[i] * float32(c[i])
+	}
+	return (s0 + s1) + (s2 + s3)
+}
+
+// quantizeInt8 maps v to int8 codes with one scale chosen so the largest
+// |component| becomes ±127 (symmetric scalar quantization).
+func quantizeInt8(v []float32) ([]int8, float32) {
+	var maxAbs float32
+	for _, x := range v {
+		if x < 0 {
+			x = -x
+		}
+		if x > maxAbs {
+			maxAbs = x
+		}
+	}
+	code := make([]int8, len(v))
+	if maxAbs == 0 {
+		return code, 0
+	}
+	scale := maxAbs / 127
+	for i, x := range v {
+		code[i] = int8(math.Round(float64(x / scale)))
+	}
+	return code, scale
+}
+
+// dequantizeInt8 is the inverse of quantizeInt8 (up to rounding).
+func dequantizeInt8(code []int8, scale float32) []float32 {
+	out := make([]float32, len(code))
+	for i, c := range code {
+		out[i] = float32(c) * scale
+	}
+	return out
+}
+
+// sim is the similarity of q to node idx: exact for float32 nodes,
+// approximate for quantized ones. Caller must hold vi.mu.
+func (vi *VectorIndex) sim(q []float32, idx int32) float32 {
+	n := vi.nodes[idx]
+	if n.code != nil {
+		return dotF32I8(q, n.code) * n.scale
+	}
+	return dot(q, n.vec)
+}
+
+// vecOf returns node idx's vector, decoding a quantized node (allocates).
+// Caller must hold vi.mu.
+func (vi *VectorIndex) vecOf(idx int32) []float32 {
+	n := vi.nodes[idx]
+	if n.code != nil {
+		return dequantizeInt8(n.code, n.scale)
+	}
+	return n.vec
+}
+
+// simItem is one (similarity, node index) pair.
 type simItem struct {
 	sim float32
 	idx int32
 }
-type simHeap struct {
-	items    []simItem
-	minFirst bool
+
+// maxSimHeap keeps the most similar item on top (the candidate frontier).
+type maxSimHeap []simItem
+
+func (h *maxSimHeap) push(it simItem) {
+	*h = append(*h, it)
+	s := *h
+	for i := len(s) - 1; i > 0; {
+		p := (i - 1) / 2
+		if s[p].sim >= s[i].sim {
+			break
+		}
+		s[p], s[i] = s[i], s[p]
+		i = p
+	}
 }
 
-func (h *simHeap) Len() int { return len(h.items) }
-func (h *simHeap) Less(i, j int) bool {
-	if h.minFirst {
-		return h.items[i].sim < h.items[j].sim
+func (h *maxSimHeap) pop() simItem {
+	s := *h
+	top := s[0]
+	last := len(s) - 1
+	s[0] = s[last]
+	s = s[:last]
+	for i := 0; ; {
+		l, r, m := 2*i+1, 2*i+2, i
+		if l < len(s) && s[l].sim > s[m].sim {
+			m = l
+		}
+		if r < len(s) && s[r].sim > s[m].sim {
+			m = r
+		}
+		if m == i {
+			break
+		}
+		s[i], s[m] = s[m], s[i]
+		i = m
 	}
-	return h.items[i].sim > h.items[j].sim
+	*h = s
+	return top
 }
-func (h *simHeap) Swap(i, j int)      { h.items[i], h.items[j] = h.items[j], h.items[i] }
-func (h *simHeap) Push(x interface{}) { h.items = append(h.items, x.(simItem)) }
-func (h *simHeap) Pop() interface{} {
-	old := h.items
-	n := len(old)
-	it := old[n-1]
-	h.items = old[:n-1]
-	return it
+
+// minSimHeap keeps the least similar item on top (a bounded result set).
+type minSimHeap []simItem
+
+func (h *minSimHeap) push(it simItem) {
+	*h = append(*h, it)
+	s := *h
+	for i := len(s) - 1; i > 0; {
+		p := (i - 1) / 2
+		if s[p].sim <= s[i].sim {
+			break
+		}
+		s[p], s[i] = s[i], s[p]
+		i = p
+	}
+}
+
+func (h *minSimHeap) pop() simItem {
+	s := *h
+	top := s[0]
+	last := len(s) - 1
+	s[0] = s[last]
+	s = s[:last]
+	for i := 0; ; {
+		l, r, m := 2*i+1, 2*i+2, i
+		if l < len(s) && s[l].sim < s[m].sim {
+			m = l
+		}
+		if r < len(s) && s[r].sim < s[m].sim {
+			m = r
+		}
+		if m == i {
+			break
+		}
+		s[i], s[m] = s[m], s[i]
+		i = m
+	}
+	*h = s
+	return top
+}
+
+// visitedSet is a generation-stamped mark array: a node is visited in the
+// current search iff marks[i] == gen. Bumping gen clears the set in O(1),
+// so a pooled set costs no per-search allocation (the old map[int32] did).
+type visitedSet struct {
+	marks []uint32
+	gen   uint32
+}
+
+var visitedPool = sync.Pool{New: func() interface{} { return &visitedSet{} }}
+
+func getVisited(n int) *visitedSet {
+	v := visitedPool.Get().(*visitedSet)
+	if cap(v.marks) < n {
+		v.marks = make([]uint32, n+n/4)
+		v.gen = 0
+	}
+	v.marks = v.marks[:cap(v.marks)]
+	v.gen++
+	if v.gen == 0 { // wrapped: stale marks could collide with the new gen
+		for i := range v.marks {
+			v.marks[i] = 0
+		}
+		v.gen = 1
+	}
+	return v
+}
+
+// visit marks i and reports whether it was unvisited.
+func (v *visitedSet) visit(i int32) bool {
+	if v.marks[i] == v.gen {
+		return false
+	}
+	v.marks[i] = v.gen
+	return true
 }
 
 // searchLayer runs a beam search of width ef at the given layer, starting from
-// entry points eps. Returns up to ef (similarity, index) pairs, best-first
-// unspecified (callers sort/select). Caller must hold vi.mu (read or write).
-func (vi *VectorIndex) searchLayer(q []float32, eps []int32, ef, layer int) []simItem {
-	visited := make(map[int32]struct{}, ef*4)
-	candidates := &simHeap{minFirst: false} // frontier: best-first expansion
-	results := &simHeap{minFirst: true}     // keep-best-ef: worst on top
+// entry points eps. Every reachable node is traversed, but only nodes for
+// which accept(idx) is true (nil = every node) enter the result set.
+// maxVisit > 0 stops the walk after that many visited nodes. Returns up to ef
+// accepted (similarity, index) pairs in unspecified order. Caller must hold
+// vi.mu (read or write).
+func (vi *VectorIndex) searchLayer(q []float32, eps []int32, ef, layer int, accept func(int32) bool, maxVisit int) []simItem {
+	visited := getVisited(len(vi.nodes))
+	defer visitedPool.Put(visited)
 
-	for _, ep := range eps {
-		if _, ok := visited[ep]; ok {
-			continue
-		}
-		visited[ep] = struct{}{}
-		s := dot(q, vi.nodes[ep].vec)
-		heap.Push(candidates, simItem{s, ep})
-		heap.Push(results, simItem{s, ep})
-	}
-
-	for candidates.Len() > 0 {
-		c := heap.Pop(candidates).(simItem)
-		if results.Len() >= ef && c.sim < results.items[0].sim {
-			break // best remaining candidate is worse than the worst kept result
-		}
-		node := vi.nodes[c.idx]
-		if layer < len(node.neighbors) {
-			for _, nb := range node.neighbors[layer] {
-				if _, ok := visited[nb]; ok {
-					continue
-				}
-				visited[nb] = struct{}{}
-				s := dot(q, vi.nodes[nb].vec)
-				if results.Len() < ef || s > results.items[0].sim {
-					heap.Push(candidates, simItem{s, nb})
-					heap.Push(results, simItem{s, nb})
-					if results.Len() > ef {
-						heap.Pop(results)
-					}
-				}
+	candidates := make(maxSimHeap, 0, ef*2) // frontier: best-first expansion
+	results := make(minSimHeap, 0, ef+1)    // keep-best-ef: worst on top
+	offer := func(s float32, idx int32) {
+		if accept == nil || accept(idx) {
+			results.push(simItem{s, idx})
+			if len(results) > ef {
+				results.pop()
 			}
 		}
 	}
-	return results.items
+
+	nVisited := 0
+	for _, ep := range eps {
+		if !visited.visit(ep) {
+			continue
+		}
+		nVisited++
+		s := vi.sim(q, ep)
+		candidates.push(simItem{s, ep})
+		offer(s, ep)
+	}
+
+	for len(candidates) > 0 {
+		c := candidates.pop()
+		if len(results) >= ef && c.sim < results[0].sim {
+			break // best remaining candidate is worse than the worst kept result
+		}
+		node := vi.nodes[c.idx]
+		if layer >= len(node.neighbors) {
+			continue
+		}
+		for _, nb := range node.neighbors[layer] {
+			if !visited.visit(nb) {
+				continue
+			}
+			nVisited++
+			s := vi.sim(q, nb)
+			if len(results) < ef || s > results[0].sim {
+				candidates.push(simItem{s, nb})
+				offer(s, nb)
+			}
+		}
+		if maxVisit > 0 && nVisited >= maxVisit {
+			break
+		}
+	}
+	return results
 }
 
 // greedyDescend walks from ep down through layers (top..targetLayer+1) taking
-// the locally best neighbor at each step. Caller must hold vi.mu.
+// the locally best neighbor at each step. Upper layers are routing-only, so
+// tombstoned nodes are valid stepping stones. Caller must hold vi.mu.
 func (vi *VectorIndex) greedyDescend(q []float32, ep int32, fromLayer, toLayer int) int32 {
 	cur := ep
-	curSim := dot(q, vi.nodes[cur].vec)
+	curSim := vi.sim(q, cur)
 	for l := fromLayer; l > toLayer; l-- {
 		for improved := true; improved; {
 			improved = false
@@ -154,7 +386,7 @@ func (vi *VectorIndex) greedyDescend(q []float32, ep int32, fromLayer, toLayer i
 				break
 			}
 			for _, nb := range node.neighbors[l] {
-				if s := dot(q, vi.nodes[nb].vec); s > curSim {
+				if s := vi.sim(q, nb); s > curSim {
 					curSim, cur = s, nb
 					improved = true
 				}
@@ -164,44 +396,129 @@ func (vi *VectorIndex) greedyDescend(q []float32, ep int32, fromLayer, toLayer i
 	return cur
 }
 
-// selectTopM returns the indices of the up-to-m most similar items.
-func selectTopM(items []simItem, m int) []int32 {
-	// Partial selection via a min-heap of size m.
-	h := &simHeap{minFirst: true}
-	for _, it := range items {
-		if h.Len() < m {
-			heap.Push(h, it)
-		} else if it.sim > h.items[0].sim {
-			heap.Pop(h)
-			heap.Push(h, it)
+// selectNeighbors picks up to m of cands (similarities are to the base node)
+// with the paper's heuristic: walking candidates best-first, one is kept only
+// if it is more similar to the base than to every neighbour already kept.
+// Discarded candidates then back-fill any remaining slots
+// (keepPrunedConnections), so a node never ends up under-connected.
+// Caller must hold vi.mu.
+func (vi *VectorIndex) selectNeighbors(cands []simItem, m int) []int32 {
+	if len(cands) <= m {
+		out := make([]int32, len(cands))
+		for i, c := range cands {
+			out[i] = c.idx
+		}
+		return out
+	}
+	sorted := append([]simItem(nil), cands...)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i].sim > sorted[j].sim })
+
+	selected := make([]int32, 0, m)
+	var pruned []int32
+	for _, c := range sorted {
+		if len(selected) >= m {
+			break
+		}
+		cv := vi.vecOf(c.idx)
+		diverse := true
+		for _, s := range selected {
+			if vi.sim(cv, s) > c.sim {
+				diverse = false
+				break
+			}
+		}
+		if diverse {
+			selected = append(selected, c.idx)
+		} else {
+			pruned = append(pruned, c.idx)
 		}
 	}
-	out := make([]int32, h.Len())
-	for i := range out {
-		out[i] = h.items[i].idx
+	for _, p := range pruned {
+		if len(selected) >= m {
+			break
+		}
+		selected = append(selected, p)
 	}
-	return out
+	return selected
 }
 
-// insertHNSW adds (or updates) a vector. Caller must hold vi.mu exclusively.
-func (vi *VectorIndex) insertHNSW(id string, vec []float32) {
-	if i, exists := vi.byID[id]; exists {
-		n := vi.nodes[i]
-		n.vec = vec
-		if n.deleted {
-			n.deleted = false
-			vi.live++
+// isLive reports whether node idx is not tombstoned (the default layer-0
+// acceptance rule). Caller must hold vi.mu.
+func (vi *VectorIndex) isLive(idx int32) bool { return !vi.nodes[idx].deleted }
+
+// hnswPlan is the read-only half of an insert: the neighbours chosen per
+// layer, valid only for the epoch (and non-empty graph) it was computed in.
+type hnswPlan struct {
+	epoch uint64
+	empty bool      // graph had no nodes when planned
+	links [][]int32 // links[l] for l in 0..min(level, maxLevel)
+}
+
+// planInsert searches for the new node's neighbours without mutating the
+// graph. Caller must hold vi.mu (read suffices).
+func (vi *VectorIndex) planInsert(vec []float32, level int) hnswPlan {
+	p := hnswPlan{epoch: vi.epoch}
+	if len(vi.nodes) == 0 {
+		p.empty = true
+		return p
+	}
+	ep := vi.entry
+	// Phase 1: greedy descend from the top of the graph to level+1.
+	if vi.maxLevel > level {
+		ep = vi.greedyDescend(vec, ep, vi.maxLevel, level)
+	}
+	// Phase 2: beam search on each layer from min(level, maxLevel) down to 0.
+	startLayer := level
+	if vi.maxLevel < startLayer {
+		startLayer = vi.maxLevel
+	}
+	p.links = make([][]int32, startLayer+1)
+	eps := []int32{ep}
+	for l := startLayer; l >= 0; l-- {
+		var found []simItem
+		if l == 0 {
+			// Layer 0 carries the result edges: don't spend them on
+			// tombstones, unless nothing live is reachable at all.
+			found = vi.searchLayer(vec, eps, hnswEfConstruction, 0, vi.isLive, 0)
+			if len(found) == 0 {
+				found = vi.searchLayer(vec, eps, hnswEfConstruction, 0, nil, 0)
+			}
+		} else {
+			found = vi.searchLayer(vec, eps, hnswEfConstruction, l, nil, 0)
 		}
-		return
+		p.links[l] = vi.selectNeighbors(found, hnswM)
+		if len(found) > 0 {
+			eps = eps[:0]
+			for _, it := range found {
+				eps = append(eps, it.idx)
+			}
+		}
+	}
+	return p
+}
+
+// commitInsert links a planned node into the graph. If id already exists its
+// old node is tombstoned first (an update). Caller must hold vi.mu
+// exclusively and must have checked p.epoch == vi.epoch.
+func (vi *VectorIndex) commitInsert(id string, vec []float32, level int, p hnswPlan) {
+	if vi.compacting {
+		vi.pending = append(vi.pending, hnswOp{id: id, vec: vec})
+	}
+	if old, exists := vi.byID[id]; exists && !vi.nodes[old].deleted {
+		vi.nodes[old].deleted = true
+		vi.live--
 	}
 
-	level := hnswLevelForID(id)
 	idx := int32(len(vi.nodes))
 	node := &hnswNode{
 		id:        id,
-		vec:       vec,
 		level:     level,
 		neighbors: make([][]int32, level+1),
+	}
+	if vi.quant {
+		node.code, node.scale = quantizeInt8(vec)
+	} else {
+		node.vec = vec
 	}
 	vi.nodes = append(vi.nodes, node)
 	vi.byID[id] = idx
@@ -213,28 +530,16 @@ func (vi *VectorIndex) insertHNSW(id string, vec []float32) {
 		return
 	}
 
-	ep := vi.entry
-	// Phase 1: greedy descend from the top of the graph to level+1.
-	if vi.maxLevel > level {
-		ep = vi.greedyDescend(vec, ep, vi.maxLevel, level)
-	}
-
-	// Phase 2: beam-connect on each layer from min(level, maxLevel) down to 0.
-	startLayer := level
-	if vi.maxLevel < startLayer {
-		startLayer = vi.maxLevel
-	}
-	eps := []int32{ep}
-	for l := startLayer; l >= 0; l-- {
-		found := vi.searchLayer(vec, eps, hnswEfConstruction, l)
+	for l, selected := range p.links {
+		if l > level {
+			break
+		}
+		node.neighbors[l] = selected
 		mmax := hnswM
 		if l == 0 {
 			mmax = hnswMmax0
 		}
-		selected := selectTopM(found, hnswM)
-		node.neighbors[l] = append([]int32(nil), selected...)
-
-		// Bidirectional links with degree pruning on the neighbor side.
+		// Bidirectional links with heuristic pruning on the neighbour side.
 		for _, nb := range selected {
 			nbNode := vi.nodes[nb]
 			if l >= len(nbNode.neighbors) {
@@ -242,19 +547,13 @@ func (vi *VectorIndex) insertHNSW(id string, vec []float32) {
 			}
 			nbNode.neighbors[l] = append(nbNode.neighbors[l], idx)
 			if len(nbNode.neighbors[l]) > mmax {
-				// Keep the mmax most similar to the NEIGHBOR itself.
+				base := vi.vecOf(nb)
 				items := make([]simItem, len(nbNode.neighbors[l]))
 				for i, x := range nbNode.neighbors[l] {
-					items[i] = simItem{dot(nbNode.vec, vi.nodes[x].vec), x}
+					items[i] = simItem{vi.sim(base, x), x}
 				}
-				nbNode.neighbors[l] = selectTopM(items, mmax)
+				nbNode.neighbors[l] = vi.selectNeighbors(items, mmax)
 			}
-		}
-
-		// Next layer starts from everything we found here.
-		eps = eps[:0]
-		for _, it := range found {
-			eps = append(eps, it.idx)
 		}
 	}
 
@@ -264,47 +563,50 @@ func (vi *VectorIndex) insertHNSW(id string, vec []float32) {
 	}
 }
 
-// searchHNSW returns the top-k live ids by cosine similarity.
-// Caller must hold vi.mu (read suffices).
-func (vi *VectorIndex) searchHNSW(q []float32, k int) []VectorMatch {
-	if len(vi.nodes) == 0 || vi.live == 0 {
-		return nil
-	}
-	ef := hnswEfSearch
-	if k > ef {
-		ef = k
-	}
-	// Over-fetch when tombstones exist so filtering can still fill k.
-	if vi.live < len(vi.nodes) {
-		ef += len(vi.nodes) - vi.live
-	}
+// insertHNSW adds (or updates) a vector in one step. Caller must hold vi.mu
+// exclusively. Used for private graphs (compaction) and tests; concurrent
+// callers use insert.
+func (vi *VectorIndex) insertHNSW(id string, vec []float32) {
+	level := hnswLevelForID(id)
+	vi.commitInsert(id, vec, level, vi.planInsert(vec, level))
+}
 
-	ep := vi.greedyDescend(q, vi.entry, vi.maxLevel, 0)
-	found := vi.searchLayer(q, []int32{ep}, ef, 0)
+// insert adds (or updates) a vector, planning under the read lock and
+// linking under the write lock. Caller must NOT hold vi.mu.
+func (vi *VectorIndex) insert(id string, vec []float32) {
+	level := hnswLevelForID(id)
+	for {
+		vi.mu.RLock()
+		p := vi.planInsert(vec, level)
+		vi.mu.RUnlock()
 
-	items := make([]simItem, 0, len(found))
-	for _, it := range found {
-		if !vi.nodes[it.idx].deleted {
-			items = append(items, it)
+		vi.mu.Lock()
+		// Stale plan: a compaction renumbered the nodes, or the graph was
+		// empty when planned and another insert has since seeded it.
+		if p.epoch != vi.epoch || (p.empty && len(vi.nodes) > 0) {
+			vi.mu.Unlock()
+			continue
 		}
+		vi.commitInsert(id, vec, level, p)
+		vi.maybeCompactLocked()
+		vi.mu.Unlock()
+		return
 	}
-	// Sort best-first via heap drain.
-	h := &simHeap{items: items, minFirst: false}
-	heap.Init(h)
-	n := k
-	if k <= 0 || k > h.Len() {
-		n = h.Len()
-	}
-	out := make([]VectorMatch, 0, n)
-	for len(out) < n && h.Len() > 0 {
-		it := heap.Pop(h).(simItem)
-		out = append(out, VectorMatch{ID: vi.nodes[it.idx].id, Score: it.sim})
-	}
-	return out
+}
+
+// remove tombstones id. Caller must NOT hold vi.mu.
+func (vi *VectorIndex) remove(id string) {
+	vi.mu.Lock()
+	defer vi.mu.Unlock()
+	vi.removeHNSW(id)
+	vi.maybeCompactLocked()
 }
 
 // removeHNSW tombstones id. Caller must hold vi.mu exclusively.
 func (vi *VectorIndex) removeHNSW(id string) {
+	if vi.compacting {
+		vi.pending = append(vi.pending, hnswOp{id: id})
+	}
 	if i, ok := vi.byID[id]; ok {
 		if !vi.nodes[i].deleted {
 			vi.nodes[i].deleted = true
@@ -314,12 +616,144 @@ func (vi *VectorIndex) removeHNSW(id string) {
 	}
 }
 
+// maybeCompactLocked starts a background compaction when tombstones cross
+// the threshold. Caller must hold vi.mu exclusively.
+func (vi *VectorIndex) maybeCompactLocked() {
+	dead := len(vi.nodes) - vi.live
+	if vi.compacting || dead < hnswCompactMinDead || float64(dead) <= hnswCompactRatio*float64(len(vi.nodes)) {
+		return
+	}
+	vi.compacting = true
+	snap := vi.liveSnapshotLocked()
+	go vi.compact(snap)
+}
+
+// liveSnapshotLocked returns the live (id, vec) pairs. Float32 vectors are
+// shared, not copied: they are immutable once inserted. Quantized nodes are
+// decoded; re-quantizing a decoded vector reproduces its codes. Caller must
+// hold vi.mu.
+func (vi *VectorIndex) liveSnapshotLocked() []hnswOp {
+	snap := make([]hnswOp, 0, vi.live)
+	for i, n := range vi.nodes {
+		if !n.deleted {
+			snap = append(snap, hnswOp{id: n.id, vec: vi.vecOf(int32(i))})
+		}
+	}
+	return snap
+}
+
+// compact builds a fresh graph from snap without holding vi.mu, then replays
+// the writes recorded meanwhile and swaps the fresh graph in.
+func (vi *VectorIndex) compact(snap []hnswOp) {
+	fresh := &VectorIndex{dim: vi.dim, quant: vi.quant, byID: make(map[string]int32, len(snap))}
+	for _, op := range snap {
+		fresh.insertHNSW(op.id, op.vec)
+	}
+
+	vi.mu.Lock()
+	defer vi.mu.Unlock()
+	for _, op := range vi.pending {
+		if op.vec == nil {
+			fresh.removeHNSW(op.id)
+		} else {
+			fresh.insertHNSW(op.id, op.vec)
+		}
+	}
+	vi.nodes, vi.byID = fresh.nodes, fresh.byID
+	vi.entry, vi.maxLevel, vi.live = fresh.entry, fresh.maxLevel, fresh.live
+	vi.pending = nil
+	vi.compacting = false
+	vi.epoch++
+	vi.compactions++
+}
+
+// searchHNSW returns the top-k live ids by cosine similarity.
+// Caller must hold vi.mu (read suffices).
+func (vi *VectorIndex) searchHNSW(q []float32, k int) []VectorMatch {
+	return vi.searchFiltered(q, k, 0, nil)
+}
+
+// searchFiltered returns the top-k live ids by cosine similarity among those
+// for which accept(id) is true (nil = all). ef ≤ 0 selects the default beam
+// width; it is raised to k when k is larger. k ≤ 0 returns every matching
+// live vector (exact scan). Caller must hold vi.mu (read suffices).
+func (vi *VectorIndex) searchFiltered(q []float32, k, ef int, accept func(id string) bool) []VectorMatch {
+	if len(vi.nodes) == 0 || vi.live == 0 {
+		return nil
+	}
+	if k <= 0 {
+		return vi.bruteForce(q, 0, nil, accept)
+	}
+	if ef <= 0 {
+		ef = hnswEfSearch
+	}
+	if k > ef {
+		ef = k
+	}
+
+	accept0 := vi.isLive
+	maxVisit := 0
+	if accept != nil {
+		accept0 = func(idx int32) bool {
+			n := vi.nodes[idx]
+			return !n.deleted && accept(n.id)
+		}
+		maxVisit = hnswFilterVisitBase + hnswFilterVisitPerEf*ef
+	}
+
+	ep := vi.greedyDescend(q, vi.entry, vi.maxLevel, 0)
+	found := vi.searchLayer(q, []int32{ep}, ef, 0, accept0, maxVisit)
+	return topMatches(vi, found, k)
+}
+
+// bruteForce scores candidates exactly: the nodes of ids when ids != nil,
+// else every node. Tombstoned and non-accepted nodes are skipped. k ≤ 0
+// returns all of them. Caller must hold vi.mu.
+func (vi *VectorIndex) bruteForce(q []float32, k int, ids []string, accept func(id string) bool) []VectorMatch {
+	var items []simItem
+	score := func(idx int32) {
+		n := vi.nodes[idx]
+		if n.deleted || (accept != nil && !accept(n.id)) {
+			return
+		}
+		items = append(items, simItem{vi.sim(q, idx), idx})
+	}
+	if ids != nil {
+		for _, id := range ids {
+			if idx, ok := vi.byID[id]; ok {
+				score(idx)
+			}
+		}
+	} else {
+		for i := range vi.nodes {
+			score(int32(i))
+		}
+	}
+	return topMatches(vi, items, k)
+}
+
+// topMatches sorts items best-first and returns the first k (all if k ≤ 0).
+func topMatches(vi *VectorIndex, items []simItem, k int) []VectorMatch {
+	sort.Slice(items, func(i, j int) bool { return items[i].sim > items[j].sim })
+	if k > 0 && k < len(items) {
+		items = items[:k]
+	}
+	out := make([]VectorMatch, len(items))
+	for i, it := range items {
+		out[i] = VectorMatch{ID: vi.nodes[it.idx].id, Score: it.sim}
+	}
+	return out
+}
+
 // hnswStatsBytes is a rough memory estimate for the admin API (vectors +
 // adjacency), avoiding a full graph walk.
 func (vi *VectorIndex) hnswStatsBytes() int64 {
 	var b int64
 	for _, n := range vi.nodes {
-		b += int64(len(n.vec)) * 4
+		b += int64(len(n.vec))*4 + int64(len(n.code))
+		if n.code != nil {
+			b += 4 // scale
+		}
 		for _, adj := range n.neighbors {
 			b += int64(len(adj)) * 4
 		}

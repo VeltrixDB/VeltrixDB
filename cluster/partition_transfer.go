@@ -25,11 +25,16 @@ package cluster
 
 import (
 	"bytes"
+	"context"
+	"crypto/hmac"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -99,6 +104,10 @@ type TransferAgent struct {
 	scheme       string // "http" or "https"
 	tlsEnabled   bool
 	boundAddr    atomic.Value // string; actual listen address, set by Start (useful with ":0")
+	mux          *http.ServeMux
+	// secret, when set, is the shared cluster key every request on this
+	// listener must be signed with (SetClusterSecret).
+	secret []byte
 }
 
 // NewTransferAgent creates a plaintext TransferAgent.
@@ -134,13 +143,14 @@ func NewTransferAgentTLS(pm *PartitionMap, localNodeID string, store LocalStore,
 	}
 
 	mux := http.NewServeMux()
+	ta.mux = mux
 	mux.HandleFunc("/transfer/keys", ta.handleReceive)
 	mux.HandleFunc("/transfer/health", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})
 	ta.httpServer = &http.Server{
 		Addr:         listenAddr,
-		Handler:      mux,
+		Handler:      ta.authMiddleware(mux),
 		ReadTimeout:  transferHTTPTimeout,
 		WriteTimeout: transferHTTPTimeout,
 	}
@@ -287,9 +297,17 @@ func (ta *TransferAgent) MigrateToNewOwners() error {
 		return nil
 	}
 
-	// Group keys by destination node ID.
+	// Group keys by destination node ID. Pinned keys are not grouped: they
+	// are copied to every destination below and never deleted here.
 	byDest := make(map[string][]KeyValue)
+	var pinned []KeyValue
 	for _, key := range keys {
+		if isPinnedKey(key) {
+			if val, err := ta.store.Get(key); err == nil {
+				pinned = append(pinned, KeyValue{Key: key, Value: val, TTL: ta.store.GetTTLForKey(key)})
+			}
+			continue
+		}
 		owner, err := ta.pm.GetNodeForKey(key)
 		if err != nil {
 			log.Printf("[transfer] route key=%q: %v", key, err)
@@ -312,6 +330,12 @@ func (ta *TransferAgent) MigrateToNewOwners() error {
 		return nil
 	}
 
+	// Every destination also gets a copy of the pinned keys, sent FIRST so a
+	// namespace's settings apply before its vectors arrive.
+	for nodeID, kvs := range byDest {
+		byDest[nodeID] = append(append([]KeyValue(nil), pinned...), kvs...)
+	}
+
 	// Fan out to all destination nodes in parallel.
 	var mu sync.Mutex
 	var firstErr error
@@ -332,9 +356,10 @@ func (ta *TransferAgent) MigrateToNewOwners() error {
 				log.Printf("[transfer] send to node=%s error: %v  sent=%d/%d",
 					nodeID, err, sent, len(kvs))
 			}
-			successByDest[nodeID] = make([]string, sent)
-			for i := 0; i < sent; i++ {
-				successByDest[nodeID][i] = kvs[i].Key
+			// Only migrated keys are deleted locally; the pinned copies at
+			// the head of kvs stay.
+			for i := len(pinned); i < sent; i++ {
+				successByDest[nodeID] = append(successByDest[nodeID], kvs[i].Key)
 			}
 		}(nodeID, kvs)
 	}
@@ -355,6 +380,132 @@ func (ta *TransferAgent) MigrateToNewOwners() error {
 	}
 	log.Printf("[transfer] migration done  moved=%d  errors=%v", totalMoved, firstErr != nil)
 	return firstErr
+}
+
+// pinnedKeyPrefixes are key families every node needs a copy of, so
+// migration copies them to each destination instead of moving them:
+// "@vecns/<ns>" holds a vector namespace's configuration (dimension,
+// quantization), which each node applies to the vectors it owns.
+// "@idxdef/<name>" carries a secondary-index definition the same way.
+var pinnedKeyPrefixes = []string{"@vecns/", "@idxdef/"}
+
+func isPinnedKey(key string) bool {
+	for _, p := range pinnedKeyPrefixes {
+		if strings.HasPrefix(key, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// Cluster request signing (SetClusterSecret). Each request carries
+//
+//	X-Veltrix-Cluster-Time: unix seconds
+//	X-Veltrix-Cluster-Auth: hex HMAC-SHA256(secret, time "\n" method "\n" path "\n" body)
+//
+// and is rejected unless the MAC matches and the time is within
+// clusterAuthMaxSkew of the receiver's clock. Without it, anyone who can
+// reach the listener can write keys (/transfer/keys) and run searches
+// (/internal/search). TLS with client certificates is the alternative.
+const (
+	clusterAuthHeader  = "X-Veltrix-Cluster-Auth"
+	clusterTimeHeader  = "X-Veltrix-Cluster-Time"
+	clusterAuthMaxSkew = 5 * time.Minute
+	maxSignedBodyBytes = 256 << 20
+)
+
+// SetClusterSecret requires every request on this agent's listener, and
+// signs every request it sends, with secret. Every node must use the same
+// secret. Call before Start; an empty secret disables signing.
+func (ta *TransferAgent) SetClusterSecret(secret []byte) {
+	ta.secret = append([]byte(nil), secret...)
+}
+
+func signClusterRequest(secret []byte, ts, method, path string, body []byte) string {
+	m := hmac.New(sha256.New, secret)
+	m.Write([]byte(ts + "\n" + method + "\n" + path + "\n"))
+	m.Write(body)
+	return hex.EncodeToString(m.Sum(nil))
+}
+
+// signRequest adds the auth headers to req (no-op without a secret).
+func (ta *TransferAgent) signRequest(req *http.Request, body []byte) {
+	if len(ta.secret) == 0 {
+		return
+	}
+	ts := fmt.Sprint(time.Now().Unix())
+	req.Header.Set(clusterTimeHeader, ts)
+	req.Header.Set(clusterAuthHeader, signClusterRequest(ta.secret, ts, req.Method, req.URL.Path, body))
+}
+
+// authMiddleware verifies request signatures when a secret is set. The
+// health probe stays open so load balancers need no key.
+func (ta *TransferAgent) authMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if len(ta.secret) == 0 || r.URL.Path == "/transfer/health" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		ts := r.Header.Get(clusterTimeHeader)
+		var sec int64
+		if _, err := fmt.Sscan(ts, &sec); err != nil {
+			http.Error(w, "missing or bad "+clusterTimeHeader, http.StatusUnauthorized)
+			return
+		}
+		if d := time.Since(time.Unix(sec, 0)); d > clusterAuthMaxSkew || d < -clusterAuthMaxSkew {
+			http.Error(w, "request time outside the allowed clock skew", http.StatusUnauthorized)
+			return
+		}
+		body, err := io.ReadAll(io.LimitReader(r.Body, maxSignedBodyBytes+1))
+		if err != nil || len(body) > maxSignedBodyBytes {
+			http.Error(w, "unreadable or oversized body", http.StatusRequestEntityTooLarge)
+			return
+		}
+		want := signClusterRequest(ta.secret, ts, r.Method, r.URL.Path, body)
+		if !hmac.Equal([]byte(want), []byte(r.Header.Get(clusterAuthHeader))) {
+			http.Error(w, "bad cluster signature", http.StatusUnauthorized)
+			return
+		}
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		next.ServeHTTP(w, r)
+	})
+}
+
+// Handle registers an extra handler on the transfer listener. It shares the
+// listener's TLS / mTLS settings, which makes it the channel for
+// node-to-node requests such as distributed search. Call before Start.
+func (ta *TransferAgent) Handle(pattern string, h http.Handler) {
+	ta.mux.Handle(pattern, h)
+}
+
+// PostJSON sends in as JSON to path on nodeID's transfer listener and
+// decodes the JSON reply into out. A non-200 reply is an error carrying the
+// body text.
+func (ta *TransferAgent) PostJSON(ctx context.Context, nodeID, path string, in, out interface{}) error {
+	addr := ta.pm.GetNodeTransferAddr(nodeID)
+	if addr == "" {
+		return fmt.Errorf("no transfer address for node %s", nodeID)
+	}
+	body, err := json.Marshal(in)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, ta.scheme+"://"+addr+path, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	ta.signRequest(req, body)
+	resp, err := ta.httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return fmt.Errorf("node %s: HTTP %d: %s", nodeID, resp.StatusCode, strings.TrimSpace(string(msg)))
+	}
+	return json.NewDecoder(resp.Body).Decode(out)
 }
 
 const transferConnRetries = 3 // attempts on "connection refused" before giving up
@@ -387,7 +538,13 @@ func (ta *TransferAgent) sendBatches(nodeID string, kvs []KeyValue) (sent int, e
 
 		var resp *http.Response
 		for attempt := 0; attempt < transferConnRetries; attempt++ {
-			resp, err = client.Post(url, "application/json", bytes.NewReader(body))
+			req, rerr := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
+			if rerr != nil {
+				return sent, rerr
+			}
+			req.Header.Set("Content-Type", "application/json")
+			ta.signRequest(req, body)
+			resp, err = client.Do(req)
 			if err == nil {
 				break
 			}

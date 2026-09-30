@@ -206,20 +206,13 @@ func buildReplicatedCoordinator(p clusterParams) (*coordinator, func(), *replica
 
 	// Apply received ops to the local engine.
 	applyFn := func(op *replication.WriteOperation) error {
+		// Vector / text writes replicate as plain KV on their reserved
+		// prefixes; the engine's search hooks refresh this replica's RAM
+		// indexes (storage/search_hooks.go).
 		if op.IsTombstone {
 			return pCurrentEngine.Delete(op.Key)
 		}
-		if err := pCurrentEngine.Put(op.Key, op.Value, op.TTL); err != nil {
-			return err
-		}
-		// Vector writes replicate as plain KV on the reserved "@vec/" prefix;
-		// refresh this replica's in-RAM searchable index as well.
-		if storage.IsVectorKey(op.Key) {
-			if err := pCurrentEngine.LoadVectorBlob(op.Key, op.Value); err != nil {
-				log.Printf("[repl] vector index refresh %q: %v", op.Key, err)
-			}
-		}
-		return nil
+		return pCurrentEngine.Put(op.Key, op.Value, op.TTL)
 	}
 	replListen := p.replAddr
 	if replListen == "" {

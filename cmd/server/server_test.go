@@ -420,6 +420,82 @@ func TestVectorRoundtrip(t *testing.T) {
 	}
 }
 
+// ── Namespaced / filtered vector ops (VSETNS / VSEARCHX / VDEL) ──────────────
+
+func TestVectorNamespacesFilterDelete(t *testing.T) {
+	ts := startTestServer(t, t.TempDir(), nil)
+	defer ts.stop(t)
+
+	bc := dialBinary(t, ts.addr)
+	defer bc.Close()
+	tc := dialText(t, ts.addr)
+	defer tc.Close()
+
+	// Two namespaces with different dimensions.
+	if err := bc.VSetNS("img", "cat", []float32{1, 0}); err != nil {
+		t.Fatalf("vsetns img: %v", err)
+	}
+	if err := bc.VSetNS("img", "dog", []float32{0.9, 0.3}); err != nil {
+		t.Fatalf("vsetns img: %v", err)
+	}
+	if err := tc.VSetNS("txt", "hello", []float32{0, 0, 1}); err != nil {
+		t.Fatalf("text vset NS: %v", err)
+	}
+	m, err := bc.VSearchWithOptions(2, []float32{1, 0}, client.VectorSearchOptions{NS: "img", Ef: 100})
+	if err != nil || len(m) != 2 || m[0].ID != "cat" {
+		t.Fatalf("vsearchx img: %+v err=%v", m, err)
+	}
+	tm, err := tc.VSearchWithOptions(1, []float32{0, 0, 1}, client.VectorSearchOptions{NS: "txt"})
+	if err != nil || len(tm) != 1 || tm[0].ID != "hello" {
+		t.Fatalf("text vsearch NS: %+v err=%v", tm, err)
+	}
+
+	// Filter on the KV record whose key is the vector id.
+	if err := bc.Put("cat", []byte(`{"kind":"feline"}`), 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := bc.Put("dog", []byte(`{"kind":"canine"}`), 0); err != nil {
+		t.Fatal(err)
+	}
+	opts := client.VectorSearchOptions{NS: "img", FilterField: "kind", FilterOp: "=", FilterValue: "canine"}
+	m, err = bc.VSearchWithOptions(2, []float32{1, 0}, opts)
+	if err != nil || len(m) != 1 || m[0].ID != "dog" {
+		t.Fatalf("binary filtered search: %+v err=%v", m, err)
+	}
+	tm, err = tc.VSearchWithOptions(2, []float32{1, 0}, opts)
+	if err != nil || len(tm) != 1 || tm[0].ID != "dog" {
+		t.Fatalf("text filtered search: %+v err=%v", tm, err)
+	}
+
+	// Delete over both protocols.
+	if err := bc.VDel("img", "cat"); err != nil {
+		t.Fatalf("vdel: %v", err)
+	}
+	m, err = bc.VSearchWithOptions(2, []float32{1, 0}, client.VectorSearchOptions{NS: "img"})
+	if err != nil || len(m) != 1 || m[0].ID != "dog" {
+		t.Fatalf("after binary vdel: %+v err=%v", m, err)
+	}
+	if err := tc.VDel("txt", "hello"); err != nil {
+		t.Fatalf("text vdel: %v", err)
+	}
+	tm, err = tc.VSearchWithOptions(1, []float32{0, 0, 1}, client.VectorSearchOptions{NS: "txt"})
+	if err != nil || len(tm) != 0 {
+		t.Fatalf("after text vdel: %+v err=%v", tm, err)
+	}
+
+	// Unknown namespace and bad filter op are clean errors, not hangs.
+	if _, err := bc.VSearchWithOptions(1, []float32{1, 0}, client.VectorSearchOptions{NS: "nope"}); err == nil {
+		t.Fatal("search of unknown namespace must fail")
+	}
+	if _, err := bc.VSearchWithOptions(1, []float32{1, 0}, client.VectorSearchOptions{NS: "img", FilterField: "kind", FilterOp: "~", FilterValue: "x"}); err == nil {
+		t.Fatal("bad filter op must fail")
+	}
+	// Connection still usable after the errors.
+	if _, err := bc.VSearchWithOptions(1, []float32{1, 0}, client.VectorSearchOptions{NS: "img"}); err != nil {
+		t.Fatalf("connection broken after error: %v", err)
+	}
+}
+
 // ── QUERY with and without a matching index ──────────────────────────────────
 
 func TestQueryLanguage(t *testing.T) {
