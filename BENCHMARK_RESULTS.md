@@ -192,6 +192,7 @@ Not YCSB and not this machine; each row states its conditions.
 | Mixed-workload write P99, 1 ms flush window | **2.57 ms** | same |
 | Batch writes, C++ storage layer all on (io_uring bridge + SQPOLL, batch engine, native index) | 1.12M keys/s | same; per-part attribution pending |
 | C++ network front-end (`--net=cpp`, opt-in) vs Go | read P50 154 vs 286 µs, poll read throughput 194K vs 177K ops/s; read P99 ~3.0 vs 1.8 ms, batch writes ~12% lower | same, measured before disk reads moved off the loop; not faster overall |
+| Durable single-key Put, adaptive vs fixed group commit, 15 ms window | 1 writer P50 16.0 ms → 0.45 ms (63 → 2.2K writes/s); 64 writers 4.0K → 37.5K writes/s, P99 16.8 → 2.6 ms; 256 writers 15.3K → 74K writes/s; same writes per fdatasync | macOS, **emulated 300 µs fdatasync** (`TestGroupCommit_LatencyTable`); 2 ms sync: 64 writers 3.5K → 11.7K |
 | Native index vs Go map, 5M keys | full GC 21 → 0.27 ms, settled RSS 168 → 142 B/key, ~19 ns more per cache-miss lookup | engine benchmark |
 
 Reproduce the CI rows with `scripts/net-bench.sh` or the `Net front-end`

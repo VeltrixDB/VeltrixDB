@@ -11,6 +11,16 @@ Releases are cut automatically on every merge to `main` (GitHub release +
 
 ## [Unreleased]
 
+### Performance
+
+- Adaptive group commit (`--group-commit=adaptive`, the new default; `fixed`
+  restores the old behaviour). The WAL / VLog flush windows become upper
+  bounds: a lone writer is synced immediately and concurrent writers after an
+  idle gap of about one fdatasync. With an emulated 300 µs sync and the 15 ms
+  default window, a single writer's Put P50 drops from 16 ms to 0.45 ms and 64
+  writers go from 4.0K to 37.5K durable writes/s (P99 16.8 → 2.6 ms) at the
+  same writes per fdatasync.
+
 ### Added
 
 - Vector search: multiple namespaces on the wire (`VSET id NS ns ...`,

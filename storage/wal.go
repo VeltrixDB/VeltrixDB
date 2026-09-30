@@ -70,6 +70,8 @@ type WriteAheadLog struct {
 	flushWindow  time.Duration // 0 = flush immediately after channel drain
 	maxBatch     int           // max entries per flush (safety cap)
 	diskIdx      int           // for log prefixes
+	// pacer decides when an open batch is flushed (group_commit.go).
+	pacer *commitPacer
 	// legacyText writes the pre-binary pipe-delimited records instead of the
 	// binary format (wal_format.go). Rollback insurance only: an older build
 	// cannot read binary records. Set before the first append.
@@ -105,6 +107,7 @@ func newWriteAheadLog(
 	flushWindow time.Duration,
 	maxBatch int,
 	diskIdx int,
+	groupCommit string, // GroupCommitAdaptive ("" means the same) or GroupCommitFixed
 ) (*WriteAheadLog, error) {
 	if err := os.MkdirAll(walDir, 0755); err != nil {
 		return nil, fmt.Errorf("wal dir %s: %w", walDir, err)
@@ -128,6 +131,7 @@ func newWriteAheadLog(
 		flushWindow: flushWindow,
 		maxBatch:    maxBatch,
 		diskIdx:     diskIdx,
+		pacer:       newCommitPacer(groupCommit, flushWindow),
 	}
 	// Seed the durable offset with the pre-existing file size (crash-recovery
 	// content or a prior checkpoint) so the archiver can copy it too.
@@ -386,7 +390,9 @@ func (wal *WriteAheadLog) flusher() {
 		}
 
 		if writeErr == nil {
-			writeErr = fdatasync(int(wal.file.Fd()))
+			t0 := time.Now()
+			writeErr = groupCommitSync(int(wal.file.Fd()))
+			wal.pacer.observe(len(pending), time.Since(t0))
 		}
 
 		// Give the record buffers back now that their bytes have been written.
@@ -445,51 +451,32 @@ func (wal *WriteAheadLog) flusher() {
 		return pendingRecords >= wal.maxBatch
 	}
 
-	var (
-		timer  *time.Timer
-		timerC <-chan time.Time
-	)
-
-	startTimer := func() {
-		if wal.flushWindow > 0 && timer == nil {
-			timer = time.NewTimer(wal.flushWindow)
-			timerC = timer.C
-		}
-	}
-	stopTimer := func() {
-		if timer != nil {
-			timer.Stop()
-			timer = nil
-			timerC = nil
-		}
-	}
+	// bt fires when the open batch must be flushed: the window deadline in
+	// fixed mode, the idle gap (bounded by the deadline) in adaptive mode.
+	var bt batchTimer
 
 	for {
 		select {
 		case item := <-wal.appendCh:
 			pending = append(pending, item)
 			pendingRecords += item.n
-			// Start window timer on the first entry of a new batch.
-			startTimer()
 			// Drain whatever is already in the channel without blocking.
 			full := drain()
-
-			// Flush immediately if: no window configured, or max batch reached.
-			if wal.flushWindow == 0 || full {
-				stopTimer()
+			// Flush now (no window, batch full, or a lone writer in adaptive
+			// mode), or (re)arm the batch timer.
+			if wal.pacer.schedule(&bt, len(pending), full) {
+				bt.stop()
 				flush()
 			}
-			// Otherwise wait for the timer to fire (more writers may arrive).
 
-		case <-timerC:
-			// Window expired — flush everything that accumulated.
-			timer = nil
-			timerC = nil
+		case <-bt.C:
+			// Idle gap or window expired — flush everything that accumulated.
+			bt.stop()
 			flush()
 
 		case <-wal.doneCh:
 			// Shutdown: stop timer, drain channel, flush final batch.
-			stopTimer()
+			bt.stop()
 		drainFinal:
 			for {
 				select {

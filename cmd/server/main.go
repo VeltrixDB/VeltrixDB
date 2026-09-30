@@ -167,8 +167,13 @@ func main() {
 	cacheMB := flag.Uint("cache", 256, "LIRS cache size in MB (ignored when --auto-tune is set)")
 	gcThreshold := flag.Float64("gc-threshold", 0.30,
 		"VLog dead-space ratio that triggers compaction (0.0–1.0).\n\tLower = more frequent but smaller GC passes. Default 0.30.")
+	groupCommit := flag.String("group-commit", "adaptive",
+		"How the WAL/VLog flush windows are used:\n"+
+			"\tadaptive (default): the window is an upper bound — a lone writer is synced at once,\n"+
+			"\tconcurrent writers are synced after an idle gap of about one fdatasync.\n"+
+			"\tfixed: every batch waits the full window (the pre-2026-10 behaviour).")
 	walWindowMs := flag.Int("wal-flush-window-ms", 15,
-		"WAL group-commit flush window in milliseconds.\n"+
+		"WAL group-commit flush window in milliseconds (the upper bound in adaptive mode).\n"+
 			"\t15ms (default): ~200 entries/batch at 100K writes/s; matches WriteBatcher window.\n"+
 			"\t5ms: lower latency but fewer entries/fdatasync; use for latency-sensitive workloads.\n"+
 			"\tMust match --vlog-flush-window-ms (Invariant 20).")
@@ -391,6 +396,10 @@ func main() {
 	cfg.VLogFlushWindowMs = *vlogWindowMs
 	cfg.WALMaxBatchEntries = *walMaxBatch
 	cfg.WALFormat = *walFormat
+	if *groupCommit != storage.GroupCommitAdaptive && *groupCommit != storage.GroupCommitFixed {
+		log.Fatalf("--group-commit must be %s or %s, got %q", storage.GroupCommitAdaptive, storage.GroupCommitFixed, *groupCommit)
+	}
+	cfg.GroupCommit = *groupCommit
 	cfg.DefragThreshold = *gcThreshold
 	cfg.EncryptionEnabled = *encryptAtRest
 	cfg.EncryptionKeyPath = *encryptKeyPath
@@ -415,6 +424,7 @@ func main() {
 	cfg.WALFlushWindowMs = *walWindowMs
 	cfg.VLogFlushWindowMs = *vlogWindowMs
 	cfg.WALMaxBatchEntries = *walMaxBatch
+	cfg.GroupCommit = *groupCommit
 
 	// Start health server before engine init so the liveness probe never
 	// times out during slow startup (WAL replay, VLog device open, etc.).

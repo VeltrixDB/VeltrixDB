@@ -250,7 +250,7 @@ func NewStorageEngine(cfg *StorageConfig) (*StorageEngine, error) {
 
 	wals := make([]*WriteAheadLog, len(dirs))
 	for i, dir := range dirs {
-		w, err := newWriteAheadLog(dir, metrics.WALFlushes, flushWindow, maxBatch, i)
+		w, err := newWriteAheadLog(dir, metrics.WALFlushes, flushWindow, maxBatch, i, cfg.GroupCommit)
 		if err != nil {
 			for j := 0; j < i; j++ {
 				wals[j].close()
@@ -292,7 +292,7 @@ func NewStorageEngine(cfg *StorageConfig) (*StorageEngine, error) {
 			if i < len(rawDevices) {
 				raw = rawDevices[i]
 			}
-			vl, err := newVLog(i, dir, raw, vlogWindow)
+			vl, err := newVLog(i, dir, raw, vlogWindow, cfg.GroupCommit)
 			if err != nil {
 				for j := 0; j < i; j++ {
 					vlogs[j].close()
