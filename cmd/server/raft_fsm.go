@@ -71,6 +71,9 @@ const (
 	opRPop
 	opSAdd
 	opSRem
+
+	// Appended, never inserted: fsmOp values are persisted in the Raft log.
+	opVDel
 )
 
 // fsmTxnOp is one operation inside an opTxn command.
@@ -280,6 +283,11 @@ func (f *raftFSM) applyOne(c fsmCmd) error {
 		f.deliver(c.ReqID, fsmResult{err: err})
 		return nil
 
+	case opVDel:
+		err := f.engine.DeleteVector(c.Ns, c.Key)
+		f.deliver(c.ReqID, fsmResult{err: err})
+		return nil
+
 	case opIdxCreate:
 		err := f.engine.CreateFieldIndex(c.Key, c.Field)
 		f.deliver(c.ReqID, fsmResult{err: err})
@@ -400,15 +408,10 @@ func (f *raftFSM) Restore(data []byte) error {
 			}
 			return fmt.Errorf("raft-fsm restore decode: %w", err)
 		}
+		// Vectors and text documents arrive in a snapshot as plain reserved
+		// KV pairs; the engine's search hooks index them.
 		if err := f.engine.Put(e.Key, e.Value, -1); err != nil {
 			return fmt.Errorf("raft-fsm restore put %q: %w", e.Key, err)
-		}
-		// Vectors arrive in a snapshot as plain "@vec/..." KV pairs; refresh
-		// the in-RAM searchable index too.
-		if storage.IsVectorKey(e.Key) {
-			if err := f.engine.LoadVectorBlob(e.Key, e.Value); err != nil {
-				return fmt.Errorf("raft-fsm restore vector %q: %w", e.Key, err)
-			}
 		}
 	}
 	return nil

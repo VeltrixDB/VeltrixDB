@@ -500,6 +500,121 @@ jobs:
             --sha    "${{ github.sha }}" \
             --branch "${{ github.ref_name }}"
 
+  # ── Node 7: search regression ─────────────────────────────────────────────
+  # Vector / text / hybrid search has three kinds of regression that the
+  # functional suites above do not catch on their own, so they get one job:
+  #   1. quality — recall@10 gates on a fixed clustered dataset (float32,
+  #      ef=256, int8 + re-rank, filtered graph path, after 40 % deletes) and
+  #      a labelled BM25 / RRF corpus. A change that returns worse results
+  #      while every assertion-style test still passes fails here. Recall
+  #      numbers are written to the job summary.
+  #   2. concurrency — the search, hook, routing and signing tests under -race.
+  #   3. distributed — a real 3-process replicated cluster with a cluster
+  #      secret: writes through one node are searchable from the others,
+  #      unsigned node-to-node requests get 401, and a killed node fails a
+  #      search loudly before the failure detector drops it.
+  node-7-search:
+    name: "Node 7 — search regression (quality gates + 3-node cluster)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: record start time
+        id: t0
+        run: echo "ts=$(date +%s)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.21"
+          cache: true
+
+      # Same reason as node-1: every Put fdatasyncs; tmpfs makes that cheap.
+      # TMPDIR is set per step, never at job level (setup-go runs `go env`
+      # before this mount exists).
+      - name: mount tmpfs for test scratch
+        run: |
+          sudo mkdir -p /mnt/veltrix-tmp
+          sudo mount -t tmpfs -o size=1G,mode=1777 tmpfs /mnt/veltrix-tmp
+          df -h /mnt/veltrix-tmp
+
+      - name: quality gates (recall / ranking)
+        env:
+          TMPDIR: /mnt/veltrix-tmp
+        run: |
+          set -o pipefail
+          CGO_ENABLED=0 go test -v -timeout 300s -count=1 \
+            -run 'TestSearchQualityGate' ./storage/ \
+            2>&1 | tee /tmp/search-quality.txt
+          {
+            echo "### Search quality gates"
+            echo '```'
+            grep -E 'recall@[0-9]+ =' /tmp/search-quality.txt | sed -E 's/^ *search_quality_test.go:[0-9]+: //'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # -race needs cgo, and cgo on Linux compiles the storage package's C++
+      # shims, which include liburing headers (see node-5). The C++ engine
+      # itself stays off, as in node-5.
+      - name: install liburing
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends liburing-dev
+
+      - name: search, hooks, routing, signing under -race
+        env:
+          TMPDIR: /mnt/veltrix-tmp
+          VELTRIXDB_DISABLE_CGO_ENGINE: "1"
+        run: |
+          set -o pipefail
+          CGO_ENABLED=1 go test -race -v -timeout 600s -count=1 \
+            -run 'HNSW|Vector|Text|Tokenize|Hybrid|Search|IndexDef|ReservedKeys|Secondary|FieldIndex|RoutingKey|TransferAuth|Fanout|Distributed|RaftFSM_NamespaceHashVector' \
+            ./storage/ ./cluster/ ./cmd/server/ \
+            2>&1 | tee /tmp/search-race.txt
+
+      - name: build server binary
+        run: CGO_ENABLED=0 go build -o /tmp/veltrixdb ./cmd/server
+
+      - name: 3-node cluster search end-to-end
+        env:
+          VELTRIX_SERVER_BIN: /tmp/veltrixdb
+          TMPDIR: /mnt/veltrix-tmp
+        run: |
+          set -o pipefail
+          CGO_ENABLED=0 go test -v -timeout 300s -count=1 \
+            -run 'TestSearchCluster' ./tests/integration/ \
+            2>&1 | tee /tmp/search-e2e.txt
+
+      - name: summarise failures
+        if: failure()
+        run: |
+          echo "───────── FAILED TESTS ─────────"
+          grep -hE '^--- FAIL|^\s+--- FAIL|_test\.go:[0-9]+:' /tmp/search-*.txt | head -60 \
+            || echo "(no --- FAIL lines found)"
+          echo "────────────────────────────────"
+
+      - name: upload test output
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: search-regression-output
+          path: /tmp/search-*.txt
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: push CI metrics
+        if: always()
+        env:
+          PUSH_GW_URL: ${{ secrets.PUSH_GW_URL }}
+        run: |
+          bash scripts/push-ci-metrics.sh \
+            --job    "node-7-search" \
+            --start  "${{ steps.t0.outputs.ts }}" \
+            --status "${{ job.status }}" \
+            --run-id "${{ github.run_id }}" \
+            --sha    "${{ github.sha }}" \
+            --branch "${{ github.ref_name }}"
+
   # ── bench: packing density + GC emergency hard gates ──────────────────────
   bench:
     name: "Bench — density + GC gates + paper-changes microbench"

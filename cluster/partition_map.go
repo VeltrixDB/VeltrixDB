@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -640,7 +641,67 @@ func (chr *ConsistentHashRing) GetNodeWithReplicas(hash uint64, count int) ([]st
 
 // hashKey computes hash of a key
 func hashKey(key string) uint64 {
-	return hashValue(key)
+	return hashValue(RoutingKey(key))
+}
+
+// Reserved derived-index key prefixes (defined by the storage package).
+const (
+	vectorKeyPrefix = "@vec/" // "@vec/<ns>/<id>"  — persisted vector
+	textKeyPrefix   = "@txt/" // "@txt/<ns>/<id>"  — persisted text document
+	indexKeyPrefix  = "@idx/" // "@idx/<rule>/<value>/<primary>" — secondary index entry
+)
+
+// RoutingKey is the string a key is placed on the ring by. Derived-index
+// keys route as the record they describe, so a record, its vector, its text
+// document and its secondary-index entries always live on the same node and
+// a node can evaluate a search filter against its own data:
+// "@vec/<ns>/<id>" and "@txt/<ns>/<id>" route as <id>,
+// "@idx/<rule>/<value>/<primary>" as <primary>. Every other key routes as
+// itself.
+func RoutingKey(key string) string {
+	if len(key) < 5 || key[0] != '@' {
+		return key
+	}
+	skip := 0 // path components to drop after the prefix
+	switch key[:5] {
+	case vectorKeyPrefix, textKeyPrefix:
+		skip = 1
+	case indexKeyPrefix:
+		skip = 2
+	default:
+		return key
+	}
+	rest := key[5:]
+	for ; skip > 0; skip-- {
+		i := strings.IndexByte(rest, '/')
+		if i < 0 {
+			return key // malformed: route as-is
+		}
+		rest = rest[i+1:]
+	}
+	if rest == "" {
+		return key
+	}
+	return rest
+}
+
+// SearchPeers returns the IDs of every non-failed member except localID —
+// the nodes a distributed search fans out to.
+func (pm *PartitionMap) SearchPeers(localID string) []string {
+	pm.mu.RLock()
+	defer pm.mu.RUnlock()
+	var out []string
+	for id, n := range pm.Nodes {
+		if id == localID {
+			continue
+		}
+		if st, ok := n.State.Load().(NodeState); ok && st == NodeStateFailed {
+			continue
+		}
+		out = append(out, id)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // HashKey is the exported key-hash used by GetNodeForKey / the consistent-hash
@@ -649,7 +710,7 @@ func hashKey(key string) uint64 {
 // reaches the identical owner node the server would pick — enabling client-side
 // routing that matches the server exactly.
 func HashKey(key string) uint64 {
-	return hashValue(key)
+	return hashValue(RoutingKey(key))
 }
 
 // hashValue computes FNV-1a and passes it through a 64-bit finalizer.

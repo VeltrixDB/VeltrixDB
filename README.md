@@ -149,6 +149,8 @@ print(db.get("user:1001"))  # alice
 | **Durability** | Group-commit WAL (binary, CRC32C-checksummed records), fdatasync amortization, crash recovery via WAL replay |
 | **Atomic ops** | CAS, INCR, DECR, SETNX — shard-locked RMW, safe under concurrency |
 | **Data types** | Keys with TTL, hash fields with per-field TTL, namespaces |
+| **Vector search** | HNSW (cosine), multiple namespaces, optional int8 quantization (~4× less vector RAM, exact re-rank from disk), metadata filters, background tombstone compaction |
+| **Full-text / hybrid** | BM25 inverted index (Unicode tokenizer), hybrid vector + text search fused by Reciprocal Rank Fusion; searches fan out across cluster nodes |
 | **Replication** | Raft consensus, async / quorum / strong modes, anti-entropy |
 | **Transactions** | Optimistic MVCC with vector clocks |
 | **Security** | AES-256-GCM at-rest encryption, RBAC, mTLS, append-only audit log |
@@ -265,9 +267,14 @@ The bundled cluster-aware client (`client.NewClient`) discovers topology
 (`TOPOLOGY` command / `/admin/cluster`), routes each key with the same
 consistent hash the server uses, and follows `MOVED` redirects to the leader.
 
-**Not yet routed through the distributed layer:** namespace, hash-field,
-vector, secondary-index, and query operations apply locally only in raft/
-replicated modes. Plain KV + atomic + TXN are fully wired.
+Namespace, hash-field, list/set, vector and text writes route through the
+coordinator in every mode (see [ARCHITECTURE.md](ARCHITECTURE.md)).
+Vector, text and hybrid searches, `QUERY` and `IDXQUERY` fan out to every
+node, and `IDXCREATE` / `IDXDROP` replicate in both raft and replicated mode.
+Node-to-node traffic (key migration and distributed search) can be signed
+with a shared secret: `--cluster-secret-file` (or `VELTRIXDB_CLUSTER_SECRET`)
+on every node; without it, or mTLS, that listener is unauthenticated and the
+server logs a warning.
 
 ---
 
@@ -282,7 +289,46 @@ PING            → PONG
 INFO            → keys=N writes=N reads=N ...
 AUTH user pass  → OK
 QUIT            → BYE
+
+VCREATE ns dim [QUANT none|int8]                             → OK
+VSET id [NS ns] f1 f2 ...                                    → OK
+VSEARCH k [NS ns] [EF n] [FILTER field op value] f1 f2 ...   → "id score" lines, END
+VDEL id [NS ns]                                              → OK
+
+TSET id [NS ns] TEXT free text ...                           → OK
+TDEL id [NS ns]                                              → OK
+TSEARCH k [NS ns] [FILTER field op value] QUERY free text    → "id score" lines, END
+HSEARCH k [NS ns] [EF n] [ALPHA a] [CAND n] [FILTER field op value]
+        [VEC f1 ... fn] QUERY free text                      → "id rrf-score" lines, END
 ```
+
+**Vectors.** `NS` defaults to `default`; a namespace's dimension is fixed by
+its first `VSET` or by `VCREATE`. `VCREATE ... QUANT int8` keeps int8 codes in
+RAM (dim + 4 bytes per vector instead of 4 × dim) and re-ranks the top 4 × k
+graph candidates against the full float32 vectors, which are persisted in the
+VLog either way; running it on an existing namespace re-encodes it.
+
+**Text.** `TSET` indexes a document for BM25 (lowercased letter/digit runs, no
+stemming or stop words). One id names one record across all of these: `PUT
+doc-42 {"lang":"en"}`, `VSET doc-42 ...` and `TSET doc-42 ...` describe the
+same thing, and `HSEARCH` fuses the vector and text rankings of a namespace by
+reciprocal rank (`ALPHA` = vector weight, default 0.5; `CAND` = candidates per
+list, default max(50, 4k)). Either half may be omitted.
+
+**Filters.** `FILTER` is a `QUERY` predicate (`= != > < >= <= contains`) on the
+ordinary KV record whose key equals the vector id — e.g. `PUT doc-42
+{"lang":"en"}` next to `VSET doc-42 ...`. An `=` filter on a field with an
+`IDXCREATE` index is served from the index (exact scan when ≤ 2048 ids
+match); other filters are checked during the graph walk. The same filter
+works on `TSEARCH` and `HSEARCH`.
+
+**Clusters.** Search writes go through the normal replicated / Raft write
+path. The ring places a record's vector, text and index entries on the
+record's own node, so after a rebalance each node filters its own records;
+searches run on every non-failed node and are merged (BM25 is scored with
+cluster-wide statistics). `--search-fanout=false` keeps searches local;
+`--search-timeout-ms` bounds each peer, and a peer that misses it is left out
+of the result.
 
 ### Binary (used by all SDKs, auto-detected)
 
@@ -295,6 +341,10 @@ Response: [1B status][4B payloadLen][payload]
 Single:  0x01=PUT  0x02=GET  0x03=DEL  0x04=PING  0x05=INFO
 Batch:   0x06=MPUT 0x07=MGET
 Atomic:  0x18=CAS  0x19=INCR 0x1A=DECR 0x1B=SETNX
+Vector:  0x26=VSET 0x27=VSEARCH (namespace "default")
+         0x08=VSETNS 0x1E=VSEARCHX (namespace, ef, filter) 0x1F=VDEL
+Search:  0x1C=SEARCH, sub-op in the 2-byte field: 1=VCREATE 2=TSET 3=TDEL
+         4=TSEARCH 5=HSEARCH (layouts in cmd/server/ext_ops.go)
 Status:  0x00=OK   0x01=ERR  0x02=NOT_FOUND
 ```
 
@@ -361,7 +411,8 @@ These are real gaps. We'd rather you know them upfront:
 - **CDC is in-process only.** Events lost if `repl-ship` is down. Durable WAL-tail mode is future work.
 - **Raft reads are local (possibly stale).** `raft` mode gives linearizable *writes* (quorum commit) but reads are served from local applied state — there is no read-index / lease-read path yet.
 - **Replicated mode is not linearizable.** `replicated` mode is primary-copy replication for durability across copies; it has no single-writer ordering, so concurrent writers to the same key are not linearizable. Use `raft` mode when you need write linearizability.
-- **Non-KV ops are node-local in cluster modes.** Namespace, hash-field, vector, secondary-index, and query operations are not routed through Raft/replication yet — only plain KV + atomic + TXN are.
+- **Distributed searches ask every node.** Each vector / text / hybrid search, `QUERY` and `IDXQUERY` runs on all non-failed nodes, so its cost grows with the cluster. If a peer does not answer within `--search-timeout-ms`, the request fails and names it — until the failure detector marks it failed — unless `--search-allow-partial` is set.
+- **Search indexes live in RAM.** Vectors (float32 or int8 codes), graph edges and the BM25 inverted index are held in memory and rebuilt from the persisted keys at startup; the full-precision vectors and document text stay on NVMe.
 
 See [docs/redis-comparison.md](docs/redis-comparison.md) for a full feature-by-feature comparison.
 

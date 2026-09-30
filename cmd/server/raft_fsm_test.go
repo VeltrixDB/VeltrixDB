@@ -252,6 +252,14 @@ func TestRaftFSM_NamespaceHashVectorOps(t *testing.T) {
 	if err != nil || len(matches) != 1 || matches[0].ID != "v1" {
 		t.Fatalf("vsearch = %+v err=%v, want v1", matches, err)
 	}
+	apply(fsmCmd{Op: opVDel, Ns: "fsmvecs", Key: "v1"})
+	matches, err = f.engine.SearchVector("fsmvecs", []float32{0.9, 0.1, 0}, 2)
+	if err != nil || len(matches) != 1 || matches[0].ID != "v2" {
+		t.Fatalf("vsearch after opVDel = %+v err=%v, want only v2", matches, err)
+	}
+	if _, err := f.engine.Get(storage.VectorPersistKey("fsmvecs", "v1")); err == nil {
+		t.Fatal("opVDel left the persisted @vec key behind")
+	}
 
 	// Secondary index create → visible via lookup after an NS write; then drop.
 	apply(fsmCmd{Op: opIdxCreate, Key: "bycity", Field: "city"})

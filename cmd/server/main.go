@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"crypto/tls"
 	"encoding/binary"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -43,6 +44,18 @@ const (
 	binCmdMPut = 0x06 // vectorized multi-put  (batch frame)
 	binCmdMGet = 0x07 // vectorized multi-get  (batch frame)
 	binCmdAuth = 0x09 // AUTH: [1B 0x09][2B userLen][4B passLen][user][pass]
+
+	// Namespaced / filtered vector ops. They take the free slots below 0x29
+	// because protocol sniffing (handleConn) treats a first byte above
+	// binCmdGetVer as the text protocol: 0x2A+ is printable ASCII.
+	// Frame layouts are documented on their handlers in ext_ops.go.
+	binCmdVSetNS   = 0x08 // VSETNS:   [1B][2B idLen][4B dim] + [2B nsLen] + ns + id + dim×4B float32 LE
+	binCmdVSearchX = 0x1E // VSEARCHX: [1B][2B k][4B dim] + [2B nsLen][2B ef][2B fieldLen][2B opLen][2B valLen] + ns+field+op+value + dim×4B
+	binCmdVDel     = 0x1F // VDEL:     [1B][2B idLen][4B nsLen] + ns + id
+	// SEARCH: [1B][2B subop][4B payloadLen] + payload of [4B len][bytes] fields.
+	// One opcode multiplexes the text / hybrid / namespace ops (subop list in
+	// ext_ops.go) — the free slots below 0x29 are nearly used up.
+	binCmdSearch = 0x1C
 
 	// Namespace commands (0x0A–0x0F).
 	// All NS frames use a 9-byte header: [1B cmd][2B nsLen LE][2B keyLen LE][4B aux LE]
@@ -204,6 +217,18 @@ func main() {
 	autoRebalance := flag.Bool("auto-rebalance", true,
 		"In distributed modes, automatically rebalance the partition ring and migrate\n"+
 			"\tkeys to their new owners when nodes join, leave, or fail.")
+	searchFanoutFlag := flag.Bool("search-fanout", true,
+		"In distributed modes, run vector / text / hybrid searches on every node and\n"+
+			"\tmerge (needed once a rebalance has partitioned the keys). false = local only.")
+	searchTimeoutMs := flag.Int("search-timeout-ms", 2000,
+		"Per-peer timeout for one distributed search phase.")
+	searchAllowPartial := flag.Bool("search-allow-partial", false,
+		"Return a distributed search / QUERY / IDXQUERY result without the peers that\n"+
+			"\tfailed or timed out (logged). Default: fail the request and name them.")
+	clusterSecretFile := flag.String("cluster-secret-file", "",
+		"File holding the shared secret that signs (HMAC-SHA256) every request on the\n"+
+			"\ttransfer listener: key migration and distributed search. Same file on every\n"+
+			"\tnode. Env VELTRIXDB_CLUSTER_SECRET is used when this is empty.")
 	consistencyFlag := flag.String("consistency", "eventual",
 		"Replicated-mode write consistency: eventual|quorum|strong.\n"+
 			"\teventual: ACK after local write (async replication).\n"+
@@ -624,6 +649,23 @@ func main() {
 		if terr != nil {
 			log.Fatalf("transfer agent: %v", terr)
 		}
+		// Distributed search rides the transfer listener (and its TLS).
+		ta.Handle(searchPath, newSearchHandler(engine))
+		secret, serr := loadClusterSecret(*clusterSecretFile)
+		if serr != nil {
+			log.Fatalf("cluster secret: %v", serr)
+		}
+		if len(secret) > 0 {
+			ta.SetClusterSecret(secret)
+			log.Printf("[transfer] requests signed with the cluster secret")
+		} else if transferTLS == nil || !transferTLS.RequireClientCert {
+			log.Printf("[transfer] WARNING: listener %s is unauthenticated (no --cluster-secret-file and no mTLS): "+
+				"anyone who can reach it can write keys and run searches", tAddr)
+		}
+		coord.ta = ta
+		coord.searchFanout = *searchFanoutFlag
+		coord.searchAllowPartial = *searchAllowPartial
+		coord.searchTimeout = time.Duration(*searchTimeoutMs) * time.Millisecond
 		if terr := ta.Start(); terr != nil {
 			log.Fatalf("transfer agent: %v", terr)
 		}
@@ -1721,60 +1763,209 @@ func handleTextConn(conn net.Conn, br *bufio.Reader, engine *storage.StorageEngi
 				}
 				limit, _ = strconv.Atoi(full[4])
 			}
-			keys := engine.LookupBySecondary(full[1], full[2])
-			for i, k := range keys {
-				if limit > 0 && i >= limit {
-					break
-				}
+			keys, err := coord.IdxQuery(full[1], full[2], limit)
+			if err != nil {
+				writeLine("ERR " + err.Error())
+				continue
+			}
+			for _, k := range keys {
 				writeLine(k)
 			}
 			writeLine("END")
 
-		// ── Vector index (namespace "default") ─────────────────────────────
-		// VSET <key> <f1> <f2> ... — dimension fixed by the first VSET.
+		// ── Vector index ────────────────────────────────────────────────────
+		// VSET <key> [NS <ns>] <f1> <f2> ... — namespace "default" unless NS
+		// is given; a namespace's dimension is fixed by its first VSET.
 		case "VSET":
 			if err := ca.Check(security.PermWrite); err != nil {
 				writeLine("ERR " + err.Error())
 				continue
 			}
+			const usage = "ERR usage: VSET <key> [NS <ns>] <f1> <f2> ..."
 			full := strings.Fields(line)
 			if len(full) < 3 {
-				writeLine("ERR usage: VSET <key> <f1> <f2> ...")
+				writeLine(usage)
 				continue
 			}
-			vec, err := parseFloats(full[2:])
+			ns, rest := defaultVectorNS, full[2:]
+			if strings.ToUpper(rest[0]) == "NS" {
+				if len(rest) < 3 {
+					writeLine(usage)
+					continue
+				}
+				ns, rest = rest[1], rest[2:]
+			}
+			vec, err := parseFloats(rest)
 			if err != nil {
 				writeLine("ERR " + err.Error())
 				continue
 			}
-			if err := coord.VSet(defaultVectorNS, full[1], vec); err != nil {
+			if err := coord.VSet(ns, full[1], vec); err != nil {
 				writeLine("ERR " + err.Error())
 			} else {
 				writeLine("OK")
 			}
 
-		// VSEARCH <k> <f1> <f2> ...  →  "id score" lines + END
+		// VSEARCH <k> [NS <ns>] [EF <n>] [FILTER <field> <op> <value>] <f1> <f2> ...
+		//   →  "id score" lines + END
+		// FILTER is a QUERY predicate on the KV record whose key is the id.
 		case "VSEARCH":
 			if err := ca.Check(security.PermRead); err != nil {
 				writeLine("ERR " + err.Error())
 				continue
 			}
+			const usage = "ERR usage: VSEARCH <k> [NS <ns>] [EF <n>] [FILTER <field> <op> <value>] <f1> <f2> ..."
 			full := strings.Fields(line)
 			if len(full) < 3 {
-				writeLine("ERR usage: VSEARCH <k> <f1> <f2> ...")
+				writeLine(usage)
 				continue
 			}
 			k, err := strconv.Atoi(full[1])
 			if err != nil || k < 0 {
-				writeLine("ERR usage: VSEARCH <k> <f1> <f2> ...")
+				writeLine(usage)
 				continue
 			}
-			query, err := parseFloats(full[2:])
+			ns, opts, rest, ok := parseVSearchOpts(full[2:])
+			if !ok {
+				writeLine(usage)
+				continue
+			}
+			query, err := parseFloats(rest)
 			if err != nil {
 				writeLine("ERR " + err.Error())
 				continue
 			}
-			matches, err := engine.SearchVector(defaultVectorNS, query, k)
+			matches, err := coord.VSearch(ns, query, k, opts)
+			if err != nil {
+				writeLine("ERR " + err.Error())
+				continue
+			}
+			for _, m := range matches {
+				writeLine(fmt.Sprintf("%s %g", m.ID, m.Score))
+			}
+			writeLine("END")
+
+		// VDEL <key> [NS <ns>]
+		case "VDEL":
+			if err := ca.Check(security.PermWrite); err != nil {
+				writeLine("ERR " + err.Error())
+				continue
+			}
+			full := strings.Fields(line)
+			ns := defaultVectorNS
+			switch {
+			case len(full) == 2:
+			case len(full) == 4 && strings.ToUpper(full[2]) == "NS":
+				ns = full[3]
+			default:
+				writeLine("ERR usage: VDEL <key> [NS <ns>]")
+				continue
+			}
+			if err := coord.VDel(ns, full[1]); err != nil {
+				writeLine("ERR " + err.Error())
+			} else {
+				writeLine("OK")
+			}
+
+		// VCREATE <ns> <dim> [QUANT none|int8] — create / reconfigure a vector
+		// namespace (int8: ~4× less RAM, full-precision re-rank from disk).
+		case "VCREATE":
+			if err := ca.Check(security.PermWrite); err != nil {
+				writeLine("ERR " + err.Error())
+				continue
+			}
+			const usage = "ERR usage: VCREATE <ns> <dim> [QUANT none|int8]"
+			full := strings.Fields(line)
+			quant := ""
+			switch {
+			case len(full) == 3:
+			case len(full) == 5 && strings.ToUpper(full[3]) == "QUANT":
+				quant = full[4]
+			default:
+				writeLine(usage)
+				continue
+			}
+			dim, err := strconv.Atoi(full[2])
+			if err != nil {
+				writeLine(usage)
+				continue
+			}
+			if err := coord.VCreate(full[1], dim, quant); err != nil {
+				writeLine("ERR " + err.Error())
+			} else {
+				writeLine("OK")
+			}
+
+		// ── Full-text (BM25) and hybrid search ─────────────────────────────
+		// TSET <id> [NS <ns>] TEXT <free text to end of line>
+		case "TSET":
+			if err := ca.Check(security.PermWrite); err != nil {
+				writeLine("ERR " + err.Error())
+				continue
+			}
+			const usage = "ERR usage: TSET <id> [NS <ns>] TEXT <text>"
+			toks := tokenOffsets(line)
+			if len(toks) < 3 {
+				writeLine(usage)
+				continue
+			}
+			id, ns, i := toks[1].s, defaultVectorNS, 2
+			if strings.ToUpper(toks[i].s) == "NS" && i+2 < len(toks) {
+				ns, i = toks[i+1].s, i+2
+			}
+			if strings.ToUpper(toks[i].s) != "TEXT" {
+				writeLine(usage)
+				continue
+			}
+			text := strings.TrimLeft(line[toks[i].off+len(toks[i].s):], " \t")
+			if err := coord.TSet(ns, id, text); err != nil {
+				writeLine("ERR " + err.Error())
+			} else {
+				writeLine("OK")
+			}
+
+		// TDEL <id> [NS <ns>]
+		case "TDEL":
+			if err := ca.Check(security.PermWrite); err != nil {
+				writeLine("ERR " + err.Error())
+				continue
+			}
+			full := strings.Fields(line)
+			ns := defaultVectorNS
+			switch {
+			case len(full) == 2:
+			case len(full) == 4 && strings.ToUpper(full[2]) == "NS":
+				ns = full[3]
+			default:
+				writeLine("ERR usage: TDEL <id> [NS <ns>]")
+				continue
+			}
+			if err := coord.TDel(ns, full[1]); err != nil {
+				writeLine("ERR " + err.Error())
+			} else {
+				writeLine("OK")
+			}
+
+		// TSEARCH <k> [NS <ns>] [FILTER <field> <op> <value>] QUERY <text>
+		// HSEARCH <k> [NS <ns>] [EF <n>] [ALPHA <a>] [CAND <n>] [FILTER <field> <op> <value>]
+		//         [VEC <f1> ... <fn>] QUERY <text>
+		//   →  "id score" lines + END (HSEARCH scores are RRF scores)
+		case "TSEARCH", "HSEARCH":
+			if err := ca.Check(security.PermRead); err != nil {
+				writeLine("ERR " + err.Error())
+				continue
+			}
+			sq, err := parseTextSearch(line, cmd == "HSEARCH")
+			if err != nil {
+				writeLine("ERR " + err.Error())
+				continue
+			}
+			var matches []storage.VectorMatch
+			if cmd == "TSEARCH" {
+				matches, err = coord.TSearch(sq.ns, sq.query, sq.k, sq.opts.Filter)
+			} else {
+				matches, err = coord.HSearch(sq.ns, sq.vec, sq.query, sq.k, sq.opts)
+			}
 			if err != nil {
 				writeLine("ERR " + err.Error())
 				continue
@@ -1818,7 +2009,7 @@ func handleTextConn(conn net.Conn, br *bufio.Reader, engine *storage.StorageEngi
 					continue
 				}
 			}
-			entries, err := engine.QueryNS(ns, field, op, value, limit)
+			entries, err := coord.Query(ns, field, op, value, limit)
 			if err != nil {
 				writeLine("ERR " + err.Error())
 				continue
@@ -1829,7 +2020,7 @@ func handleTextConn(conn net.Conn, br *bufio.Reader, engine *storage.StorageEngi
 			writeLine("END")
 
 		default:
-			writeLine("ERR unknown command: " + cmd + " (supported: AUTH PUT GET DEL INFO PING QUIT NSPUT NSGET NSDEL NSDROP NSSCAN NSLIST HSET HGET HDEL HGETALL HKEYS HLEN HEXPIRE HTTL RANGE SCANCUR TXN VER IDXCREATE IDXDROP IDXQUERY VSET VSEARCH QUERY)")
+			writeLine("ERR unknown command: " + cmd + " (supported: AUTH PUT GET DEL INFO PING QUIT NSPUT NSGET NSDEL NSDROP NSSCAN NSLIST HSET HGET HDEL HGETALL HKEYS HLEN HEXPIRE HTTL RANGE SCANCUR TXN VER IDXCREATE IDXDROP IDXQUERY VSET VSEARCH VDEL VCREATE TSET TDEL TSEARCH HSEARCH QUERY)")
 		}
 	}
 }
@@ -1856,6 +2047,163 @@ func parseRangeTail(toks []string) (limit int, reverse, ok bool) {
 		return 0, false, false
 	}
 	return limit, reverse, true
+}
+
+// parseVSearchOpts consumes VSEARCH's optional NS / EF / FILTER clauses (any
+// order, each at most once) and returns the remaining (float) tokens.
+func parseVSearchOpts(toks []string) (ns string, opts storage.VectorSearchOptions, rest []string, ok bool) {
+	ns = defaultVectorNS
+	seen := map[string]bool{}
+	for len(toks) > 0 {
+		kw := strings.ToUpper(toks[0])
+		if seen[kw] {
+			return "", opts, nil, false
+		}
+		switch kw {
+		case "NS":
+			if len(toks) < 2 {
+				return "", opts, nil, false
+			}
+			ns, toks = toks[1], toks[2:]
+		case "EF":
+			if len(toks) < 2 {
+				return "", opts, nil, false
+			}
+			ef, err := strconv.Atoi(toks[1])
+			if err != nil || ef < 0 {
+				return "", opts, nil, false
+			}
+			opts.Ef, toks = ef, toks[2:]
+		case "FILTER":
+			if len(toks) < 4 || !storage.IsQueryOp(toks[2]) {
+				return "", opts, nil, false
+			}
+			opts.Filter = &storage.VectorFilter{Field: toks[1], Op: toks[2], Value: toks[3]}
+			toks = toks[4:]
+		default:
+			return ns, opts, toks, len(toks) > 0
+		}
+		seen[kw] = true
+	}
+	return "", opts, nil, false // no query vector
+}
+
+// lineToken is one whitespace-delimited token and its byte offset in the line.
+type lineToken struct {
+	s   string
+	off int
+}
+
+// tokenOffsets splits line like strings.Fields, keeping offsets so a
+// command can take "the rest of the line" verbatim (TSET's text).
+func tokenOffsets(line string) []lineToken {
+	var out []lineToken
+	start := -1
+	for i := 0; i <= len(line); i++ {
+		sp := i == len(line) || line[i] == ' ' || line[i] == '\t'
+		if sp && start >= 0 {
+			out = append(out, lineToken{line[start:i], start})
+			start = -1
+		} else if !sp && start < 0 {
+			start = i
+		}
+	}
+	return out
+}
+
+// textSearchArgs is a parsed TSEARCH / HSEARCH line.
+type textSearchArgs struct {
+	k     int
+	ns    string
+	query string
+	vec   []float32
+	opts  storage.HybridOptions
+}
+
+// parseTextSearch parses TSEARCH (hybrid=false) or HSEARCH lines.
+func parseTextSearch(line string, hybrid bool) (textSearchArgs, error) {
+	usage := errors.New("usage: TSEARCH <k> [NS <ns>] [FILTER <field> <op> <value>] QUERY <text>")
+	if hybrid {
+		usage = errors.New("usage: HSEARCH <k> [NS <ns>] [EF <n>] [ALPHA <a>] [CAND <n>] [FILTER <field> <op> <value>] [VEC <f1> ... <fn>] QUERY <text>")
+	}
+	toks := tokenOffsets(line)
+	a := textSearchArgs{ns: defaultVectorNS}
+	if len(toks) < 2 {
+		return a, usage
+	}
+	// TSEARCH k=0 returns every match (as the binary protocol and the engine
+	// do); fusion needs a bound, so HSEARCH requires k > 0.
+	k, err := strconv.Atoi(toks[1].s)
+	if err != nil || k < 0 || (hybrid && k == 0) {
+		return a, usage
+	}
+	a.k = k
+	num := func(i int) (int, bool) {
+		if i >= len(toks) {
+			return 0, false
+		}
+		n, err := strconv.Atoi(toks[i].s)
+		return n, err == nil && n >= 0
+	}
+	seen := map[string]bool{}
+	for i := 2; i < len(toks); {
+		kw := strings.ToUpper(toks[i].s)
+		if seen[kw] {
+			return a, usage
+		}
+		seen[kw] = true
+		switch {
+		case kw == "QUERY":
+			a.query = strings.TrimLeft(line[toks[i].off+len(toks[i].s):], " \t")
+			if !hybrid && !storage.HasSearchTerms(a.query) {
+				return a, errors.New("query has no searchable terms")
+			}
+			return a, nil
+		case kw == "NS" && i+1 < len(toks):
+			a.ns, i = toks[i+1].s, i+2
+		case kw == "FILTER" && i+3 < len(toks) && storage.IsQueryOp(toks[i+2].s):
+			a.opts.Filter = &storage.VectorFilter{Field: toks[i+1].s, Op: toks[i+2].s, Value: toks[i+3].s}
+			i += 4
+		case hybrid && kw == "EF":
+			n, ok := num(i + 1)
+			if !ok {
+				return a, usage
+			}
+			a.opts.Ef, i = n, i+2
+		case hybrid && kw == "CAND":
+			n, ok := num(i + 1)
+			if !ok {
+				return a, usage
+			}
+			a.opts.Candidates, i = n, i+2
+		case hybrid && kw == "ALPHA" && i+1 < len(toks):
+			f, err := strconv.ParseFloat(toks[i+1].s, 64)
+			if err != nil {
+				return a, usage
+			}
+			a.opts.Alpha, i = &f, i+2
+		case hybrid && kw == "VEC":
+			j := i + 1
+			for j < len(toks) && strings.ToUpper(toks[j].s) != "QUERY" {
+				j++
+			}
+			vs := make([]string, 0, j-i-1)
+			for _, t := range toks[i+1 : j] {
+				vs = append(vs, t.s)
+			}
+			v, err := parseFloats(vs)
+			if err != nil {
+				return a, err
+			}
+			a.vec, i = v, j
+		default:
+			return a, usage
+		}
+	}
+	if hybrid && len(a.vec) > 0 {
+		return a, nil // vector-only hybrid query
+	}
+	return a, usage
 }
 
 // parseFloats converts VSET/VSEARCH float tokens to []float32.
@@ -2485,8 +2833,9 @@ func handleBinaryConn(conn net.Conn, br *bufio.Reader, engine *storage.StorageEn
 			continue
 		}
 
-		// ── Extended ops (0x20–0x29): range scans, TXN, indexes, vectors ───
-		if cmd >= binCmdRange && cmd <= binCmdGetVer {
+		// ── Extended ops (0x20–0x29, 0x08, 0x1C, 0x1E, 0x1F): range scans, TXN,
+		// indexes, vectors ────────────────────────────────────────────────
+		if (cmd >= binCmdRange && cmd <= binCmdGetVer) || cmd == binCmdVSetNS || cmd == binCmdVSearchX || cmd == binCmdVDel || cmd == binCmdSearch {
 			if err := handleExtOp(cmd, keyLen, valLen, br, bw, engine, ca, coord); err != nil {
 				return
 			}

@@ -33,7 +33,8 @@ package storage
 //   PSCAN  pred=price-under-100  prefix=item/  limit=100  →  []key
 //   PFILTER  pred=price-under-100  keys=[k1,k2,k3]  →  []bool
 //
-// (PSCAN/PFILTER wire-protocol verbs are reserved at 0x1C/0x1D — wire-up is
+// (PSCAN/PFILTER: 0x1D is the one free binary opcode left — 0x1C became the
+// SEARCH multiplexer, whose sub-op scheme can carry both — wire-up is
 // noted as future work; the engine API below is ready.)
 
 import (

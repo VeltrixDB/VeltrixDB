@@ -172,7 +172,7 @@ func TestHNSW_EngineIntegration(t *testing.T) {
 	<-eng.ReplayDone
 	defer eng.Close()
 
-	ns := fmt.Sprintf("it-%d", rand.Int()) // global registry — unique per run
+	ns := "it"
 	if err := eng.RegisterVectorNamespace(ns, 3); err != nil {
 		t.Fatal(err)
 	}

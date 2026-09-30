@@ -53,11 +53,18 @@ var indexRuleCount atomic.Int32
 func indexRulesActive() bool { return indexRuleCount.Load() > 0 }
 
 // isInternalIndexKey reports whether key belongs to an engine-internal
-// keyspace (secondary-index entries, persisted vectors) that must never be
+// keyspace (secondary-index entries and definitions, persisted vectors, text
+// documents, vector namespace settings) that must never be
 // secondary-indexed itself.
 func isInternalIndexKey(key string) bool {
+	if len(key) == 0 || key[0] != '@' {
+		return false
+	}
 	return strings.HasPrefix(key, secondaryIndexPrefix) ||
-		strings.HasPrefix(key, vectorKeyPrefix)
+		strings.HasPrefix(key, vectorKeyPrefix) ||
+		strings.HasPrefix(key, textKeyPrefix) ||
+		strings.HasPrefix(key, vectorNSConfigPrefix) ||
+		strings.HasPrefix(key, indexDefPrefix)
 }
 
 // IndexRule is one secondary-index extraction rule.
@@ -126,11 +133,22 @@ func secondaryKeysFor(primary string, value []byte) []string {
 }
 
 // LookupBySecondary returns primary keys whose secondary entry matches
-// (rule, value). Internally scans "@idx/<rule>/<value>/*" via shard walk.
+// (rule, value). Scans "@idx/<rule>/<value>/*" on the ordered key index in
+// O(log N + matches) when it is enabled, else via an O(N) shard walk.
 // Result order is unspecified.
 func (se *StorageEngine) LookupBySecondary(rule, value string) []string {
 	prefix := fmt.Sprintf("%s%s/%s/", secondaryIndexPrefix, rule, escape(value))
 	var out []string
+	if oi := se.index.ordered; oi != nil {
+		// The ordered index holds exactly the live keys (ordered_index.go).
+		// prefix ends in '/', so bumping that byte bounds the prefix range.
+		end := prefix[:len(prefix)-1] + string(rune('/'+1))
+		oi.ascend(prefix, end, func(k string) bool {
+			out = append(out, k[len(prefix):])
+			return true
+		})
+		return out
+	}
 	for i := range se.index.shards {
 		shard := &se.index.shards[i]
 		shard.mu.RLock()

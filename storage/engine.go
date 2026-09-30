@@ -111,6 +111,12 @@ type StorageEngine struct {
 	fieldIdxMu   sync.Mutex
 	fieldIdxDefs []FieldIndexDef
 
+	// vectors / texts hold this engine's in-RAM search indexes, one per
+	// namespace (vector_index.go, text_index.go), kept in sync with their
+	// reserved keys by search_hooks.go. Zero values are ready to use.
+	vectors vectorRegistry
+	texts   textRegistry
+
 	// diskHealth holds one consecutive-error breaker per disk; a tripped
 	// breaker fails writes fast and reports the node degraded (disk_health.go).
 	diskHealth []diskHealth
@@ -814,6 +820,9 @@ func (se *StorageEngine) Put(key string, value []byte, ttl int32) error {
 	if maintainIdx {
 		se.applySecondaryIndexes(key, oldIdxVal, value)
 	}
+	if isSearchKey(key) {
+		se.onSearchKeyPut(key, value)
+	}
 	return nil
 }
 
@@ -1105,6 +1114,9 @@ func (se *StorageEngine) Delete(key string) error {
 	// Remove the deleted key's secondary-index entries (diff against nil).
 	if maintainIdx && oldIdxVal != nil {
 		se.applySecondaryIndexes(key, oldIdxVal, nil)
+	}
+	if isSearchKey(key) {
+		se.onSearchKeyDelete(key)
 	}
 	return nil
 }
