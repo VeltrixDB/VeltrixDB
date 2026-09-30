@@ -1,0 +1,3 @@
+# compare.sh output and docker-compose data volumes
+results/
+data/
