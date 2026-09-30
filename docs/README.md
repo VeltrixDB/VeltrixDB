@@ -12,6 +12,7 @@ Technical documentation for VeltrixDB internals.
 | [partitioning.md](partitioning.md) | Consistent hash ring; virtual nodes; partition assignment; rebalancing; data migration via TransferAgent |
 | [node-lifecycle.md](node-lifecycle.md) | Node failover (leader election timeline); node addition; graceful removal; crash detection and recovery |
 | [backup-restore.md](backup-restore.md) | Full and incremental backup; cloud backup (S3/GCS/Azure); restore procedure; backup safety guarantees |
+| [vector-search.md](vector-search.md) | Vector, full-text and hybrid search: commands, float32 / int8 / PQ / disk-graph layouts, filters, clusters, restarts, measured recall / latency / RAM |
 
 ## Existing Docs
 
@@ -20,7 +21,9 @@ Technical documentation for VeltrixDB internals.
 | [DR_RUNBOOK.md](DR_RUNBOOK.md) | Disaster recovery runbook; encryption key rotation; data corruption recovery |
 | [SOC2_CONTROLS.md](SOC2_CONTROLS.md) | SOC 2 compliance controls |
 | [TESTING_GUIDE.md](TESTING_GUIDE.md) | How to run unit, cgo/native-index, `netfront/`, integration and e2e tests; what each CI job runs |
-| [../BENCHMARKING.md](../BENCHMARKING.md) | Bench harness gates; `scripts/net-bench.sh` front-end and storage-configuration comparison |
+| [../BENCHMARKING.md](../BENCHMARKING.md) | Bench harness gates; `scripts/net-bench.sh`; group-commit table; vector benchmarks |
+| [../BENCHMARK_RESULTS.md](../BENCHMARK_RESULTS.md) | Every measured number with its conditions (June 2026 YCSB; October 2026 group commit, YCSB, vectors, stability) |
+| [../bench/compare/README.md](../bench/compare/README.md) | Same-hardware harness: VeltrixDB vs Aerospike vs ScyllaDB (go-ycsb), `vecbench` |
 | [../cpp/README.md](../cpp/README.md) | What in `cpp/` is actually reachable from Go (most of it is not) |
 
 ## Quick Reference
@@ -50,3 +53,9 @@ Technical documentation for VeltrixDB internals.
 | Value transform (compress/encrypt) | `storage/engine.go` — `transformForWrite` |
 | Transform-metadata repair | `storage/repair.go`, `cmd/veltrix-repair/main.go` |
 | Platform fdatasync split | `storage/fdatasync_linux.go`, `storage/fdatasync_other.go` |
+| Group commit pacing (adaptive / fixed) | `storage/group_commit.go` |
+| Vector index (HNSW, int8, PQ, disk graph) | `storage/hnsw.go`, `storage/hnsw_pq.go`, `storage/pq.go`, `storage/vector_index.go`, `storage/vector_adj.go` |
+| Full-text and hybrid search | `storage/text_index.go`, `storage/hybrid.go` |
+| Search index sync + startup rebuild | `storage/search_hooks.go` |
+| Distributed search, cluster signing | `cmd/server/search_fanout.go`, `cluster/partition_transfer.go` |
+| Derived-key routing | `cluster/partition_map.go` — `RoutingKey` |

@@ -2,31 +2,52 @@
 
 ---
 
-## The Most Important Knob: Flush Windows
+## The Most Important Knob: Group Commit
 
-WAL and VLog both use group-commit. N writes arriving within the window share one `fdatasync`.
+WAL and VLog both use group commit: concurrent writes share one `fdatasync`.
+Every write is acknowledged only after the sync that covers it.
+
+**Adaptive (default, `--group-commit=adaptive`).** The flush window is an
+upper bound, not a wait. A writer that is alone is synced at once (latency ≈
+one fdatasync). When writers are concurrent, a batch stays open until no new
+write has arrived for about one fdatasync, or the window expires, or the
+batch cap is reached. Measured with an emulated 300 µs device sync, 15 ms
+window (`TestGroupCommit_LatencyTable`, macOS):
+
+| Writers | Fixed 15 ms window | Adaptive |
+|--|--|--|
+| 1 | P50 16.0 ms, 63 writes/s | P50 0.45 ms, 2,186 writes/s |
+| 8 | P50 16.0 ms, 501 writes/s | P50 0.96 ms, 8,283 writes/s |
+| 64 | P50 15.9 ms, P99 16.8 ms, 4,053 writes/s | P50 1.7 ms, P99 2.6 ms, 37,504 writes/s |
+| 256 | P99 33.2 ms, 15,291 writes/s | P99 11.5 ms, 73,999 writes/s |
+
+Batches are as large as in fixed mode (64 writes per sync at 64 writers), so
+adaptive does not cost more IOPS under load. With a 2 ms sync (slow or network
+disk) 64 writers go 3,541 → 11,691 writes/s.
+
+**Fixed (`--group-commit=fixed`).** The pre-2026-10 behaviour: every batch
+waits the whole window. Only useful if you depend on its exact batching.
 
 **Rule: `-wal-flush-window-ms` and `-vlog-flush-window-ms` must always be equal.**
+In adaptive mode the window only bounds how long a busy batch may stay open;
+the default 15 ms is fine for almost everything. In fixed mode:
 
 ```
 writes/s ≈ goroutines × (1000 / window_ms)
 ```
 
-| Goal | Window | P99 write |
+| Goal (fixed mode) | Window | P99 write |
 |------|--------|-----------|
 | Lowest latency (low concurrency) | 0 ms | ~0.2 ms |
 | Low latency | 2 ms | ~2.2 ms |
 | 100K+ writes/s | **5 ms** | ~5.2 ms |
-| **Default (balance)** | **15 ms** | ~15.2 ms |
+| Former default | **15 ms** | ~15.2 ms |
 | Maximum throughput | 20 ms | ~20.2 ms |
 
-P99 figures are Linux NVMe. **Do not size against a macOS measurement** — on
-Darwin the engine calls plain `fsync(2)`, which returns at the drive cache in
-~0.02 ms and does not flush it. See ARCHITECTURE.md, "Durability".
-
-```bash
-./veltrixdb --wal-flush-window-ms 5 --vlog-flush-window-ms 5
-```
+P99 figures in the fixed table are Linux NVMe. **Do not size against a macOS
+measurement** — on Darwin the engine calls plain `fsync(2)`, which returns at
+the drive cache in ~0.02 ms and does not flush it (the adaptive table above
+emulates the sync cost for that reason). See ARCHITECTURE.md, "Durability".
 
 ---
 
@@ -174,6 +195,28 @@ histogram_quantile(0.99, rate(veltrixdb_storage_read_latency_seconds_bucket[5m])
 
 ---
 
+## Vector and Text Search
+
+Details and all measurements: [docs/vector-search.md](docs/vector-search.md).
+
+| Knob | Effect (GloVe-100, 100K words, recall@10 / p50, one query at a time, macOS) |
+|--|--|
+| `VSEARCH ... EF n` | ef 64: 0.842 / 0.25 ms · ef 128: 0.906 / 0.42 ms · ef 256: 0.953 / 0.77 ms · ef 512: 0.983 / 1.43 ms (float32) |
+| `VCREATE ... QUANT int8` | same recall as float32, ~⅓ of the vector RAM; re-ranks 4 × k from disk (+0.1–0.3 ms at this size) |
+| `VCREATE ... QUANT pq [PQM m]` | −2 to −3 points of recall, ~⅐ of float32's RAM at 768-dim; re-ranks the whole beam from disk. More `PQM` = better recall, more RAM |
+| `VCREATE ... GRAPH disk` | moves layer-0 edges (≈97 % of edge memory) to a mapped file; recall unchanged within noise |
+| `IDXCREATE` on filter fields | `=` filters served from the index instead of one read per candidate |
+| `--search-fanout=false` | searches stay local — only correct while every node holds every record |
+
+RAM per 768-dim vector (heap, measured): float32 3.4 KB, int8 1.1 KB, pq
+(m = 96) 0.49 KB, pq + disk graph 0.38 KB + 0.22 KB mapped.
+
+The search indexes are rebuilt at startup and searches are refused until the
+rebuild finishes (`INFO` → `search_ready`); plan restarts of large namespaces
+accordingly.
+
+---
+
 ## Common Problems
 
 | Symptom | Check | Fix |
@@ -183,3 +226,8 @@ histogram_quantile(0.99, rate(veltrixdb_storage_read_latency_seconds_bucket[5m])
 | GC not running | `vlog_gc_skipped_paused_total` rising | Wait 4 min for stale EWMA to clear |
 | `reads_total = 0` with traffic | Old binary | Update — the missing metrics call is fixed |
 | False failure alerts (single node) | `fd.SetLocalNode` not called | Fix before `fd.Start()` in your cluster setup |
+| Writes slow at low concurrency (≈ window per write) | `--group-commit=fixed` set | Use the default `adaptive` |
+| `search indexes are still rebuilding after restart` | `INFO` shows `search_ready=0 search_loaded=x/y` | Wait for the rebuild, or `--search-allow-partial` if incomplete results are acceptable |
+| `search incomplete: N of M peers did not answer` | the named peer is down or slow; not yet marked failed | Retry after the failure detector marks it, raise `--search-timeout-ms`, or `--search-allow-partial` |
+| `[transfer] WARNING: listener ... is unauthenticated` | no `--cluster-secret-file` and no mTLS | Set the same secret file on every node |
+| PQ namespace uses as much RAM as float32 | fewer than `PQTRAIN` vectors, codebook not trained yet | Expected until the threshold; lower `PQTRAIN` (≥ 256) for small namespaces |

@@ -5,7 +5,7 @@ This document maps VeltrixDB's built-in capabilities to the SOC 2 Trust Service 
 | TSC | Criterion summary | VeltrixDB capability | Operator obligation |
 |-----|---|---|---|
 | CC6.1 | Logical access controls | RBAC (`-auth-config`), per-namespace tenancy, mTLS (`-tls-cert`/`-tls-key`/`-tls-ca`) | Provision unique users per service, rotate credentials, deny network ingress to admin port |
-| CC6.6 | Restrict data transmission to authorized parties | TLS 1.3 listener (`-tls-addr`), mTLS client cert verification | Use mTLS in production; load only signed certs |
+| CC6.6 | Restrict data transmission to authorized parties | TLS 1.3 listener (`-tls-addr`), mTLS client cert verification; inter-node transfer listener (key migration + distributed search) signed with HMAC-SHA256 via `-cluster-secret-file`, or cluster mTLS | Use mTLS in production; load only signed certs; set the same cluster secret on every node (the server logs a warning when the transfer listener is unauthenticated) |
 | CC6.7 | Encrypted data at rest | AES-256-GCM at rest (`EncryptionEnabled=true`); key sourced from `VELTRIXDB_ENCRYPTION_KEY` env or `EncryptionKeyPath` file | Manage the master key in KMS / sealed secret; never commit key material to source. PITR archive segments hold values decrypted — encrypt and access-restrict the archive location |
 | CC6.8 | Anti-malware / image hygiene | Single-binary distribution; `Dockerfile` runtime stage is `gcr.io/distroless/cc-debian12` (glibc, no shell) | Scan published images (Trivy / Snyk); pin SHA256 in Helm chart |
 | CC7.1 | Detection of vulnerabilities | `govulncheck` runs in CI (`.github/workflows/ci.yml`) | Triage vulncheck output weekly; subscribe to Go security mailing list |

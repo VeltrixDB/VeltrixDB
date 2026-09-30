@@ -138,7 +138,9 @@ otherwise deletes would leave bits set forever and the false-positive rate
 would climb.
 
 **WAL** — group-commit: N writes share one `write(2)` and one `fdatasync`.
-Default 15 ms window. One WAL per disk. Records are binary and checksummed
+Adaptive by default (`storage/group_commit.go`): the 15 ms window is an upper
+bound — a lone writer is synced at once, concurrent writers after an idle gap
+of about one fdatasync; the VLog flusher uses the same pacer. One WAL per disk. Records are binary and checksummed
 (see the write path); a `MultiPut` enqueues one item per batch, not one per
 key.
 
@@ -377,6 +379,41 @@ Compare with `scripts/net-bench.sh` (see BENCHMARKING.md) on the target
 hardware; a Mac cannot show a difference, since loopback caps round trips at
 ~60K/s for both.
 
+## Search subsystem
+
+Vector, full-text and hybrid search are derived state over reserved keys
+(user guide: [docs/vector-search.md](docs/vector-search.md)).
+
+```
+PUT / Delete / MultiPut of a reserved key
+   @vec/<ns>/<id>   float32 blob ──► HNSW index of <ns>   (hnsw.go, vector_index.go)
+   @txt/<ns>/<id>   UTF-8 text  ──► BM25 index of <ns>    (text_index.go)
+   @vecns/<ns>      settings    ──► create / re-encode <ns> (quant, pq_m, graph)
+   @idxdef/<name>   field       ──► CreateFieldIndex / DropFieldIndex
+        │
+        └── storage/search_hooks.go runs after the write commits, so replication,
+            raft apply, snapshot restore and partition transfer all index correctly
+```
+
+- **HNSW** (M = 16, 32 on layer 0, efConstruction = 200): diversity-heuristic
+  neighbour selection, deletes as tombstones compacted in the background once
+  they pass 30 %, inserts planned under the read lock and linked under the
+  write lock, updates as tombstone + fresh node.
+- **Quantization:** int8 codes (dim + 4 B) or product quantization (m B,
+  k-means codebooks trained in the background); searches re-rank candidates
+  against the float32 vectors read back with one parallel MultiGet.
+- **Disk graph:** layer-0 adjacency as 132-byte records in an unlinked,
+  memory-mapped scratch file (`vector_adj.go`).
+- **Text:** BM25 inverted index; hybrid = weighted reciprocal-rank fusion of
+  the two lists (`hybrid.go`).
+- **Startup:** `RebuildSearchIndexes` applies `@vecns/` settings, then loads
+  vectors and documents on all cores; until it finishes searches return
+  `ErrSearchRebuilding` (`INFO` → `search_ready`).
+- **Cluster:** `cluster.RoutingKey` routes the derived keys as their record;
+  `cmd/server/search_fanout.go` fans searches out over the transfer listener
+  (HMAC-signed with `--cluster-secret-file`), sums BM25 statistics first, and
+  fails the request if a peer does not answer (`--search-allow-partial`).
+
 ## Cluster
 
 ```
@@ -460,8 +497,10 @@ term/leader, peers, partition epoch, and per-replica replication lag.
 
 ### Remaining gaps
 
-- Replicated-mode secondary-index METADATA (IDXCREATE/IDXDROP) is node-local;
-  raft mode replicates it.
-- QUERY / RANGE / SCANCUR reads are always local in cluster modes.
+- RANGE / SCANCUR reads are local in cluster modes (QUERY, IDXQUERY and the
+  searches fan out; IDXCREATE / IDXDROP replicate in both modes via
+  `@idxdef/` keys).
+- The search indexes are not persisted; each node rebuilds them at startup
+  and refuses searches until done.
 - repl-ship has no back-pressure to the source and only LWW conflict
   resolution.

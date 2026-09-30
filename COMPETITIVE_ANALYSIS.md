@@ -1,5 +1,5 @@
 # VeltrixDB vs Redis vs ScyllaDB vs Aerospike
-**Competitive Performance Analysis — June 2026**
+**Competitive Performance Analysis — June 2026, updated October 2026**
 
 > All VeltrixDB numbers are from actual benchmarks run on AWS EC2 (495 GB RAM, 4× 873 GB NVMe).  
 > Redis, ScyllaDB, and Aerospike numbers are from their official benchmarks and widely-cited third-party tests on comparable hardware.
@@ -17,6 +17,47 @@
 | Redis (AOF always) | 100K–500K ops/sec | 10K–30K ops/sec | 1–3 ms | RAM only |
 | ScyllaDB | 500K–2M ops/sec | 100K–500K ops/sec | <1–5 ms | SSD (TBs) |
 | Aerospike | 500K–2M ops/sec | 100K–500K ops/sec | <1 ms | SSD (TBs) |
+
+The VeltrixDB row is the June 2026 YCSB run; the others are published figures
+from other hardware. Nothing in this table was run side by side.
+
+---
+
+## October 2026 update
+
+What changed since the June tables, and what it measured. These are
+VeltrixDB-only numbers on a macOS laptop (conditions in
+[BENCHMARK_RESULTS.md](BENCHMARK_RESULTS.md#october-2026-measurements)); they
+are **not** a same-hardware comparison and are not substituted into the
+tables below.
+
+| Area | Change | Measured |
+|--|--|--|
+| Durable single-key writes | Adaptive group commit (default): the flush window became an upper bound | emulated 300 µs sync: 1 writer 63 → 2,186 writes/s (P50 16 → 0.45 ms); 64 writers 4.0K → 37.5K writes/s (P99 16.8 → 2.6 ms); 256 writers 15.3K → 74K |
+| KV through the server | go-ycsb workloads via `bench/compare` | C 55K ops/s (P99 0.39 ms), B 52K (0.65 ms), A 35K (1.3 ms), 16 threads, same-host client |
+| Vector search | HNSW rework, int8 / PQ quantization, disk-resident layer-0 graph, filters, cluster fan-out | GloVe-100 100K: recall@10 0.953 at ef = 256, p50 0.77 ms (float32); network, 20K, int8, 8 clients: 24.6K QPS at recall 0.894 |
+| Full-text / hybrid | BM25 inverted index, weighted RRF fusion | functional + ranking gates; no throughput benchmark yet |
+| Cluster reads | new Raft leader waits for its no-op before local reads; searches fail closed on a missing peer | failover read test 20/20 missing writes without the barrier, 0/20 with it |
+
+The durable-write gap to Aerospike and ScyllaDB was mostly the fixed 15 ms
+window; adaptive commit removes that wait. Whether it closes the gap on real
+NVMe is **unmeasured** — that needs `bench/compare/compare.sh` on one Linux
+machine with the durability settings its README lists.
+
+### Search features
+
+| | VeltrixDB | Redis | Aerospike | ScyllaDB |
+|--|--|--|--|--|
+| Vector search | ✅ HNSW in the database (float32 / int8 / PQ, graph in RAM or mapped file) | Redis Stack / RediSearch | Aerospike Vector Search (separate service) | Vector search (ScyllaDB Cloud) |
+| Full-text | ✅ BM25, Unicode tokenizer | RediSearch | — | — |
+| Hybrid vector + text | ✅ reciprocal-rank fusion | RediSearch | — | — |
+| Filter on the record | ✅ QUERY predicates, index-accelerated `=` | ✅ | check vendor docs | check vendor docs |
+| Measured side by side | ❌ not yet | ❌ | ❌ | ❌ |
+
+Competitor columns list products their vendors publish; they were not tested
+here, and "—" means not verified rather than absent. VectorDBBench has no
+Aerospike or ScyllaDB client, so a like-for-like vector comparison with those
+two needs a new driver in `bench/compare/cmd/vecbench`.
 
 ---
 
@@ -176,13 +217,16 @@ Aerospike Enterprise and ScyllaDB Enterprise have licensing costs. VeltrixDB is 
 ## Where VeltrixDB Needs Work
 
 ### 1. Write throughput gap vs Aerospike / ScyllaDB
-18K vs 100K–500K ops/sec for per-key durable writes (YCSB, historical). The WAL group-commit window (5 ms) is the primary bottleneck. Batched writes are a different picture: 8 clients × 1024-key MPUT later measured 1.77M keys/s (4-CPU CI runner, tmpfs, same-host client) and 3.54M keys/s (macOS, 1M-key space). The io_uring write bridge is not the lever: on that CI runner the C++ storage layer with the bridge on measured 1.12M vs 1.77M keys/s with it off, so it is opt-in.
+18K vs 100K–500K ops/sec for per-key durable writes (YCSB, historical). The fixed WAL group-commit window was the primary bottleneck; adaptive group commit (October 2026, above) removes the wait, re-measurement on NVMe pending. Batched writes are a different picture: 8 clients × 1024-key MPUT later measured 1.77M keys/s (4-CPU CI runner, tmpfs, same-host client) and 3.54M keys/s (macOS, 1M-key space). The io_uring write bridge is not the lever: on that CI runner the C++ storage layer with the bridge on measured 1.12M vs 1.77M keys/s with it off, so it is opt-in.
 
 ### 2. Write P99 latency
 47 ms P99 writes vs Aerospike's 1–5 ms (historical YCSB). The fixed flush window added its full length to every durable write. Since 2026-10 group commit is adaptive (`--group-commit=adaptive`, default): with an emulated 300 µs device sync, a lone writer's P50 fell from 16 ms to 0.45 ms and 64 writers went from 4.0K to 37.5K durable writes/s with P99 16.8 → 2.6 ms (`TestGroupCommit_LatencyTable`; emulated sync, not a device measurement). YCSB on NVMe has not been re-run.
 
 ### 3. Maturity
-Aerospike has 15+ years of NVMe optimization. ScyllaDB has been production-hardened for 10+ years. VeltrixDB is newer — the benchmark results show the architecture is correct; production hardening is ongoing.
+Aerospike has 15+ years of NVMe optimization. ScyllaDB has been production-hardened for 10+ years. VeltrixDB is newer. Since October 2026 a nightly workflow runs a 20-minute oracle-checked search soak, 10 SIGKILL/restart cycles and recall gates on real embeddings; there is still no long-running production deployment record.
+
+### 4. Vector search at scale
+Tested to 100K real vectors and 10K at 768-dim. The HNSW graph is rebuilt at every start (searches are refused until it finishes), and graph nodes stay on the Go heap (~280–400 B per vector even with PQ and the disk graph). 10M+ vectors are untested.
 
 ---
 
@@ -204,14 +248,14 @@ VeltrixDB driver. VeltrixDB's own numbers on a real dataset are in
 
 ## Tuning Roadmap to Close the Gap
 
-| Improvement | Expected Write Impact | Status |
+| Improvement | Expected / measured write impact | Status |
 |-------------|----------------------|--------|
 | Adaptive group commit (window = upper bound) | Emulated 300 µs sync: 64 writers 4.0K → 37.5K writes/s, 256 writers 15.3K → 74K | **Default since 2026-10**; YCSB on NVMe pending |
 | WAL window 1 ms + 500 threads | ~50K–80K ops/sec | Configurable now |
 | io_uring write path (C++) | Not a gain so far: C++ storage layer all on (bridge, batch engine, native index) 1.12M vs 1.77M keys/s all off (CI batch writes); per-part attribution pending | Implemented, opt-in (`VELTRIXDB_URING_BRIDGE=on\|sqpoll`) |
 | WAL window 0 ms + io_uring | ~200K–400K ops/sec | Requires testing |
-| Parallel WAL per disk (4 disks) | 4× current | Architecture supports it |
+| Parallel WAL per disk (4 disks) | — | Already the design: one WAL, VLog and flusher per disk |
 
 ---
 
-*VeltrixDB v1.0 · YCSB 0.17.0 · 100M keys · 4× NVMe · 495 GB RAM · June 2026*
+*June tables: VeltrixDB v1.0 · YCSB 0.17.0 · 100M keys · 4× NVMe · 495 GB RAM. October update: macOS laptop, see BENCHMARK_RESULTS.md.*

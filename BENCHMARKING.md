@@ -53,7 +53,9 @@ CONCURRENCY=512 BULK_DUR=120 STRESS_DUR=300 \
 > for `MultiPut`, the ordered-index overwrite skip and the native index, all
 > of which change write-path numbers. The macOS figures also sit on a `fsync`
 > that does not flush the drive cache (see ARCHITECTURE.md, Durability).
-> Re-run before quoting them.
+> Re-run before quoting them. The single-Put rows are fixed-window group
+> commit; the default is now adaptive (see
+> [Durable single-key writes](#durable-single-key-writes-group-commit-table)).
 
 ### macOS M-series (dev)
 | Metric | Value |
@@ -182,3 +184,40 @@ To A/B it yourself:
 ```bash
 EXTRA_SERVER_FLAGS="--disable-ordered-index" ./scripts/bench.sh
 ```
+
+## Durable single-key writes: group commit table
+
+`--group-commit=adaptive` (default) vs `fixed`, with the device's fdatasync
+cost emulated so the result means the same on a laptop as on Linux:
+
+```bash
+VELTRIX_GC_TABLE=1 go test ./storage -run TestGroupCommit_LatencyTable -v
+```
+
+Reference (macOS, emulated 300 µs sync, 15 ms window): 1 writer P50 16 ms →
+0.45 ms; 64 writers 4.0K → 37.5K writes/s, P99 16.8 → 2.6 ms; 256 writers
+15.3K → 74K writes/s. `TestGroupCommit_AdaptiveGates` (every PR) fails if a
+lone writer waits for the window or concurrent writers stop sharing syncs.
+The nightly workflow prints the table in its job summary.
+
+## Vector search
+
+| What | Command | Reference (macOS) |
+|--|--|--|
+| Recall / latency on real embeddings (GloVe-100, 100K) | `scripts/ann-dataset.py glove-100-angular /tmp/ann --train 100000 --test 500` then `VELTRIX_ANN_DIR=/tmp/ann go test ./storage -run TestRealEmbeddings -v -timeout 30m` | float32 recall@10 0.953 at ef = 256, p50 0.77 ms |
+| Over the network, concurrent clients | `go run ./bench/compare/cmd/vecbench -addr HOST:9000 -data /tmp/ann -quant int8 -efs 64,128,256 -threads 16 -out results/` (from `bench/compare`) | 20K, int8, 8 clients: 24.6K QPS at recall 0.894 |
+| RAM per vector at 768-dim | `VELTRIX_VECTOR_MEMORY=1 go test ./storage -run TestVectorMemoryTable -v` | float32 3.4 KB, int8 1.1 KB, pq 0.49 KB, pq + disk 0.38 KB |
+| Recall regression gate (every PR) | `go test ./storage -run TestSearchQualityGate -v` | measured values and gates in the file |
+| HNSW micro-benchmarks | `go test ./storage -run '^$' -bench 'HNSW' -benchtime 2000x` | search 99 µs at 20K × 128, 6 allocs |
+
+All numbers and conditions: [docs/vector-search.md](docs/vector-search.md#measured-performance).
+
+## Against Aerospike and ScyllaDB (same hardware)
+
+`bench/compare/compare.sh` runs go-ycsb workloads A–F through a VeltrixDB
+driver and go-ycsb's Aerospike and Cassandra (ScyllaDB) drivers, one database
+at a time on the same machine, and writes `results/<ts>/summary.md`. Read
+[bench/compare/README.md](bench/compare/README.md) first — in particular the
+durability settings, which differ by default between the three. No shared
+run has been published yet; the Aerospike / ScyllaDB paths are compile-checked
+only.

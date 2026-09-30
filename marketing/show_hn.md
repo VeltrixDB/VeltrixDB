@@ -16,6 +16,8 @@ YCSB 0.17.0 on a single AWS EC2 node (4× NVMe), 100M keys, 200 threads:
 - Value-log GC emergency runs: 0
 - Write amplification: ~1.0×
 
+Vector, BM25 and hybrid search are built in (HNSW with float32 / int8 / product quantization). On GloVe-100, first 100K words: recall@10 0.953 at ef = 256 with a 0.77 ms median, one query at a time on a laptop. No same-hardware comparison with other vector databases yet.
+
 An earlier internal 3-node GKE run reached 7.2M reads/s / 1.8M writes/s, but it has not been reproduced with a published harness, so treat it as unverified.
 
 "GC" in the list above is the value-log garbage collector: zero emergency runs means space reclamation kept up with the write rate. On the Go side, cgo builds keep the key index off the Go heap; with 5M keys a full Go GC takes 0.27 ms instead of 21 ms, at ~19 ns extra per cache-miss lookup.

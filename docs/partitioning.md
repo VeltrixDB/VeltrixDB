@@ -43,7 +43,7 @@ type ConsistentHashRing struct {
 key = "user:42"
     │
     ▼
-hash = FNV-1a("user:42")   →   uint64 hash value
+hash = FNV-1a(RoutingKey("user:42"))   →   uint64 hash value
     │
     ▼
 Binary search in sortedKeys for first virtualNode hash >= key hash
@@ -57,6 +57,14 @@ nodeID = virtualNodes[foundHash]              →  "node-2"
     ▼
 Route request to node-2
 ```
+
+`RoutingKey` (`cluster/partition_map.go`) is the key itself, except for
+derived search keys, which route as the record they belong to:
+`@vec/<ns>/<id>` and `@txt/<ns>/<id>` route as `<id>`, and
+`@idx/<rule>/<value>/<id>` as `<id>`. A rebalance therefore keeps a record,
+its vector, its text document and its secondary-index entries on one node,
+so each node can evaluate search filters on its own data. Server and cluster
+client use the same function.
 
 ### PartitionMap
 
@@ -179,6 +187,12 @@ Fan out to destination nodes in parallel:
 ```
 
 **Safety guarantee**: `Put` on destination happens before `Delete` on source. If the HTTP POST fails, keys are NOT deleted locally — the next `MigrateToNewOwners()` call retries.
+
+**Pinned keys**: `@vecns/<ns>` (vector namespace settings) and `@idxdef/<name>` (secondary-index definitions) are needed on every node, so they are *copied* to each destination — sent first in its batch — and never deleted locally.
+
+**Search indexes follow the keys**: the destination's `Put` and the source's `Delete` run the engine's search hooks, so migrated vectors and documents become searchable on the new owner and disappear from the old one. (Before these hooks, migrated vectors stayed searchable on the source and were unsearchable on the destination.)
+
+**Authentication**: with `--cluster-secret-file` (or `VELTRIXDB_CLUSTER_SECRET`) every request on the transfer listener — `/transfer/keys` and the distributed-search endpoint `/internal/search` — carries an HMAC-SHA256 over time, method, path and body, and is refused (HTTP 401) if it does not verify or is more than 5 minutes off the receiver's clock. `/transfer/health` stays open. Without a secret or mTLS the server logs that the listener is unauthenticated.
 
 **Concurrency**: Each destination node receives its batch in a separate goroutine. A cluster-wide migration is parallel across all `N-1` destination nodes simultaneously.
 

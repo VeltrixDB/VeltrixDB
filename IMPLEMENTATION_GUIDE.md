@@ -111,6 +111,8 @@ On Linux, the backing array has extra bytes for alignment padding. Storing the f
 
 Both default to 15 ms. The PUT path submits to both concurrently and waits for `max(WAL_wait, VLog_wait)`. If the windows differ, the shorter one finishes first but the caller still waits for the longer one — you get the latency cost of the longer window with no throughput benefit from the shorter one.
 
+With the default adaptive group commit (`storage/group_commit.go`) the window is only an upper bound: a lone writer is synced immediately and concurrent writers after an idle gap of about one fdatasync. Both flushers use the same pacer, so they still finish a batch at about the same time. `TestGroupCommit_AdaptiveGates` fails if a lone writer waits for the window or concurrent writers stop sharing syncs.
+
 ### 9. VLog.MarkDead must be called on every overwrite or delete
 
 `MarkDead(valueLen)` increments the dead-byte counter used by `GCRatio()`. Missing this call causes VLog to grow without bound because the GC never thinks there is enough garbage to trigger.
@@ -147,6 +149,22 @@ Do not parse them interchangeably.
 
 ---
 
+
+### 14. Search indexes are updated only by the reserved-key hooks
+
+Vectors (`@vec/`), text documents (`@txt/`), vector namespace settings (`@vecns/`) and replicated index definitions (`@idxdef/`) are ordinary keys; `Put`, `Delete` and `MultiPut` call `onSearchKeyPut` / `onSearchKeyDelete` after the write commits. Never refresh an index next to a Put yourself — the hook already ran, and a second vector insert is an update that leaves a tombstone. A write path that bypasses those three functions must call the hooks.
+
+### 15. Derived keys route as their record
+
+`cluster.RoutingKey` hashes `@vec/<ns>/<id>` and `@txt/<ns>/<id>` as `<id>` and `@idx/<rule>/<value>/<id>` as `<id>`, so a rebalance keeps a record with its vector, text and index entries. `@vecns/` and `@idxdef/` are copied to every node, never moved. Distributed search filters locally and depends on this.
+
+### 16. Distributed search fails closed
+
+A peer that does not answer fails the search (and names the peer) unless `--search-allow-partial`; so does a node whose indexes are still rebuilding after a restart. Do not skip failed peers by default — a partial result looks like a correct one.
+
+### 17. Every read passes `coordinator.readBarrier()`
+
+GET, text MGET, binary MGET and the coalesced binary GET path. In raft mode it makes a newly elected leader wait until its term's no-op is applied, so writes the previous leader acknowledged are visible; with `--linearizable-reads` it runs the ReadIndex fence. A new read path that calls the engine directly loses both.
 ## Key Data Structures
 
 ### IndexEntry (Go, 64 bytes)
@@ -494,7 +512,7 @@ This applies to any nested struct used as a default argument inside a class body
 
 ## Adding a New Command
 
-1. Add a command byte constant in `cmd/server/main.go` (after `cmdAuth = 0x09`)
+1. Add a command byte constant in `cmd/server/main.go`. It must be **≤ 0x29**: the first byte of a connection decides binary vs text, and 0x2A+ is printable ASCII. Only 0x1D is still free — add search-style commands as sub-ops of `SEARCH` (0x1C) instead, and dispatch the new byte to `handleExtOp` explicitly
 2. Add a `handleXxx` function that reads the frame and calls the storage engine
 3. Add the command to the `switch` in the binary protocol dispatch loop
 4. Add `CMD_XXX` to the C++ `VeltrixBatchEngine` if it needs batch processing
@@ -545,4 +563,4 @@ WAL batch size efficiency:
 ```promql
 rate(veltrixdb_storage_writes_total[1m]) / rate(veltrixdb_storage_wal_flushes_total[1m])
 ```
-Target > 100 at 10 ms window + 10K writes/s/disk.
+Target > 100 at 10 ms window + 10K writes/s/disk in fixed mode. In adaptive mode (default) the ratio follows concurrency: ~1 for a lone writer, ~N for N concurrent writers (64 writers → 64 writes per flush measured).

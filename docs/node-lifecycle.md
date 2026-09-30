@@ -52,6 +52,8 @@ T=451 ms node-2's no-op entry ACKed by node-3 (quorum)
 - **Writes to the old leader**: Return `ErrNotLeader`. Clients should retry — a well-behaved client retries with exponential backoff until it finds the new leader.
 - **New writes to `node-2`**: Accepted and committed normally ~450 ms after the old leader went down.
 - **Reads from followers**: Always served from local state (up to the committed `commitIndex`). Stale reads are possible if a follower hasn't received the latest commits yet.
+- **Reads from the new leader**: held until the new leader has applied its term's no-op (typically one heartbeat round, bounded by 2 s), so they include every write the old leader acknowledged. Before this barrier a GET immediately after failover could return "not found" for an acknowledged write (`TestRaftClusterFailover`).
+- **Searches**: fail with `search incomplete: ... did not answer` naming the dead node until the failure detector marks it failed, then run on the remaining nodes (`--search-allow-partial` answers without it straight away).
 
 ### No Data Loss
 

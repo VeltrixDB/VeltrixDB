@@ -11,6 +11,20 @@ Releases are cut automatically on every merge to `main` (GitHub release +
 
 ## [Unreleased]
 
+### Documentation
+
+- New [docs/vector-search.md](docs/vector-search.md): commands, memory
+  layouts, filters, BM25 / hybrid, clusters, restarts, all measured recall /
+  latency / RAM numbers with their conditions.
+- BENCHMARK_RESULTS.md gains an "October 2026 measurements" section (group
+  commit tables, go-ycsb A–F, vectors, stability, CI). README, PERFORMANCE,
+  COMPETITIVE_ANALYSIS, ARCHITECTURE (new "Search subsystem"),
+  IMPLEMENTATION_GUIDE (rules 14–17, opcode limit), BENCHMARKING, the docs/
+  guides, clients/README and the marketing drafts are updated to match.
+- Marketing: the "10× cheaper than Redis" tagline and the "$4K vs $400 per
+  month" line are replaced by the per-key RAM arithmetic (they overstated the
+  saving for small values).
+
 ### Added
 
 - `bench/compare` (separate Go module): go-ycsb runner with a VeltrixDB

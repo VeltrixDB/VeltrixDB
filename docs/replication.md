@@ -120,6 +120,8 @@ if len(e.Command) > 0 {
 
 This is why the first observable effect after a leader election may be a short (≤ 50 ms) delay before writes are accepted — the no-op must commit first.
 
+**Reads on a new leader wait for the no-op too.** Until the no-op is applied, the new leader's state machine may not yet contain entries its predecessor committed and acknowledged. Serving a local GET in that window returned "not found" for an acknowledged write (`TestRaftClusterFailover` failed intermittently this way; nothing was lost). `RaftNode.WaitLeaderApplied` blocks reads on a leader until `lastApplied ≥` its no-op index (≤ `readIndexTimeout`, 2 s); after that it is one atomic load. Followers never wait — their local reads are stale by design; use `--linearizable-reads` for the ReadIndex fence. GET and every MGET path go through the same barrier (`coordinator.readBarrier`). Without it, a unit test missed the acknowledged write in 20 of 20 failovers; with it, 0 of 20.
+
 ### Persistence
 
 Raft state (`CurrentTerm`, `VotedFor`, log entries) is persisted to `<dataDir>/raft_state.gob` using a **temp-file rename** pattern for atomicity:

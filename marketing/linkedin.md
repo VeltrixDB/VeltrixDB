@@ -37,7 +37,7 @@ If you're paying Redis bills at scale, or running into write amplification issue
 
 We open-sourced VeltrixDB today — a distributed KV database for NVMe SSDs.
 
-The short version: Redis at 1B keys costs ~$4K/month in RAM. The same workload on VeltrixDB costs ~$400/month on NVMe. Write amplification is ~1.0× (vs 10-30× for LSM trees). No compaction rewrites, so no compaction-driven P99 spikes.
+The short version: values live on NVMe and only the index is in RAM (~142 B/key). For 1B keys × 1 KB values that is 142–232 GB of RAM plus ~1.4 TB of NVMe, where an in-memory store needs over 1 TB of RAM — the saving grows with value size and is small for tiny values. Write amplification is ~1.0× (vs 10-30× for LSM trees). No compaction rewrites, so no compaction-driven P99 spikes. Vector, full-text and hybrid search are built in.
 
 Single-node YCSB: 427K reads/s, 18K fsync'd writes/s, zero errors across 100M ops.
 

@@ -223,7 +223,12 @@ The WAL uses a **group commit** pattern to amortise `fdatasync` cost:
 3. The whole batch is written with one `write(2)`, and one `fdatasync` covers it.
 4. All pending callers unblock after the single fdatasync.
 
-Default flush window: **15 ms** (`--wal-flush-window-ms`). At 1000 writes/s, the batch is ~15 entries; at 100K writes/s the batch is ~1500 entries. Both pay one fdatasync.
+**When a batch is flushed** (`storage/group_commit.go`, `--group-commit`):
+
+- **adaptive** (default): the flush window (**15 ms**, `--wal-flush-window-ms`) is only an upper bound. A writer that is alone — the batch holds one request and recent batches held about one — is synced immediately. Otherwise the batch stays open until no request has arrived for an idle gap of about one fdatasync (EWMA, clamped to 20 µs – 2 ms), the window expires, or the batch cap is reached. Requests that arrive during a sync form the next batch.
+- **fixed**: every batch waits the whole window (at 1000 writes/s ~15 entries per batch, at 100K writes/s ~1500).
+
+Measured with an emulated 300 µs sync (macOS): a lone writer's P50 is 0.45 ms adaptive vs 16 ms fixed; 64 writers 37.5K vs 4.0K writes/s at the same 64 writes per fdatasync. The VLog flusher uses the same pacer. Durability is identical: no caller is answered before the fdatasync that covers its bytes.
 
 ### WAL and VLog Concurrency
 
@@ -333,5 +338,7 @@ On unclean shutdown (crash, OOM kill, SIGKILL):
 3. **`applyWALReplay()`** rebuilds the in-memory `shardedIndex`.
 4. For KV-sep records (`vlogOffset > 0`): the VLog already has the value bytes; the WAL entry re-establishes the index pointer without re-reading the value.
 5. Legacy 6-, 7- and 8-field entries are still parsed for backward compatibility. An 8-field record replays with no transform flags, which is correct — it was written before the engine could record them.
+
+**Search indexes** are not in the WAL or the checkpoint as such: vectors, text documents and their settings are ordinary reserved keys (`@vec/<ns>/<id>`, `@txt/<ns>/<id>`, `@vecns/<ns>`, `@idxdef/<name>`), replayed like any key. After replay the server runs `RebuildSearchIndexes` in the background and refuses searches until it finishes (`INFO` → `search_ready`). See [vector-search.md](vector-search.md#durability-and-restarts).
 
 On clean shutdown (`SIGTERM`): the engine writes a compacted checkpoint WAL (one record per live key, tombstones dropped) to `wal.log.ckpt` and atomically renames it over `wal.log`, so a crash mid-checkpoint leaves the old WAL intact. Next startup replays O(numLiveKeys) records instead of the full write history. The checkpoint uses the current `--wal-format`.

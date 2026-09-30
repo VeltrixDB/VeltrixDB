@@ -163,6 +163,9 @@ MultiPut/MultiGet map to Redis pipelines. SETNX, INCR, DECR, CAS are supported.
 | Multi-node replication | ✅ | ✅ (async/quorum/strong) |
 | Change data capture | ❌ built-in | ✅ |
 | Atomic CAS / INCR | ✅ | ✅ |
+| Vector search | ✅ Redis Stack / RediSearch module | ✅ built in: HNSW, float32 / int8 / PQ, disk-resident graph option |
+| Full-text search | ✅ RediSearch module | ✅ built in: BM25 |
+| Hybrid vector + text | ✅ RediSearch module | ✅ reciprocal-rank fusion |
 | SDKs (Go/Python/Node/Rust/C++) | ✅ | ✅ |
 | RESP protocol | ✅ | 🗓 roadmap |
 | Managed cloud offering | ✅ | 🗓 roadmap |

@@ -96,6 +96,8 @@ go run ./cmd/loadtest \
   --num-keys=1000000 --value-size=128 --read-ratio=0.7
 ```
 
+For the WAL / VLog flush path, include `VELTRIX_GC_TABLE=1 go test ./storage -run TestGroupCommit_LatencyTable -v` (adaptive vs fixed with an emulated sync). For vector / text search, run `go test ./storage -run TestSearchQualityGate -v` (recall gates) and, for index or quantization changes, the GloVe-100 recall test (`TestRealEmbeddings`, see [docs/vector-search.md](docs/vector-search.md#how-it-is-tested)).
+
 For network front-end or C++ storage changes, measure on Linux with `scripts/net-bench.sh` or the `Net front-end` workflow (see [BENCHMARKING.md](BENCHMARKING.md)). A Mac cannot show networking gains, because loopback caps round trips at ~60K/s for both front-ends.
 
 ### 4. Keep PRs focused

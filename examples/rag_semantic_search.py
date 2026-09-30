@@ -16,6 +16,12 @@ no dependencies. In production, swap `embed()` for a real model
 (voyage-3, text-embedding-3-small, all-MiniLM-L6-v2, ...) — every other line
 stays the same.
 
+Keyword + semantic retrieval: also store each chunk's text with
+`TSET <key> NS <ns> TEXT <text>` and query with `HSEARCH k NS <ns> VEC ...
+QUERY <question>` (reciprocal-rank fusion of vector and BM25 results). Large
+corpora can use `VCREATE <ns> <dim> QUANT pq` to cut vector RAM ~7×. See
+docs/vector-search.md.
+
 Run:  python3 rag_semantic_search.py [host] [port]     (default 127.0.0.1 9000)
 """
 import hashlib

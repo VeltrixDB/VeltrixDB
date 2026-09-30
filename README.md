@@ -5,7 +5,7 @@
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 [![GitHub Stars](https://img.shields.io/github/stars/VeltrixDB/veltrixdb?style=social)](https://github.com/VeltrixDB/veltrixdb/stargazers)
 
-**NVMe-native distributed key-value database. 427K reads/s measured (YCSB). ~1× write amplification by design. Kubernetes-first.**
+**NVMe-native distributed key-value database with built-in vector, full-text and hybrid search. 427K reads/s measured (YCSB). ~1× write amplification by design. Kubernetes-first.**
 
 An in-memory store keeps every value in RAM. VeltrixDB keeps values on NVMe and only the index in RAM:
 ~142 B/key (plus ~90 B/key for the ordered index unless disabled). At 1 KB values that is roughly 4–7× less RAM;
@@ -38,16 +38,26 @@ echo -e "PUT hello world\nGET hello\nPING" | nc localhost 9000
 > with a published harness, so we no longer lead with it. The YCSB numbers
 > above are the ones you can reproduce today with `scripts/bench.sh`.
 
-**Single node (Linux NVMe):**
+**Single node (Linux NVMe), historical — pure-Go path, fixed group-commit window:**
 
 | Operation | P50 | P99 |
 |-----------|-----|-----|
 | GET — cache hit | 0.05 ms | 0.28 ms (~1.4M reads/s) |
-| PUT — 15 ms flush window (default) | 5 ms | 15.2 ms |
+| PUT — 15 ms fixed flush window | 5 ms | 15.2 ms |
 | PUT — 5 ms window, 512 workers | 2.6 ms | 5.2 ms (~102K writes/s) |
 | MultiPut 1024 entries | — | ~9.5 ms (~426K entries/s) |
 
-These rows are historical (pure-Go path). Later server batch writes, 8 clients × 1024-key MPUT: 3.54M keys/s, P99 4.2 ms (macOS, 1M-key space) and 1.77M keys/s, P99 12.2–12.7 ms (4-CPU CI runner, tmpfs, same-host client). See [BENCHMARK_RESULTS.md](BENCHMARK_RESULTS.md#later-measurements).
+**October 2026 (macOS laptop; see [BENCHMARK_RESULTS.md](BENCHMARK_RESULTS.md#october-2026-measurements) for conditions):**
+
+| Measurement | Result |
+|--|--|
+| Durable PUT, **adaptive group commit** (default now), emulated 300 µs fdatasync | 1 writer P50 16 ms → **0.45 ms**; 64 writers 4.0K → **37.5K writes/s** (P99 2.6 ms); 256 writers → **74K writes/s** |
+| YCSB C / B / A through the server (go-ycsb, 16 threads, same-host client) | 55K / 52K / 35K ops/s, P99 0.39 / 0.65 / 1.3 ms |
+| Vector search, GloVe-100 (100K real word vectors), recall@10 at ef = 128 / 256 | 0.906 / 0.953, p50 0.42 / 0.77 ms (float32, one query at a time) |
+| Vector search over the network, 20K GloVe, int8, 8 clients | 24.6K QPS at recall 0.894; 15.6K QPS at recall 0.985 |
+| RAM per 768-dim vector | float32 3.4 KB, int8 1.1 KB, pq 0.49 KB, pq + disk graph 0.38 KB |
+
+The first table's rows are historical (pure-Go path). Later server batch writes, 8 clients × 1024-key MPUT: 3.54M keys/s, P99 4.2 ms (macOS, 1M-key space) and 1.77M keys/s, P99 12.2–12.7 ms (4-CPU CI runner, tmpfs, same-host client). See [BENCHMARK_RESULTS.md](BENCHMARK_RESULTS.md#later-measurements).
 
 Full methodology: [BENCHMARKING.md](BENCHMARKING.md). To compare against
 Aerospike and ScyllaDB on your own hardware — same machine, same YCSB
@@ -83,7 +93,9 @@ In the YCSB run above (100M operations): **zero errors and zero GC emergency eve
 
 **Values on NVMe, index in DRAM.** The in-memory index holds a 64-byte record per key (disk offset, shard, size, TTL, version) — ~142 B/key of RAM in practice with the native index, measured at 5M keys, plus ~90 B/key for the ordered index unless it is disabled. Value bytes go directly to the per-disk append-only VLog. A cache hit is a DRAM lookup (**~92 ns** since the cache was sharded; it was 711 ns when a single mutex fronted it). A cache miss is one NVMe random read (~400 µs).
 
-**Group-commit WAL.** A background flusher amortizes `fdatasync` across all writers within a configurable window (default 15 ms). Records are binary with a CRC32C over the whole record (replay still reads legacy text WALs). One `write(2)` and one `fdatasync` per batch instead of per write — 10–100× write throughput improvement at the cost of at most one window of durability latency.
+**Adaptive group-commit WAL.** A background flusher amortizes `fdatasync` across writers. The window (default 15 ms) is only an upper bound: a lone writer is synced immediately, and concurrent writers are synced together after an idle gap of about one fdatasync (`--group-commit=fixed` restores the full-window wait). Records are binary with a CRC32C over the whole record (replay still reads legacy text WALs). One `write(2)` and one `fdatasync` per batch instead of per write, and every write is acknowledged only after the sync that covers it.
+
+**Vector, full-text and hybrid search.** HNSW vector indexes (float32, int8 or product-quantized, graph on the heap or in a mapped file), a BM25 inverted index and reciprocal-rank hybrid search, filtered by the KV record with the same id, fanned out across cluster nodes. Vectors and documents persist as ordinary keys; the indexes are rebuilt from them at startup. See [docs/vector-search.md](docs/vector-search.md).
 
 **LIRS cache.** Scan-resistant eviction: large sequential reads don't evict your hot keys. Small values (≤256 B) get higher eviction priority, keeping the working set in RAM even under mixed workloads.
 
@@ -219,7 +231,8 @@ veltrix --help
 | `-data` | — | Single data directory |
 | `-data-dirs` | — | Comma-separated NVMe disk paths |
 | `-cache` | `256` | LIRS cache size in MB |
-| `-wal-flush-window-ms` | `15` | WAL group-commit window |
+| `-group-commit` | `adaptive` | `adaptive`: flush windows are upper bounds (lone writer synced at once); `fixed`: every batch waits the full window |
+| `-wal-flush-window-ms` | `15` | WAL group-commit window (upper bound in adaptive mode) |
 | `-vlog-flush-window-ms` | `15` | VLog flush window (keep equal to WAL) |
 | `-wal-format` | `binary` | WAL record encoding; `text` only to roll back to a pre-binary build (run once, stop cleanly) |
 | `-net` | `go` | Network front-end: `go` \| `cpp` \| `uring` \| `poll` (C++ front-ends are opt-in, experimental, binary subset only, standalone without `-auth-config`) |
@@ -239,6 +252,12 @@ veltrix --help
 | `-raft-addr` / `-repl-addr` / `-gossip-addr` | derived | Override inter-node listeners (default: client port +2 / +1 / +3) |
 | `-cluster-tls-cert` / `-cluster-tls-key` / `-cluster-tls-ca` | — | Inter-node (Raft/replication) TLS |
 | `-cluster-mtls` | `false` | Require + verify peer client certs (mutual TLS) |
+| `-cluster-secret-file` | — | Shared secret signing (HMAC-SHA256) all transfer-listener traffic: key migration and distributed search. Env `VELTRIXDB_CLUSTER_SECRET` if unset |
+| `-search-fanout` | `true` | Distributed modes: run searches, `QUERY` and `IDXQUERY` on every node and merge |
+| `-search-timeout-ms` | `2000` | Per-peer timeout for one distributed search phase |
+| `-search-allow-partial` | `false` | Answer a search without peers that failed, and during the startup index rebuild (default: fail and say why) |
+| `-linearizable-reads` | `false` | Raft mode: reads go through the ReadIndex fence (followers redirect) |
+| `-auto-rebalance` | `true` | Distributed modes: migrate keys to their new owners on membership changes |
 
 ---
 
@@ -425,7 +444,8 @@ These are real gaps. We'd rather you know them upfront:
 - **Raft reads are local by default (possibly stale on followers).** `raft` mode gives linearizable *writes* (quorum commit); reads are served from local applied state. A newly elected leader first applies everything its predecessor committed, so reads on the leader include every acknowledged write. For linearizable reads use `--linearizable-reads` (ReadIndex fence; followers redirect to the leader).
 - **Replicated mode is not linearizable.** `replicated` mode is primary-copy replication for durability across copies; it has no single-writer ordering, so concurrent writers to the same key are not linearizable. Use `raft` mode when you need write linearizability.
 - **Distributed searches ask every node.** Each vector / text / hybrid search, `QUERY` and `IDXQUERY` runs on all non-failed nodes, so its cost grows with the cluster. If a peer does not answer within `--search-timeout-ms`, the request fails and names it — until the failure detector marks it failed — unless `--search-allow-partial` is set.
-- **Search indexes live in RAM.** Vectors (float32 or int8 codes), graph edges and the BM25 inverted index are held in memory and rebuilt from the persisted keys at startup; the full-precision vectors and document text stay on NVMe.
+- **Search indexes live in RAM and are rebuilt at every start.** Vector codes (float32 / int8 / PQ), graph nodes and the BM25 inverted index are in memory (layer-0 graph edges can go to a mapped file with `GRAPH disk`); the full-precision vectors and document text stay on NVMe. Searches are refused until the rebuild finishes. Tested to 100K real vectors; 10M+ is untested.
+- **No same-hardware comparison yet** with Aerospike, ScyllaDB or other vector databases. `bench/compare` is the harness; its Aerospike / ScyllaDB paths are compile-checked only.
 
 See [docs/redis-comparison.md](docs/redis-comparison.md) for a full feature-by-feature comparison.
 
@@ -438,6 +458,9 @@ See [docs/redis-comparison.md](docs/redis-comparison.md) for a full feature-by-f
 | [ARCHITECTURE.md](ARCHITECTURE.md) | System design: sharding, write path, read path, admission control |
 | [PERFORMANCE.md](PERFORMANCE.md) | Tuning guide for your specific workload |
 | [BENCHMARKING.md](BENCHMARKING.md) | Bench harness, reference numbers, pass/fail gates |
+| [BENCHMARK_RESULTS.md](BENCHMARK_RESULTS.md) | Every measured number, with the conditions it was measured under |
+| [docs/vector-search.md](docs/vector-search.md) | Vector, full-text and hybrid search: commands, memory layouts, clusters, measured recall / latency / RAM |
+| [bench/compare](bench/compare/README.md) | Same-hardware harness for VeltrixDB vs Aerospike vs ScyllaDB (YCSB) and vector benchmarks |
 | [docs/redis-comparison.md](docs/redis-comparison.md) | When to use Redis vs VeltrixDB |
 | [docs/TESTING_GUIDE.md](docs/TESTING_GUIDE.md) | Run every feature test |
 | [docs/DR_RUNBOOK.md](docs/DR_RUNBOOK.md) | Disaster recovery procedures |

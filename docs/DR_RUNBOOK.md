@@ -27,6 +27,9 @@ kubectl describe pod -n veltrixdb POD
 | `[wal] replay of … stopped at byte N of M after K records` | Torn final write on crash (small `M − N`), or WAL damage (large) — every record is CRC32C-checked and replay stops at the first bad one | Restart pod once; if recurring or `M − N` is large, the WAL is damaged: wipe this node and let replication refill it (§2), or restore from backup (§5) in standalone mode |
 | `panic: native index: insert failed (out of memory?)` | `vm.max_map_count` too low for the off-heap native index (cgo builds) | Apply `scripts/sysctl.conf` (`vm.max_map_count = 262144`) on the node; or set `VELTRIXDB_INDEX=map` to use the Go map index |
 | `bad magic at offset O` | Silent disk corruption | Drain node, replace disk, re-join |
+| `[search] rebuilt N vectors and M text documents in T` | Normal after every start: search indexes are rebuilt from the persisted keys; searches are refused until this line (`INFO` → `search_ready=1`) | Nothing — size restart windows by T for large vector namespaces |
+| client error `search indexes are still rebuilding after restart (loaded x of y)` | A search reached a node before its rebuild finished | Retry; or run with `--search-allow-partial` if incomplete results are acceptable |
+| `[transfer] WARNING: listener … is unauthenticated` | No `--cluster-secret-file` and no cluster mTLS | Mount the same secret on every node (`VELTRIXDB_CLUSTER_SECRET`) and restart |
 | `encryption: no key in VELTRIXDB_ENCRYPTION_KEY` | Missing secret | `kubectl create secret generic veltrixdb-enc --from-literal=key=BASE64_32B` |
 
 ---
