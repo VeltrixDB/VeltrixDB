@@ -98,6 +98,15 @@ Releases are cut automatically on every merge to `main` (GitHub release +
 
 ### Fixed
 
+- Raft: a freshly elected leader served local reads before applying the
+  entries its predecessor had committed, so a GET right after failover could
+  miss a write the old leader had acknowledged (`TestRaftClusterFailover`
+  failed intermittently with "data lost across failover"; nothing was lost —
+  the write became visible once the new leader's no-op applied). Reads on a
+  new leader now wait for that no-op (`RaftNode.WaitLeaderApplied`, one
+  atomic load once caught up). The text and binary MGET paths now pass the
+  same read barrier as GET, including `--linearizable-reads`, which they
+  used to skip.
 - int8 namespaces searched with a narrower beam than float32 ones: the
   re-rank candidate count (4 × k) replaced the default ef instead of only
   raising it, so k = 10 walked with ef = 40, not 64 (recall@10 0.85 vs 0.93 on

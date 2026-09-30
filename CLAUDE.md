@@ -333,6 +333,8 @@ curl http://localhost:2112/readyz
 
 57. **A search is refused while the startup index rebuild runs.** `main` calls `engine.BeginSearchRebuild()` before starting `RebuildSearchIndexes` in the background; until it finishes, `CheckSearchReady` fails vector / text / hybrid searches (locally and on peers, so a fan-out fails too) with `ErrSearchRebuilding` and the progress, unless `--search-allow-partial`. KV traffic is unaffected. `INFO` reports `search_ready=0|1`. Tests and tools that build an engine without calling `BeginSearchRebuild` are always ready. The graph is not persisted, so on a large namespace this window is the full rebuild time.
 
+58. **Every read passes `coordinator.readBarrier()` before touching the engine** — GET, text MGET, binary MGET and the binary GET coalescing path. In raft mode with local reads it is `RaftNode.WaitLeaderApplied`: a leader elected moments ago waits (≤ `readIndexTimeout`) until the no-op it appended in `becomeLeader` is applied, so every write an earlier leader acknowledged is visible; `leaderReady` makes it one atomic load afterwards, and followers never wait (their reads are stale by design). With `--linearizable-reads` it is the ReadIndex fence. A new read path that calls `engine.Get` / `MultiGet` directly skips both — `TestWaitLeaderApplied_FailoverVisibility` fails 20/20 without the barrier.
+
 ## Performance Hotspots
 
 | Hotspot | File:Line | What matters |

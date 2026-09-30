@@ -120,6 +120,24 @@ func (rn *RaftNode) ReadIndex(timeout time.Duration) (uint64, error) {
 	return readIdx, rn.waitAppliedUntil(readIdx, deadline)
 }
 
+// WaitLeaderApplied blocks a new leader until the no-op it appended on
+// election is applied, so every write acknowledged by an earlier leader is
+// in its state machine before it serves a local read. Without it, a GET
+// sent to a freshly elected leader could miss a write the old leader had
+// already acknowledged (the entry was committed but not yet applied here),
+// which reads like data loss. Returns nil at once on followers (their local
+// reads are stale by design) and on a leader that is already caught up —
+// one atomic load. ErrReadIndexTimeout if the no-op is not applied in time.
+func (rn *RaftNode) WaitLeaderApplied(timeout time.Duration) error {
+	if rn.leaderReady.Load() || RaftRole(rn.currentRole.Load()) != RoleLeader {
+		return nil
+	}
+	rn.mu.Lock()
+	idx := rn.termStartIndex
+	rn.mu.Unlock()
+	return rn.waitAppliedUntil(idx, time.Now().Add(timeout))
+}
+
 // waitAppliedUntil blocks until lastApplied >= idx or the deadline passes.
 func (rn *RaftNode) waitAppliedUntil(idx uint64, deadline time.Time) error {
 	for {

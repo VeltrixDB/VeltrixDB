@@ -1115,6 +1115,10 @@ func handleTextConn(conn net.Conn, br *bufio.Reader, engine *storage.StorageEngi
 				writeLine("ERR usage: MGET <key> [key ...]")
 				continue
 			}
+			if err := coord.readBarrier(); err != nil {
+				writeLine("ERR " + err.Error())
+				continue
+			}
 			for _, k := range keys {
 				if val, err := engine.Get(k); err == nil {
 					fmt.Fprintf(w, "%s %s\n", k, val)
@@ -2473,7 +2477,7 @@ func handleBinaryConn(conn net.Conn, br *bufio.Reader, engine *storage.StorageEn
 				_ = sendResp(binStatusErr, []byte(err.Error()))
 				return
 			}
-			if err := handleMGet(valLen, br, bw, engine); err != nil {
+			if err := handleMGet(valLen, br, bw, engine, coord); err != nil {
 				return
 			}
 			continue
@@ -2964,6 +2968,13 @@ func handleBinaryConn(conn net.Conn, br *bufio.Reader, engine *storage.StorageEn
 				if need <= maxPooledPayload {
 					binPayloadPool.Put(payPtr)
 				}
+				if err := coord.readBarrier(); err != nil {
+					for range keys {
+						_ = writeResp(binStatusErr, []byte(err.Error()))
+					}
+					_ = bw.Flush()
+					continue
+				}
 				for _, r := range engine.MultiGet(keys) {
 					if !r.Found || r.Value == nil {
 						_ = writeResp(binStatusNotFound, nil)
@@ -3268,7 +3279,7 @@ func handleMPut(count int, br *bufio.Reader, bw *bufio.Writer, engine *storage.S
 //
 //	[1B 0x00 OK][4B count LE]
 //	count × [1B status][4B valLen LE][value bytes]
-func handleMGet(count int, br *bufio.Reader, bw *bufio.Writer, engine *storage.StorageEngine) error {
+func handleMGet(count int, br *bufio.Reader, bw *bufio.Writer, engine *storage.StorageEngine, coord *coordinator) error {
 	if count <= 0 || count > maxBatchCount {
 		resp := [5]byte{binStatusErr}
 		_, err := bw.Write(resp[:])
@@ -3303,6 +3314,19 @@ func handleMGet(count int, br *bufio.Reader, bw *bufio.Writer, engine *storage.S
 		}
 	}
 
+	if err := coord.readBarrier(); err != nil {
+		msg := []byte(err.Error())
+		var hdr [5]byte
+		hdr[0] = binStatusErr
+		binary.LittleEndian.PutUint32(hdr[1:], uint32(len(msg)))
+		if _, werr := bw.Write(hdr[:]); werr != nil {
+			return werr
+		}
+		if _, werr := bw.Write(msg); werr != nil {
+			return werr
+		}
+		return bw.Flush()
+	}
 	results := engine.MultiGet(keys)
 
 	var respHdr [5]byte

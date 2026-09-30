@@ -133,19 +133,36 @@ const readIndexTimeout = 2 * time.Second
 // may be stale on followers or a deposed leader).  With linReads set in raft
 // mode it is linearizable via ReadIndex.
 func (c *coordinator) Get(key string) ([]byte, error) {
-	if c.mode != modeRaft || !c.linReads {
-		return c.engine.Get(key)
-	}
-	if !c.raft.IsLeader() {
-		return nil, c.leaderRedirect()
-	}
-	if _, err := c.raft.ReadIndex(readIndexTimeout); err != nil {
-		if err == consensus.ErrNotLeader {
-			return nil, c.leaderRedirect()
-		}
+	if err := c.readBarrier(); err != nil {
 		return nil, err
 	}
 	return c.engine.Get(key)
+}
+
+// readBarrier is what every read (GET and the MGET paths) passes before it
+// reads the local engine.
+//   - raft, --linearizable-reads: redirect followers; run the ReadIndex fence.
+//   - raft, local reads: on a leader elected moments ago, wait for its term's
+//     no-op to apply, so writes the previous leader acknowledged are visible
+//     (TestRaftClusterFailover). One atomic load once caught up.
+//   - other modes: nothing.
+func (c *coordinator) readBarrier() error {
+	if c.mode != modeRaft {
+		return nil
+	}
+	if !c.linReads {
+		return c.raft.WaitLeaderApplied(readIndexTimeout)
+	}
+	if !c.raft.IsLeader() {
+		return c.leaderRedirect()
+	}
+	if _, err := c.raft.ReadIndex(readIndexTimeout); err != nil {
+		if err == consensus.ErrNotLeader {
+			return c.leaderRedirect()
+		}
+		return err
+	}
+	return nil
 }
 
 // newStandaloneCoordinator wraps an engine with pass-through write routing.
