@@ -44,6 +44,7 @@ import (
 	"fmt"
 	"log"
 	"math"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -72,23 +73,133 @@ const vectorRerankFactor = 4
 const (
 	QuantNone = "none" // float32 components in RAM (default)
 	QuantInt8 = "int8" // int8 codes + scale in RAM, float32 re-rank from disk
+	QuantPQ   = "pq"   // product quantization: m bytes per vector (pq.go)
+)
+
+// Graph placements for VectorNamespaceOptions.Graph.
+const (
+	GraphMemory = "memory" // all adjacency on the heap (default)
+	GraphDisk   = "disk"   // layer-0 adjacency in a mapped file (vector_adj.go)
 )
 
 // VectorNamespaceOptions configures CreateVectorNamespace.
 type VectorNamespaceOptions struct {
-	Quantization string // QuantNone ("" means the same) or QuantInt8
+	Quantization string // QuantNone ("" means the same), QuantInt8 or QuantPQ
+	// PQSubspaces is the number of PQ subspaces m (bytes per vector);
+	// 0 = dim/8. PQ only.
+	PQSubspaces int
+	// PQTrainAt is how many vectors a PQ namespace collects (as float32)
+	// before training its codebook; 0 = 10000, minimum 256. PQ only.
+	PQTrainAt int
+	// Graph is GraphMemory ("" means the same) or GraphDisk.
+	Graph string
 }
 
 // vectorNSConfig is the persisted form of a namespace's settings.
 type vectorNSConfig struct {
-	Dim   int    `json:"dim"`
-	Quant string `json:"quant"`
+	Dim       int    `json:"dim"`
+	Quant     string `json:"quant"`
+	PQM       int    `json:"pq_m,omitempty"`
+	PQTrainAt int    `json:"pq_train,omitempty"`
+	Graph     string `json:"graph,omitempty"`
 }
+
+// normalize validates c and fills defaults.
+func (c *vectorNSConfig) normalize() error {
+	c.Quant = strings.ToLower(c.Quant)
+	switch c.Quant {
+	case "":
+		c.Quant = QuantNone
+	case QuantNone, QuantInt8, QuantPQ:
+	default:
+		return fmt.Errorf("unknown quantization %q (want %s, %s or %s)", c.Quant, QuantNone, QuantInt8, QuantPQ)
+	}
+	c.Graph = strings.ToLower(c.Graph)
+	switch c.Graph {
+	case "":
+		c.Graph = GraphMemory
+	case GraphMemory, GraphDisk:
+	default:
+		return fmt.Errorf("unknown graph placement %q (want %s or %s)", c.Graph, GraphMemory, GraphDisk)
+	}
+	if c.Quant != QuantPQ {
+		c.PQM, c.PQTrainAt = 0, 0
+		return nil
+	}
+	if c.PQM == 0 {
+		c.PQM = defaultPQSubspaces(c.Dim)
+	}
+	if c.PQM < 1 || c.PQM > c.Dim {
+		return fmt.Errorf("pq subspaces %d out of range [1, %d]", c.PQM, c.Dim)
+	}
+	if c.PQTrainAt != 0 && c.PQTrainAt < pqMinTrainN {
+		return fmt.Errorf("pq training size %d below the minimum %d", c.PQTrainAt, pqMinTrainN)
+	}
+	return nil
+}
+
+// layoutEqual reports whether an index built for c can serve c2 without a
+// rebuild (only the PQ training size may differ).
+func (c vectorNSConfig) layoutEqual(c2 vectorNSConfig) bool {
+	return c.Dim == c2.Dim && c.Quant == c2.Quant && c.PQM == c2.PQM && c.Graph == c2.Graph
+}
+
+// vectorScratchDir is where disk graphs map their scratch files.
+func (se *StorageEngine) vectorScratchDir() string {
+	return filepath.Join(se.GetDataDirs()[0], "vector-scratch")
+}
+
+// newIndex returns an empty index laid out for c.
+func (c vectorNSConfig) newIndex(scratchDir string) *VectorIndex {
+	vi := &VectorIndex{
+		dim: c.Dim, quant: c.Quant == QuantInt8,
+		pqMode: c.Quant == QuantPQ, pqM: c.PQM, pqTrainAt: c.PQTrainAt,
+		byID: map[string]int32{},
+	}
+	if c.Graph == GraphDisk {
+		vi.adjDir = scratchDir
+		if a, err := newMappedAdj(scratchDir); err != nil {
+			log.Printf("[vector] disk graph unavailable (%v); keeping the graph in memory", err)
+		} else {
+			vi.adj0 = a
+		}
+	}
+	return vi
+}
+
+// config reports the settings vi was built with.
+func (vi *VectorIndex) config() vectorNSConfig {
+	c := vectorNSConfig{Dim: vi.dim, Quant: QuantNone, Graph: GraphMemory}
+	switch {
+	case vi.quant:
+		c.Quant = QuantInt8
+	case vi.pqMode:
+		c.Quant, c.PQM, c.PQTrainAt = QuantPQ, vi.pqM, vi.pqTrainAt
+	}
+	if vi.adjDir != "" {
+		c.Graph = GraphDisk
+	}
+	return c
+}
+
+// approximate reports whether search scores need a full-precision re-rank.
+func (vi *VectorIndex) approximate() bool { return vi.quant || vi.pqMode }
 
 // VectorIndex is one in-memory HNSW graph of (id, vector) tuples (hnsw.go).
 type VectorIndex struct {
-	dim      int
-	quant    bool // int8 codes instead of float32 components (hnsw.go)
+	dim   int
+	quant bool // int8 codes instead of float32 components (hnsw.go)
+	// Product quantization (hnsw_pq.go): pqMode is the namespace setting,
+	// pq the trained codebook (nil until pqTrainAt vectors have arrived).
+	pqMode     bool
+	pqM        int
+	pqTrainAt  int
+	pq         *pqCodebook
+	pqTraining bool
+	// adj0 holds layer-0 adjacency in a mapped file (vector_adj.go); nil =
+	// on the heap. adjDir is where a fresh index (compaction) maps its own.
+	adj0     *mappedAdj
+	adjDir   string
 	mu       sync.RWMutex
 	nodes    []*hnswNode
 	byID     map[string]int32 // id → node index (live entries only)
@@ -186,16 +297,6 @@ func checkDim(ns string, vi *VectorIndex, dim int) error {
 	return nil
 }
 
-func parseQuant(q string) (bool, error) {
-	switch strings.ToLower(q) {
-	case "", QuantNone:
-		return false, nil
-	case QuantInt8:
-		return true, nil
-	}
-	return false, fmt.Errorf("unknown quantization %q (want %s or %s)", q, QuantNone, QuantInt8)
-}
-
 // VectorNSConfigKey is the reserved key holding namespace ns's settings.
 func VectorNSConfigKey(ns string) string { return vectorNSConfigPrefix + ns }
 
@@ -203,24 +304,20 @@ func VectorNSConfigKey(ns string) string { return vectorNSConfigPrefix + ns }
 // existing namespaces and returns the value to store under
 // VectorNSConfigKey(ns). The server's coordinator writes that key through the
 // normal replicated Put path, so every node applies the same settings.
-// Changing an existing namespace's quantization is allowed (its vectors are
-// re-encoded); changing its dimension is not.
+// Changing an existing namespace's quantization or graph placement is
+// allowed (its vectors are re-encoded); changing its dimension is not.
 func (se *StorageEngine) EncodeVectorNamespaceConfig(ns string, dim int, opts VectorNamespaceOptions) ([]byte, error) {
 	if err := validateVectorNS(ns, dim); err != nil {
 		return nil, err
 	}
-	quant, err := parseQuant(opts.Quantization)
-	if err != nil {
+	cfg := vectorNSConfig{Dim: dim, Quant: opts.Quantization, PQM: opts.PQSubspaces, PQTrainAt: opts.PQTrainAt, Graph: opts.Graph}
+	if err := cfg.normalize(); err != nil {
 		return nil, err
 	}
 	if vi, ok := se.vectors.get(ns); ok {
 		if err := checkDim(ns, vi, dim); err != nil {
 			return nil, err
 		}
-	}
-	cfg := vectorNSConfig{Dim: dim, Quant: QuantNone}
-	if quant {
-		cfg.Quant = QuantInt8
 	}
 	return json.Marshal(cfg)
 }
@@ -235,11 +332,10 @@ func (se *StorageEngine) CreateVectorNamespace(ns string, dim int, opts VectorNa
 	if err := se.Put(VectorNSConfigKey(ns), val, -1); err != nil {
 		return err
 	}
+	var want vectorNSConfig
+	_ = json.Unmarshal(val, &want)
 	vi, ok := se.vectors.get(ns)
-	if !ok {
-		return fmt.Errorf("vector namespace %q: settings did not apply", ns)
-	}
-	if want, _ := parseQuant(opts.Quantization); vi.quant != want {
+	if !ok || !vi.config().layoutEqual(want) {
 		return fmt.Errorf("vector namespace %q: settings did not apply", ns)
 	}
 	return nil
@@ -255,8 +351,7 @@ func (se *StorageEngine) applyVectorNSConfig(ns string, val []byte) error {
 	if err := validateVectorNS(ns, cfg.Dim); err != nil {
 		return err
 	}
-	quant, err := parseQuant(cfg.Quant)
-	if err != nil {
+	if err := cfg.normalize(); err != nil {
 		return err
 	}
 	r := &se.vectors
@@ -267,19 +362,22 @@ func (se *StorageEngine) applyVectorNSConfig(ns string, val []byte) error {
 	}
 	existing, ok := r.m[ns]
 	if !ok {
-		r.m[ns] = &VectorIndex{dim: cfg.Dim, quant: quant, byID: map[string]int32{}}
+		r.m[ns] = cfg.newIndex(se.vectorScratchDir())
 		return nil
 	}
 	if err := checkDim(ns, existing, cfg.Dim); err != nil {
 		return err
 	}
-	if existing.quant == quant {
+	if existing.config().layoutEqual(cfg) {
+		existing.mu.Lock()
+		existing.pqTrainAt = cfg.PQTrainAt
+		existing.mu.Unlock()
 		return nil
 	}
 	// Re-encode from the persisted full-precision vectors. The registry write
 	// lock is held throughout, so a concurrent vector write's hook waits and
 	// then lands in the new index rather than being lost with the old one.
-	fresh := &VectorIndex{dim: cfg.Dim, quant: quant, byID: map[string]int32{}}
+	fresh := cfg.newIndex(se.vectorScratchDir())
 	prefix := VectorPersistKey(ns, "")
 	for _, k := range se.scanKeysWithPrefix(prefix) {
 		blob, err := se.Get(k)
@@ -292,8 +390,10 @@ func (se *StorageEngine) applyVectorNSConfig(ns string, val []byte) error {
 		}
 		fresh.insertHNSW(k[len(prefix):], vec)
 	}
+	fresh.trainPQPrivate()
 	r.m[ns] = fresh
-	log.Printf("[vector] namespace %q re-encoded (quantization=%s, %d vectors)", ns, cfg.Quant, fresh.live)
+	existing.retire()
+	log.Printf("[vector] namespace %q re-encoded (quantization=%s graph=%s, %d vectors)", ns, cfg.Quant, cfg.Graph, fresh.live)
 	return nil
 }
 
@@ -399,17 +499,8 @@ func (se *StorageEngine) SearchVectorWithOptions(ns string, query []float32, k i
 	// Quantized scores are approximate: fetch more candidates and re-rank
 	// them against the full-precision vectors.
 	kk, ef := k, opts.Ef
-	if vi.quant && k > 0 {
-		kk = k * vectorRerankFactor
-		// Never narrower than the default beam: raising ef only to kk once
-		// set it BELOW hnswEfSearch for small k (4×10 = 40 < 64), so int8
-		// namespaces searched with a smaller beam than float32 ones.
-		if ef <= 0 {
-			ef = hnswEfSearch
-		}
-		if ef < kk {
-			ef = kk
-		}
+	if vi.approximate() && k > 0 {
+		kk, ef = rerankPlan(vi.pqMode, k, ef)
 	}
 	var hits []VectorMatch
 	vi.mu.RLock()
@@ -421,27 +512,57 @@ func (se *StorageEngine) SearchVectorWithOptions(ns string, query []float32, k i
 		hits = vi.searchFiltered(q, kk, ef, accept)
 	}
 	vi.mu.RUnlock()
-	if vi.quant {
+	if vi.approximate() {
 		hits = se.rerankVectors(ns, vi.dim, q, hits, k)
 	}
 	return hits, nil
+}
+
+// rerankPlan returns how many graph candidates a quantized search collects
+// and re-ranks (kk) and the beam width to walk with (ef ≥ kk).
+//   - The beam is never narrower than the default: raising ef only to kk once
+//     set it BELOW hnswEfSearch for small k (4×10 = 40 < 64), so int8
+//     namespaces searched with a smaller beam than float32 ones.
+//   - int8 codes rank candidates almost like float32, so 4k are enough. PQ
+//     codes are coarser: measured on 768-dim data, re-ranking only 4k left
+//     recall@10 at 0.55 (ef=256) against float32's 0.78, and re-ranking the
+//     whole beam brought it to 0.73–0.76 (TestVectorMemoryTable). PQ
+//     therefore re-ranks max(4k, ef) — one VLog read (LIRS-cached) each.
+func rerankPlan(pq bool, k, ef int) (kk, efOut int) {
+	kk = k * vectorRerankFactor
+	if ef <= 0 {
+		ef = hnswEfSearch
+	}
+	if pq && ef > kk {
+		kk = ef
+	}
+	if ef < kk {
+		ef = kk
+	}
+	return kk, ef
 }
 
 // rerankVectors re-scores hits exactly against the persisted float32
 // vectors and returns the best k (all if k ≤ 0). A hit whose vector can no
 // longer be read (deleted meanwhile) is dropped.
 func (se *StorageEngine) rerankVectors(ns string, dim int, q []float32, hits []VectorMatch, k int) []VectorMatch {
+	// One MultiGet (parallel reads) instead of a Get per candidate: PQ
+	// re-ranks the whole beam, and serial VLog reads made that the bulk of
+	// query latency (GloVe-100, int8, ef=64: p50 1.9 ms, p99 13.8 ms).
+	keys := make([]string, len(hits))
+	for i, h := range hits {
+		keys[i] = VectorPersistKey(ns, h.ID)
+	}
 	out := hits[:0]
-	for _, h := range hits {
-		blob, err := se.Get(VectorPersistKey(ns, h.ID))
+	for i, r := range se.MultiGet(keys) {
+		if !r.Found {
+			continue // deleted meanwhile
+		}
+		vec, err := decodeVector(r.Value, dim)
 		if err != nil {
 			continue
 		}
-		vec, err := decodeVector(blob, dim)
-		if err != nil {
-			continue
-		}
-		out = append(out, VectorMatch{ID: h.ID, Score: dot(q, vec)})
+		out = append(out, VectorMatch{ID: hits[i].ID, Score: dot(q, vec)})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Score > out[j].Score })
 	if k > 0 && len(out) > k {
@@ -467,7 +588,10 @@ func (se *StorageEngine) DeleteVector(ns, id string) error {
 type VectorStats struct {
 	Namespace    string
 	Dim          int
-	Quantization string // QuantNone or QuantInt8
+	Quantization string // QuantNone, QuantInt8 or QuantPQ
+	PQTrained    bool   // QuantPQ: codebook trained (before that, float32)
+	Graph        string // GraphMemory or GraphDisk
+	DiskGraph    int64  // bytes of layer-0 adjacency on the mapped file
 	Count        int    // live vectors
 	Tombstones   int    // deleted/updated nodes awaiting compaction
 	Compactions  uint64 // completed graph compactions
@@ -482,14 +606,18 @@ func (se *StorageEngine) VectorIndexStats() []VectorStats {
 	out := make([]VectorStats, 0, len(r.m))
 	for ns, vi := range r.m {
 		vi.mu.RLock()
-		quant := QuantNone
-		if vi.quant {
-			quant = QuantInt8
+		c := vi.config()
+		var disk int64
+		if vi.adj0 != nil {
+			disk = vi.adj0.bytes()
 		}
 		out = append(out, VectorStats{
 			Namespace:    ns,
 			Dim:          vi.dim,
-			Quantization: quant,
+			Quantization: c.Quant,
+			PQTrained:    vi.pq != nil,
+			Graph:        c.Graph,
+			DiskGraph:    disk,
 			Count:        vi.live,
 			Tombstones:   len(vi.nodes) - vi.live,
 			Compactions:  vi.compactions,

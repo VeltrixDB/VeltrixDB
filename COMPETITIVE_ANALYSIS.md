@@ -179,17 +179,34 @@ Aerospike Enterprise and ScyllaDB Enterprise have licensing costs. VeltrixDB is 
 18K vs 100K–500K ops/sec for per-key durable writes (YCSB, historical). The WAL group-commit window (5 ms) is the primary bottleneck. Batched writes are a different picture: 8 clients × 1024-key MPUT later measured 1.77M keys/s (4-CPU CI runner, tmpfs, same-host client) and 3.54M keys/s (macOS, 1M-key space). The io_uring write bridge is not the lever: on that CI runner the C++ storage layer with the bridge on measured 1.12M vs 1.77M keys/s with it off, so it is opt-in.
 
 ### 2. Write P99 latency
-47 ms P99 writes vs Aerospike's 1–5 ms. The 5 ms flush window inherently adds tail latency on bursty workloads.
+47 ms P99 writes vs Aerospike's 1–5 ms (historical YCSB). The fixed flush window added its full length to every durable write. Since 2026-10 group commit is adaptive (`--group-commit=adaptive`, default): with an emulated 300 µs device sync, a lone writer's P50 fell from 16 ms to 0.45 ms and 64 writers went from 4.0K to 37.5K durable writes/s with P99 16.8 → 2.6 ms (`TestGroupCommit_LatencyTable`; emulated sync, not a device measurement). YCSB on NVMe has not been re-run.
 
 ### 3. Maturity
 Aerospike has 15+ years of NVMe optimization. ScyllaDB has been production-hardened for 10+ years. VeltrixDB is newer — the benchmark results show the architecture is correct; production hardening is ongoing.
 
 ---
 
+## Measuring it on the same hardware
+
+The tables above compare VeltrixDB runs against numbers others published on
+other machines. `bench/compare/` replaces that with one harness for all
+three: go-ycsb workloads A–F through a VeltrixDB driver and go-ycsb's own
+Aerospike and Cassandra (ScyllaDB) drivers, one database at a time on the
+same host, with the durability settings stated (see its README — ScyllaDB's
+default commit log sync and Aerospike CE's write buffer both ACK before the
+disk). No same-hardware run has been published yet; the Aerospike and
+ScyllaDB paths are compile-checked only.
+
+Vector search has no like-for-like harness against these two: VectorDBBench
+has no client for either, and `bench/compare/cmd/vecbench` ships only a
+VeltrixDB driver. VeltrixDB's own numbers on a real dataset are in
+[BENCHMARK_RESULTS.md](BENCHMARK_RESULTS.md#later-measurements) (GloVe-100).
+
 ## Tuning Roadmap to Close the Gap
 
 | Improvement | Expected Write Impact | Status |
 |-------------|----------------------|--------|
+| Adaptive group commit (window = upper bound) | Emulated 300 µs sync: 64 writers 4.0K → 37.5K writes/s, 256 writers 15.3K → 74K | **Default since 2026-10**; YCSB on NVMe pending |
 | WAL window 1 ms + 500 threads | ~50K–80K ops/sec | Configurable now |
 | io_uring write path (C++) | Not a gain so far: C++ storage layer all on (bridge, batch engine, native index) 1.12M vs 1.77M keys/s all off (CI batch writes); per-part attribution pending | Implemented, opt-in (`VELTRIXDB_URING_BRIDGE=on\|sqpoll`) |
 | WAL window 0 ms + io_uring | ~200K–400K ops/sec | Requires testing |

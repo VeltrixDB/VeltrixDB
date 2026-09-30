@@ -81,8 +81,20 @@ type searchResponse struct {
 	Missing bool `json:"missing,omitempty"`
 }
 
-// runLocalSearch executes req against this node's engine only.
+// runLocalSearch executes req against this node's engine only. While the
+// startup rebuild is running the search indexes are incomplete, so vector /
+// text searches fail (a peer's failure fails the fan-out too) unless
+// allowPartial.
 func runLocalSearch(engine *storage.StorageEngine, req searchRequest) (searchResponse, error) {
+	return runLocalSearchOpt(engine, req, false)
+}
+
+func runLocalSearchOpt(engine *storage.StorageEngine, req searchRequest, allowPartial bool) (searchResponse, error) {
+	if (req.Kind == "vector" || req.Kind == "text" || req.Kind == "textstats") && !allowPartial {
+		if err := engine.CheckSearchReady(); err != nil {
+			return searchResponse{}, err
+		}
+	}
 	switch req.Kind {
 	case "vector":
 		hits, err := engine.SearchVectorWithOptions(req.NS, req.Vec, req.K,
@@ -133,6 +145,15 @@ func newSearchHandler(engine *storage.StorageEngine) http.Handler {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(resp)
 	})
+}
+
+// searchReady refuses searches while this node's indexes are still being
+// rebuilt after a restart, unless --search-allow-partial.
+func (c *coordinator) searchReady() error {
+	if c.searchAllowPartial {
+		return nil
+	}
+	return c.engine.CheckSearchReady()
 }
 
 // searchPeers returns the nodes a search fans out to (none = local only).
@@ -211,12 +232,15 @@ func mergeHits(lists [][]storage.VectorMatch, k int) []storage.VectorMatch {
 
 // VSearch is a (possibly distributed) vector search.
 func (c *coordinator) VSearch(ns string, q []float32, k int, opts storage.VectorSearchOptions) ([]storage.VectorMatch, error) {
+	if err := c.searchReady(); err != nil {
+		return nil, err
+	}
 	peers := c.searchPeers()
 	if len(peers) == 0 {
 		return c.engine.SearchVectorWithOptions(ns, q, k, opts)
 	}
 	req := searchRequest{Kind: "vector", NS: ns, K: k, Ef: opts.Ef, Vec: q, Filter: opts.Filter}
-	local, err := runLocalSearch(c.engine, req)
+	local, err := runLocalSearchOpt(c.engine, req, c.searchAllowPartial)
 	if err != nil {
 		return nil, err // bad query (dim, filter): same answer on every node
 	}
@@ -238,6 +262,9 @@ func (c *coordinator) VSearch(ns string, q []float32, k int, opts storage.Vector
 
 // TSearch is a (possibly distributed) BM25 search.
 func (c *coordinator) TSearch(ns, query string, k int, filter *storage.VectorFilter) ([]storage.VectorMatch, error) {
+	if err := c.searchReady(); err != nil {
+		return nil, err
+	}
 	peers := c.searchPeers()
 	if len(peers) == 0 {
 		return c.engine.SearchText(ns, query, k, filter)
@@ -258,7 +285,7 @@ func (c *coordinator) TSearch(ns, query string, k int, filter *storage.VectorFil
 	}
 	// Phase 2: every node scores with them.
 	req := searchRequest{Kind: "text", NS: ns, K: k, Query: query, Filter: filter, Stats: &st}
-	local, err := runLocalSearch(c.engine, req)
+	local, err := runLocalSearchOpt(c.engine, req, c.searchAllowPartial)
 	if err != nil {
 		return nil, err
 	}
@@ -276,7 +303,7 @@ func (c *coordinator) TSearch(ns, query string, k int, filter *storage.VectorFil
 // IdxQuery is a (possibly distributed) secondary-index lookup. Result order
 // is unspecified, as for LookupBySecondary; limit ≤ 0 = unlimited.
 func (c *coordinator) IdxQuery(name, value string, limit int) ([]string, error) {
-	local, _ := runLocalSearch(c.engine, searchRequest{Kind: "idxquery", Index: name, Value: value, K: limit})
+	local, _ := runLocalSearchOpt(c.engine, searchRequest{Kind: "idxquery", Index: name, Value: value, K: limit}, c.searchAllowPartial)
 	peers := c.searchPeers()
 	if len(peers) == 0 {
 		return local.Keys, nil
@@ -313,7 +340,7 @@ func (c *coordinator) Query(ns, field, op, value string, limit int) ([]storage.N
 		return c.engine.QueryNS(ns, field, op, value, limit)
 	}
 	req := searchRequest{Kind: "query", NS: ns, K: limit, Filter: &storage.VectorFilter{Field: field, Op: op, Value: value}}
-	local, err := runLocalSearch(c.engine, req)
+	local, err := runLocalSearchOpt(c.engine, req, c.searchAllowPartial)
 	if err != nil {
 		return nil, err
 	}
@@ -340,6 +367,9 @@ func (c *coordinator) Query(ns, field, op, value string, limit int) ([]storage.N
 
 // HSearch is a (possibly distributed) hybrid search.
 func (c *coordinator) HSearch(ns string, vec []float32, query string, k int, opts storage.HybridOptions) ([]storage.VectorMatch, error) {
+	if err := c.searchReady(); err != nil {
+		return nil, err
+	}
 	if len(c.searchPeers()) == 0 {
 		return c.engine.SearchHybrid(ns, vec, query, k, opts)
 	}
@@ -393,8 +423,8 @@ func loadClusterSecret(path string) ([]byte, error) {
 
 // VCreate creates or reconfigures a vector namespace on every node by writing
 // its settings key through the replicated Put path.
-func (c *coordinator) VCreate(ns string, dim int, quant string) error {
-	val, err := c.engine.EncodeVectorNamespaceConfig(ns, dim, storage.VectorNamespaceOptions{Quantization: quant})
+func (c *coordinator) VCreate(ns string, dim int, opts storage.VectorNamespaceOptions) error {
+	val, err := c.engine.EncodeVectorNamespaceConfig(ns, dim, opts)
 	if err != nil {
 		return err
 	}

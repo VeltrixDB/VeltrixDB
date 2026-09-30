@@ -21,8 +21,9 @@ import (
 // Gate thresholds, recall@10. Measured on 2026-09-30, darwin/arm64 (the data
 // and graph build are deterministic; other architectures can differ in the
 // last digit because arm64 fuses multiply-adds): f32 0.927, f32 ef=256
-// 0.998, int8 0.923, filtered 0.994, after deletes 0.959. The gates sit ~3
-// points lower. When a change moves a measured value, update the numbers
+// 0.998, int8 0.923, pq 0.882, pq + disk graph 0.881, filtered 0.994, after
+// deletes 0.959–0.965 (depends on when the background compaction
+// snapshots). The gates sit ~3 points lower. When a change moves a measured value, update the numbers
 // here with the gate.
 const (
 	gateRecallF32      = 0.90 // clustered data, default ef (64)
@@ -30,6 +31,8 @@ const (
 	gateRecallInt8     = 0.89 // after the full-precision re-rank
 	gateRecallFiltered = 0.96 // 25 %-selective indexed filter, graph path
 	gateRecallDeleted  = 0.92 // after deleting 40 % (compaction runs)
+	gateRecallPQ       = 0.85 // pq m=16 (4 dims per code byte) + re-rank of the beam
+	gateRecallDiskPQ   = 0.85 // same, layer-0 edges in the mapped file
 )
 
 const (
@@ -126,7 +129,7 @@ func gate(t *testing.T, name string, got, min float64) {
 
 func TestSearchQualityGate(t *testing.T) {
 	if testing.Short() {
-		t.Skip("search quality gate builds 2 × 5000-vector indexes")
+		t.Skip("search quality gate builds 4 × 5000-vector indexes")
 	}
 	if raceEnabled {
 		t.Skip("quality gate is single-threaded; CI runs it without -race (search job)")
@@ -145,8 +148,21 @@ func TestSearchQualityGate(t *testing.T) {
 	if err := se.CreateVectorNamespace("gq", gateDim, VectorNamespaceOptions{Quantization: QuantInt8}); err != nil {
 		t.Fatal(err)
 	}
+	for _, ns := range []string{"gp", "gd"} {
+		opts := VectorNamespaceOptions{Quantization: QuantPQ, PQSubspaces: 16, PQTrainAt: 2000}
+		if ns == "gd" {
+			opts.Graph = GraphDisk
+		}
+		if err := se.CreateVectorNamespace(ns, gateDim, opts); err != nil {
+			t.Fatal(err)
+		}
+	}
 	loadGate(t, se, "gf", ids, vecs)
 	loadGate(t, se, "gq", ids, vecs)
+	loadGate(t, se, "gp", ids, vecs)
+	loadGate(t, se, "gd", ids, vecs)
+	waitPQTrained(t, se, "gp")
+	waitPQTrained(t, se, "gd")
 
 	gate(t, "f32 default ef", measureRecall(t, ref, queries, gateK, func(q []float32) ([]VectorMatch, error) {
 		return se.SearchVector("gf", q, gateK)
@@ -157,6 +173,12 @@ func TestSearchQualityGate(t *testing.T) {
 	gate(t, "int8 + re-rank", measureRecall(t, ref, queries, gateK, func(q []float32) ([]VectorMatch, error) {
 		return se.SearchVector("gq", q, gateK)
 	}), gateRecallInt8)
+	gate(t, "pq m=16 + re-rank", measureRecall(t, ref, queries, gateK, func(q []float32) ([]VectorMatch, error) {
+		return se.SearchVector("gp", q, gateK)
+	}), gateRecallPQ)
+	gate(t, "pq + disk graph", measureRecall(t, ref, queries, gateK, func(q []float32) ([]VectorMatch, error) {
+		return se.SearchVector("gd", q, gateK)
+	}), gateRecallDiskPQ)
 
 	// Filtered: an indexed "=" filter matching 25 % (1250 ids) — above
 	// vectorBruteForceMax/2 but forced onto the graph path.

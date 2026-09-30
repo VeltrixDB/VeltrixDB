@@ -114,8 +114,9 @@ type StorageEngine struct {
 	// vectors / texts hold this engine's in-RAM search indexes, one per
 	// namespace (vector_index.go, text_index.go), kept in sync with their
 	// reserved keys by search_hooks.go. Zero values are ready to use.
-	vectors vectorRegistry
-	texts   textRegistry
+	vectors       vectorRegistry
+	texts         textRegistry
+	searchRebuild searchRebuild
 
 	// diskHealth holds one consecutive-error breaker per disk; a tripped
 	// breaker fails writes fast and reports the node degraded (disk_health.go).
@@ -250,7 +251,7 @@ func NewStorageEngine(cfg *StorageConfig) (*StorageEngine, error) {
 
 	wals := make([]*WriteAheadLog, len(dirs))
 	for i, dir := range dirs {
-		w, err := newWriteAheadLog(dir, metrics.WALFlushes, flushWindow, maxBatch, i)
+		w, err := newWriteAheadLog(dir, metrics.WALFlushes, flushWindow, maxBatch, i, cfg.GroupCommit)
 		if err != nil {
 			for j := 0; j < i; j++ {
 				wals[j].close()
@@ -292,7 +293,7 @@ func NewStorageEngine(cfg *StorageConfig) (*StorageEngine, error) {
 			if i < len(rawDevices) {
 				raw = rawDevices[i]
 			}
-			vl, err := newVLog(i, dir, raw, vlogWindow)
+			vl, err := newVLog(i, dir, raw, vlogWindow, cfg.GroupCommit)
 			if err != nil {
 				for j := 0; j < i; j++ {
 					vlogs[j].close()

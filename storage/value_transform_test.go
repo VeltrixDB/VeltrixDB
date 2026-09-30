@@ -331,7 +331,7 @@ func TestTransformForWrite_OrderAndFlags(t *testing.T) {
 // permanently high and GCRatio under-reports garbage.
 func TestVLogBatcher_StageReportsPackedAccurately(t *testing.T) {
 	dir := t.TempDir()
-	vl, err := newVLog(0, dir, "", time.Millisecond)
+	vl, err := newVLog(0, dir, "", time.Millisecond, GroupCommitFixed)
 	if err != nil {
 		t.Fatalf("newVLog: %v", err)
 	}
@@ -398,7 +398,7 @@ func TestMaxVLogEndFromWAL(t *testing.T) {
 // file-backed VLog, where vl.end already reflects the real file size.
 func TestSetEndAtLeast_NeverRetreats(t *testing.T) {
 	dir := t.TempDir()
-	vl, err := newVLog(0, dir, "", time.Millisecond)
+	vl, err := newVLog(0, dir, "", time.Millisecond, GroupCommitFixed)
 	if err != nil {
 		t.Fatalf("newVLog: %v", err)
 	}

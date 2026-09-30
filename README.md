@@ -49,7 +49,9 @@ echo -e "PUT hello world\nGET hello\nPING" | nc localhost 9000
 
 These rows are historical (pure-Go path). Later server batch writes, 8 clients × 1024-key MPUT: 3.54M keys/s, P99 4.2 ms (macOS, 1M-key space) and 1.77M keys/s, P99 12.2–12.7 ms (4-CPU CI runner, tmpfs, same-host client). See [BENCHMARK_RESULTS.md](BENCHMARK_RESULTS.md#later-measurements).
 
-Full methodology: [BENCHMARKING.md](BENCHMARKING.md)
+Full methodology: [BENCHMARKING.md](BENCHMARKING.md). To compare against
+Aerospike and ScyllaDB on your own hardware — same machine, same YCSB
+workloads, one database at a time — use [bench/compare](bench/compare/README.md).
 
 ---
 
@@ -290,7 +292,8 @@ INFO            → keys=N writes=N reads=N ...
 AUTH user pass  → OK
 QUIT            → BYE
 
-VCREATE ns dim [QUANT none|int8]                             → OK
+VCREATE ns dim [QUANT none|int8|pq] [PQM m] [PQTRAIN n]
+        [GRAPH memory|disk]                                  → OK
 VSET id [NS ns] f1 f2 ...                                    → OK
 VSEARCH k [NS ns] [EF n] [FILTER field op value] f1 f2 ...   → "id score" lines, END
 VDEL id [NS ns]                                              → OK
@@ -303,10 +306,20 @@ HSEARCH k [NS ns] [EF n] [ALPHA a] [CAND n] [FILTER field op value]
 ```
 
 **Vectors.** `NS` defaults to `default`; a namespace's dimension is fixed by
-its first `VSET` or by `VCREATE`. `VCREATE ... QUANT int8` keeps int8 codes in
-RAM (dim + 4 bytes per vector instead of 4 × dim) and re-ranks the top 4 × k
-graph candidates against the full float32 vectors, which are persisted in the
-VLog either way; running it on an existing namespace re-encodes it.
+its first `VSET` or by `VCREATE`. The full float32 vectors are always
+persisted in the VLog; the RAM copy can be smaller:
+
+| `VCREATE` option | RAM per vector (768-dim, measured) | Search |
+|--|--|--|
+| (default) float32 | ~3.4 KB | exact scores |
+| `QUANT int8` | ~1.1 KB | top 4 × k graph candidates re-ranked from disk |
+| `QUANT pq [PQM m]` | ~0.5 KB (m bytes of codes, default m = dim/8) | the whole beam re-ranked from disk |
+| `QUANT pq GRAPH disk` | ~0.4 KB heap + ~0.2 KB in a mapped file | as pq; layer-0 edges live in a file the kernel can page to NVMe |
+
+A PQ namespace stores float32 until it holds `PQTRAIN` vectors (default
+10,000), then trains its codebook in the background and re-encodes. Running
+`VCREATE` on an existing namespace with other settings re-encodes it. The
+graph is rebuilt from the persisted vectors at startup (it is not saved).
 
 **Text.** `TSET` indexes a document for BM25 (lowercased letter/digit runs, no
 stemming or stop words). One id names one record across all of these: `PUT
@@ -409,7 +422,7 @@ These are real gaps. We'd rather you know them upfront:
 - **No managed cloud offering.** Self-hosted only today. Managed service is planned.
 - **Range scans cost memory on every write.** `RANGE` and `SCANCUR` are served by an ordered skiplist of all live keys (~90 B/key resident). `--disable-ordered-index` gives that memory back, and then both commands return an error.
 - **CDC is in-process only.** Events lost if `repl-ship` is down. Durable WAL-tail mode is future work.
-- **Raft reads are local (possibly stale).** `raft` mode gives linearizable *writes* (quorum commit) but reads are served from local applied state — there is no read-index / lease-read path yet.
+- **Raft reads are local by default (possibly stale on followers).** `raft` mode gives linearizable *writes* (quorum commit); reads are served from local applied state. A newly elected leader first applies everything its predecessor committed, so reads on the leader include every acknowledged write. For linearizable reads use `--linearizable-reads` (ReadIndex fence; followers redirect to the leader).
 - **Replicated mode is not linearizable.** `replicated` mode is primary-copy replication for durability across copies; it has no single-writer ordering, so concurrent writers to the same key are not linearizable. Use `raft` mode when you need write linearizability.
 - **Distributed searches ask every node.** Each vector / text / hybrid search, `QUERY` and `IDXQUERY` runs on all non-failed nodes, so its cost grows with the cluster. If a peer does not answer within `--search-timeout-ms`, the request fails and names it — until the failure detector marks it failed — unless `--search-allow-partial` is set.
 - **Search indexes live in RAM.** Vectors (float32 or int8 codes), graph edges and the BM25 inverted index are held in memory and rebuilt from the persisted keys at startup; the full-precision vectors and document text stay on NVMe.

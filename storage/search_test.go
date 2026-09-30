@@ -139,7 +139,7 @@ func TestVector_ReconfigureQuantization(t *testing.T) {
 	if err := se.CreateVectorNamespace("m", 32, VectorNamespaceOptions{}); err == nil {
 		t.Fatal("changing the dimension must fail")
 	}
-	if err := se.CreateVectorNamespace("m", 16, VectorNamespaceOptions{Quantization: "pq"}); err == nil {
+	if err := se.CreateVectorNamespace("m", 16, VectorNamespaceOptions{Quantization: "bogus"}); err == nil {
 		t.Fatal("unknown quantization must fail")
 	}
 }

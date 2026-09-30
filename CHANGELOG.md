@@ -13,6 +13,43 @@ Releases are cut automatically on every merge to `main` (GitHub release +
 
 ### Added
 
+- `bench/compare` (separate Go module): go-ycsb runner with a VeltrixDB
+  driver next to go-ycsb's Aerospike and Cassandra (ScyllaDB) drivers,
+  YCSB A–F workloads, `vecbench` (real-dataset recall / QPS / p99 sweep),
+  docker-compose + `compare.sh` for one-database-at-a-time runs on the same
+  machine. The Aerospike / ScyllaDB paths are compile-checked only.
+- Nightly workflow: recall gates on GloVe-100 (100K real word vectors), a
+  20-minute search soak against an oracle, 10 SIGKILL / restart cycles with
+  every acknowledged write checked, and the group-commit / vector-memory
+  tables in the job summary.
+- Search refuses to answer while the startup index rebuild is running
+  (`search_ready` in `INFO`; `--search-allow-partial` answers anyway).
+
+- Product quantization for vector namespaces (`VCREATE ns dim QUANT pq
+  [PQM m] [PQTRAIN n]`): m bytes per vector (default dim/8), trained in the
+  background once PQTRAIN vectors (default 10,000) exist, with the whole
+  search beam re-ranked against the float32 vectors in the VLog.
+- `GRAPH disk`: layer-0 HNSW edges in a memory-mapped scratch file instead of
+  the Go heap. Measured at 768-dim, 10K vectors: float32 3.4 KB/vector of
+  heap, int8 1.1 KB, pq 0.49 KB, pq + disk graph 0.38 KB heap + 0.22 KB
+  mapped; recall@10 at ef=256 0.78 / 0.78 / 0.74 / 0.71
+  (`TestVectorMemoryTable`, synthetic clustered data).
+
+### Performance
+
+- Quantized re-rank reads the candidates' full vectors with one parallel
+  MultiGet instead of a Get each: GloVe-100 int8 at ef=64, p50 1.9 → 0.61 ms
+  and p99 13.8 → 0.81 ms.
+- Adaptive group commit (`--group-commit=adaptive`, the new default; `fixed`
+  restores the old behaviour). The WAL / VLog flush windows become upper
+  bounds: a lone writer is synced immediately and concurrent writers after an
+  idle gap of about one fdatasync. With an emulated 300 µs sync and the 15 ms
+  default window, a single writer's Put P50 drops from 16 ms to 0.45 ms and 64
+  writers go from 4.0K to 37.5K durable writes/s (P99 16.8 → 2.6 ms) at the
+  same writes per fdatasync.
+
+### Added
+
 - Vector search: multiple namespaces on the wire (`VSET id NS ns ...`,
   binary `VSETNS` 0x08), metadata-filtered search (`VSEARCH k [NS ns] [EF n]
   [FILTER field op value] ...`, binary `VSEARCHX` 0x1E) and deletes (`VDEL`,
@@ -61,6 +98,15 @@ Releases are cut automatically on every merge to `main` (GitHub release +
 
 ### Fixed
 
+- Raft: a freshly elected leader served local reads before applying the
+  entries its predecessor had committed, so a GET right after failover could
+  miss a write the old leader had acknowledged (`TestRaftClusterFailover`
+  failed intermittently with "data lost across failover"; nothing was lost —
+  the write became visible once the new leader's no-op applied). Reads on a
+  new leader now wait for that no-op (`RaftNode.WaitLeaderApplied`, one
+  atomic load once caught up). The text and binary MGET paths now pass the
+  same read barrier as GET, including `--linearizable-reads`, which they
+  used to skip.
 - int8 namespaces searched with a narrower beam than float32 ones: the
   re-rank candidate count (4 × k) replaced the default ef instead of only
   raising it, so k = 10 walked with ef = 40, not 64 (recall@10 0.85 vs 0.93 on

@@ -387,6 +387,24 @@ func (tc *TCPConn) VDel(ns, key string) error {
 	return tc.simpleOK(fmt.Sprintf("VDEL %s NS %s", key, ns))
 }
 
+// VCreateWithOptions sends VCREATE <ns> <dim> with every non-zero option.
+func (tc *TCPConn) VCreateWithOptions(ns string, dim int, opts VectorNamespaceOptions) error {
+	cmd := fmt.Sprintf("VCREATE %s %d", ns, dim)
+	if opts.Quantization != "" {
+		cmd += " QUANT " + opts.Quantization
+	}
+	if opts.PQSubspaces > 0 {
+		cmd += fmt.Sprintf(" PQM %d", opts.PQSubspaces)
+	}
+	if opts.PQTrainAt > 0 {
+		cmd += fmt.Sprintf(" PQTRAIN %d", opts.PQTrainAt)
+	}
+	if opts.Graph != "" {
+		cmd += " GRAPH " + opts.Graph
+	}
+	return tc.simpleOK(cmd)
+}
+
 // VCreate sends VCREATE <ns> <dim> [QUANT <quant>].
 func (tc *TCPConn) VCreate(ns string, dim int, quant string) error {
 	cmd := fmt.Sprintf("VCREATE %s %d", ns, dim)

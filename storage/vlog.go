@@ -165,7 +165,7 @@ type VLog struct {
 // of the device is reserved for a RawSuperblock (magic, version, vlog start).
 // The diskPath directory is still required (and used) for WAL files and the
 // punch watermark.
-func newVLog(diskIdx int, diskPath, rawDevicePath string, flushWindow time.Duration) (*VLog, error) {
+func newVLog(diskIdx int, diskPath, rawDevicePath string, flushWindow time.Duration, groupCommit string) (*VLog, error) {
 	if err := os.MkdirAll(diskPath, 0755); err != nil {
 		return nil, fmt.Errorf("disk %d: mkdir %s: %w", diskIdx, diskPath, err)
 	}
@@ -277,7 +277,7 @@ func newVLog(diskIdx int, diskPath, rawDevicePath string, flushWindow time.Durat
 		vl.punchWatermark.Store(saved)
 	}
 
-	go vl.flusher(flushWindow)
+	go vl.flusher(newCommitPacer(groupCommit, flushWindow))
 	return vl, nil
 }
 
@@ -650,8 +650,10 @@ func (vl *VLog) close() error {
 //
 // It mirrors the WAL flusher: drain all pending vlogFlushReqs, call one
 // fdatasync, then reply to every waiter.  window is the maximum time to
-// wait for more requests to arrive before flushing (matches WALFlushWindowMs).
-func (vl *VLog) flusher(window time.Duration) {
+// wait for more requests to arrive before flushing (matches WALFlushWindowMs);
+// the pacer applies the same fixed / adaptive policy as the WAL
+// (group_commit.go).
+func (vl *VLog) flusher(pacer *commitPacer) {
 	defer close(vl.flusherDone)
 	pending := make([]*vlogFlushReq, 0, 4096)
 
@@ -659,7 +661,9 @@ func (vl *VLog) flusher(window time.Duration) {
 		if len(pending) == 0 {
 			return
 		}
-		err := fdatasync(int(vl.file.Fd()))
+		t0 := time.Now()
+		err := groupCommitSync(int(vl.file.Fd()))
+		pacer.observe(len(pending), time.Since(t0))
 		for _, req := range pending {
 			req.resp <- err
 		}
@@ -678,42 +682,24 @@ func (vl *VLog) flusher(window time.Duration) {
 		}
 	}
 
-	var (
-		timer  *time.Timer
-		timerC <-chan time.Time
-	)
-	startTimer := func() {
-		if window > 0 && timer == nil {
-			timer = time.NewTimer(window)
-			timerC = timer.C
-		}
-	}
-	stopTimer := func() {
-		if timer != nil {
-			timer.Stop()
-			timer = nil
-			timerC = nil
-		}
-	}
+	var bt batchTimer
 
 	for {
 		select {
 		case req := <-vl.flushCh:
 			pending = append(pending, req)
-			startTimer()
 			drain()
-			if window == 0 || len(pending) >= 4096 {
-				stopTimer()
+			if pacer.schedule(&bt, len(pending), len(pending) >= 4096) {
+				bt.stop()
 				flush()
 			}
 
-		case <-timerC:
-			timer = nil
-			timerC = nil
+		case <-bt.C:
+			bt.stop()
 			flush()
 
 		case <-vl.doneCh:
-			stopTimer()
+			bt.stop()
 		drainFinal:
 			for {
 				select {

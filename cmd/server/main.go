@@ -167,8 +167,13 @@ func main() {
 	cacheMB := flag.Uint("cache", 256, "LIRS cache size in MB (ignored when --auto-tune is set)")
 	gcThreshold := flag.Float64("gc-threshold", 0.30,
 		"VLog dead-space ratio that triggers compaction (0.0–1.0).\n\tLower = more frequent but smaller GC passes. Default 0.30.")
+	groupCommit := flag.String("group-commit", "adaptive",
+		"How the WAL/VLog flush windows are used:\n"+
+			"\tadaptive (default): the window is an upper bound — a lone writer is synced at once,\n"+
+			"\tconcurrent writers are synced after an idle gap of about one fdatasync.\n"+
+			"\tfixed: every batch waits the full window (the pre-2026-10 behaviour).")
 	walWindowMs := flag.Int("wal-flush-window-ms", 15,
-		"WAL group-commit flush window in milliseconds.\n"+
+		"WAL group-commit flush window in milliseconds (the upper bound in adaptive mode).\n"+
 			"\t15ms (default): ~200 entries/batch at 100K writes/s; matches WriteBatcher window.\n"+
 			"\t5ms: lower latency but fewer entries/fdatasync; use for latency-sensitive workloads.\n"+
 			"\tMust match --vlog-flush-window-ms (Invariant 20).")
@@ -391,6 +396,10 @@ func main() {
 	cfg.VLogFlushWindowMs = *vlogWindowMs
 	cfg.WALMaxBatchEntries = *walMaxBatch
 	cfg.WALFormat = *walFormat
+	if *groupCommit != storage.GroupCommitAdaptive && *groupCommit != storage.GroupCommitFixed {
+		log.Fatalf("--group-commit must be %s or %s, got %q", storage.GroupCommitAdaptive, storage.GroupCommitFixed, *groupCommit)
+	}
+	cfg.GroupCommit = *groupCommit
 	cfg.DefragThreshold = *gcThreshold
 	cfg.EncryptionEnabled = *encryptAtRest
 	cfg.EncryptionKeyPath = *encryptKeyPath
@@ -415,6 +424,7 @@ func main() {
 	cfg.WALFlushWindowMs = *walWindowMs
 	cfg.VLogFlushWindowMs = *vlogWindowMs
 	cfg.WALMaxBatchEntries = *walMaxBatch
+	cfg.GroupCommit = *groupCommit
 
 	// Start health server before engine init so the liveness probe never
 	// times out during slow startup (WAL replay, VLog device open, etc.).
@@ -474,12 +484,16 @@ func main() {
 	// Rebuild the in-RAM vector indexes from persisted "@vec/..." keys once
 	// the background WAL replay has finished. VSET/VSEARCH work immediately;
 	// vectors written before the restart become searchable when this completes.
+	// Searches are refused (not answered from a half-loaded index) until this
+	// finishes, unless --search-allow-partial.
+	engine.BeginSearchRebuild()
 	go func() {
 		<-engine.ReplayDone
-		if n, rerr := engine.RebuildVectorIndexes(); rerr != nil {
-			log.Printf("[vector] rebuild failed: %v", rerr)
-		} else if n > 0 {
-			log.Printf("[vector] rebuilt %d persisted vectors", n)
+		t0 := time.Now()
+		if nv, nd, rerr := engine.RebuildSearchIndexes(); rerr != nil {
+			log.Printf("[search] rebuild failed: %v", rerr)
+		} else {
+			log.Printf("[search] rebuilt %d vectors and %d text documents in %s", nv, nd, time.Since(t0).Round(time.Millisecond))
 		}
 	}()
 
@@ -1101,6 +1115,10 @@ func handleTextConn(conn net.Conn, br *bufio.Reader, engine *storage.StorageEngi
 				writeLine("ERR usage: MGET <key> [key ...]")
 				continue
 			}
+			if err := coord.readBarrier(); err != nil {
+				writeLine("ERR " + err.Error())
+				continue
+			}
 			for _, k := range keys {
 				if val, err := engine.Get(k); err == nil {
 					fmt.Fprintf(w, "%s %s\n", k, val)
@@ -1276,6 +1294,11 @@ func handleTextConn(conn net.Conn, br *bufio.Reader, engine *storage.StorageEngi
 				m.CompactionRuns.Load(),
 				engine.GetVersion(),
 			)
+			if ready, loaded, total := engine.SearchIndexStatus(); ready {
+				info += " search_ready=1"
+			} else {
+				info += fmt.Sprintf(" search_ready=0 search_loaded=%d/%d", loaded, total)
+			}
 			for _, ds := range engine.GetDiskStats() {
 				info += fmt.Sprintf(" disk[%d]=%s:%.1fMB", ds.DiskIdx, ds.Path, float64(ds.SegmentBytes)/1e6)
 			}
@@ -1874,14 +1897,9 @@ func handleTextConn(conn net.Conn, br *bufio.Reader, engine *storage.StorageEngi
 				writeLine("ERR " + err.Error())
 				continue
 			}
-			const usage = "ERR usage: VCREATE <ns> <dim> [QUANT none|int8]"
+			const usage = "ERR usage: VCREATE <ns> <dim> [QUANT none|int8|pq] [PQM <m>] [PQTRAIN <n>] [GRAPH memory|disk]"
 			full := strings.Fields(line)
-			quant := ""
-			switch {
-			case len(full) == 3:
-			case len(full) == 5 && strings.ToUpper(full[3]) == "QUANT":
-				quant = full[4]
-			default:
+			if len(full) < 3 || len(full)%2 == 0 {
 				writeLine(usage)
 				continue
 			}
@@ -1890,7 +1908,33 @@ func handleTextConn(conn net.Conn, br *bufio.Reader, engine *storage.StorageEngi
 				writeLine(usage)
 				continue
 			}
-			if err := coord.VCreate(full[1], dim, quant); err != nil {
+			var opts storage.VectorNamespaceOptions
+			bad := false
+			for i := 3; i+1 < len(full) && !bad; i += 2 {
+				val := full[i+1]
+				switch strings.ToUpper(full[i]) {
+				case "QUANT":
+					opts.Quantization = val
+				case "GRAPH":
+					opts.Graph = val
+				case "PQM", "PQTRAIN":
+					n, err := strconv.Atoi(val)
+					if err != nil || n < 0 {
+						bad = true
+					} else if strings.ToUpper(full[i]) == "PQM" {
+						opts.PQSubspaces = n
+					} else {
+						opts.PQTrainAt = n
+					}
+				default:
+					bad = true
+				}
+			}
+			if bad {
+				writeLine(usage)
+				continue
+			}
+			if err := coord.VCreate(full[1], dim, opts); err != nil {
 				writeLine("ERR " + err.Error())
 			} else {
 				writeLine("OK")
@@ -2433,7 +2477,7 @@ func handleBinaryConn(conn net.Conn, br *bufio.Reader, engine *storage.StorageEn
 				_ = sendResp(binStatusErr, []byte(err.Error()))
 				return
 			}
-			if err := handleMGet(valLen, br, bw, engine); err != nil {
+			if err := handleMGet(valLen, br, bw, engine, coord); err != nil {
 				return
 			}
 			continue
@@ -2924,6 +2968,13 @@ func handleBinaryConn(conn net.Conn, br *bufio.Reader, engine *storage.StorageEn
 				if need <= maxPooledPayload {
 					binPayloadPool.Put(payPtr)
 				}
+				if err := coord.readBarrier(); err != nil {
+					for range keys {
+						_ = writeResp(binStatusErr, []byte(err.Error()))
+					}
+					_ = bw.Flush()
+					continue
+				}
 				for _, r := range engine.MultiGet(keys) {
 					if !r.Found || r.Value == nil {
 						_ = writeResp(binStatusNotFound, nil)
@@ -3228,7 +3279,7 @@ func handleMPut(count int, br *bufio.Reader, bw *bufio.Writer, engine *storage.S
 //
 //	[1B 0x00 OK][4B count LE]
 //	count × [1B status][4B valLen LE][value bytes]
-func handleMGet(count int, br *bufio.Reader, bw *bufio.Writer, engine *storage.StorageEngine) error {
+func handleMGet(count int, br *bufio.Reader, bw *bufio.Writer, engine *storage.StorageEngine, coord *coordinator) error {
 	if count <= 0 || count > maxBatchCount {
 		resp := [5]byte{binStatusErr}
 		_, err := bw.Write(resp[:])
@@ -3263,6 +3314,19 @@ func handleMGet(count int, br *bufio.Reader, bw *bufio.Writer, engine *storage.S
 		}
 	}
 
+	if err := coord.readBarrier(); err != nil {
+		msg := []byte(err.Error())
+		var hdr [5]byte
+		hdr[0] = binStatusErr
+		binary.LittleEndian.PutUint32(hdr[1:], uint32(len(msg)))
+		if _, werr := bw.Write(hdr[:]); werr != nil {
+			return werr
+		}
+		if _, werr := bw.Write(msg); werr != nil {
+			return werr
+		}
+		return bw.Flush()
+	}
 	results := engine.MultiGet(keys)
 
 	var respHdr [5]byte

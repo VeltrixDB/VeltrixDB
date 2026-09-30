@@ -71,6 +71,19 @@ Linux with `uring`, with `poll`, and with `uring` under `-race`.
 | node-7-search | `CGO_ENABLED=0` + cgo for `-race` | search regression: recall / ranking gates (`TestSearchQualityGate*`, numbers in the job summary), the search / hook / routing / signing tests under `-race`, and `TestSearchCluster_EndToEnd` on a real 3-process cluster |
 | Net front-end | cgo, liburing | `./netfront/...` tests plus `scripts/net-bench.sh` |
 
+### Nightly hardening (`.github/workflows/nightly.yml`)
+
+| Job | What it checks | Run locally |
+|--|--|--|
+| real-embeddings | recall@10 gates on GloVe-100 (first 100K words, 500 queries) for float32 / int8 / pq / pq + disk graph | `scripts/ann-dataset.py glove-100-angular /tmp/ann --train 100000 --test 500` then `VELTRIX_ANN_DIR=/tmp/ann go test ./storage -run TestRealEmbeddings -v` |
+| search-soak | 4 writers + 4 searchers for 20 min against an oracle: no result that was not live, self-queries and text markers of stable ids found, RSS levels off, exact match after a clean restart | `VELTRIX_SOAK_DURATION=5m go test ./tests/integration -run TestSearchSoak -v` |
+| crash-chaos | SIGKILL mid-write, restart, every acknowledged vector / text / record write present and no acknowledged delete back — 10 cycles | `VELTRIX_CHAOS_CYCLES=10 go test ./tests/integration -run TestSearchCrashRecovery -v` |
+| perf-tables | adaptive vs fixed group commit (emulated fdatasync), RAM per vector at 768-dim | `VELTRIX_GC_TABLE=1 VELTRIX_VECTOR_MEMORY=1 go test ./storage -run 'LatencyTable|MemoryTable' -v` |
+| kv-soak | `scripts/soak.sh` (manual dispatch with `kv_soak_hours`) | `SOAK_HOURS=1 ./scripts/soak.sh` |
+
+The soak test caught its own false positives before it was trusted: a miss
+only counts when the id's version is unchanged across the search.
+
 ### Search quality gates
 
 `storage/search_quality_test.go` pins recall@10 on a fixed, seeded, clustered

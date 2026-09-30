@@ -25,7 +25,7 @@ func newTestWAL(t *testing.T, flushWindow time.Duration, maxBatch int) (*WriteAh
 	t.Cleanup(func() { os.RemoveAll(dir) })
 
 	var flushCount atomic.Uint64
-	wal, err := newWriteAheadLog(dir, &flushCount, flushWindow, maxBatch, 0)
+	wal, err := newWriteAheadLog(dir, &flushCount, flushWindow, maxBatch, 0, GroupCommitFixed)
 	if err != nil {
 		t.Fatalf("newWriteAheadLog: %v", err)
 	}
@@ -62,7 +62,7 @@ func TestWAL_GroupCommit(t *testing.T) {
 	t.Cleanup(func() { os.RemoveAll(dir) })
 
 	var flushCount atomic.Uint64
-	wal, err := newWriteAheadLog(dir, &flushCount, flushWindow, 1024, 0)
+	wal, err := newWriteAheadLog(dir, &flushCount, flushWindow, 1024, 0, GroupCommitFixed)
 	if err != nil {
 		t.Fatalf("newWriteAheadLog: %v", err)
 	}
@@ -108,7 +108,7 @@ func TestWAL_ImmediateMode(t *testing.T) {
 	t.Cleanup(func() { os.RemoveAll(dir) })
 
 	var flushCount atomic.Uint64
-	wal, err := newWriteAheadLog(dir, &flushCount, 0 /*immediate*/, 1024, 0)
+	wal, err := newWriteAheadLog(dir, &flushCount, 0 /*immediate*/, 1024, 0, GroupCommitFixed)
 	if err != nil {
 		t.Fatalf("newWriteAheadLog: %v", err)
 	}

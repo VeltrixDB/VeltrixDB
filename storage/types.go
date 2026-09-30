@@ -558,8 +558,14 @@ type StorageConfig struct {
 	//
 	// WALMaxBatchEntries: safety cap; if pending entries reach this count
 	// before the window expires the flusher fires early regardless of the timer.
-	WALFlushWindowMs   int // default 10 ms; 0 = immediate
-	VLogFlushWindowMs  int // default 10 ms; 0 = immediate (must match WALFlushWindowMs)
+	WALFlushWindowMs  int // default 15 ms; 0 = immediate
+	VLogFlushWindowMs int // default 15 ms; 0 = immediate (must match WALFlushWindowMs)
+	// GroupCommit selects how the windows above are used (group_commit.go):
+	// GroupCommitAdaptive (default; "" means the same) treats them as an
+	// upper bound — a lone writer is flushed at once and concurrent writers
+	// are flushed after an idle gap of about one fdatasync —
+	// GroupCommitFixed waits the full window for every batch.
+	GroupCommit        string
 	WALMaxBatchEntries int // default 1024
 
 	// WALFormat is the encoding for NEW WAL records and clean-shutdown
@@ -664,8 +670,9 @@ func DefaultStorageConfig() *StorageConfig {
 		// At 10 K writes/s/disk: batch_size ≈ 100 — crosses the target.
 		// With concurrent WAL+VLog (Put() submits both then waits for both),
 		// P99 ≈ max(WALWindow, VLogWindow) + fdatasync ≈ 10.2 ms on NVMe.
-		WALFlushWindowMs:   15,   // 15 ms group-commit window; matches WriteBatcher batchFlushDur for ~200 entries/batch
-		VLogFlushWindowMs:  15,   // must match WALFlushWindowMs (Invariant 20)
+		WALFlushWindowMs:   15, // 15 ms group-commit window; matches WriteBatcher batchFlushDur for ~200 entries/batch
+		VLogFlushWindowMs:  15, // must match WALFlushWindowMs (Invariant 20)
+		GroupCommit:        GroupCommitAdaptive,
 		WALMaxBatchEntries: 4096, // force early flush at 4096 entries; headroom for 100K+/s bursts
 
 		// --- Write Stall / Back-pressure ---

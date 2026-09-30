@@ -269,6 +269,13 @@ type RaftNode struct {
 	commitIndex uint64
 	lastApplied uint64
 
+	// termStartIndex is the index of the no-op this node appended when it
+	// last became leader; leaderReady is set once that entry is applied, i.e.
+	// every entry committed by earlier leaders is in the state machine
+	// (WaitLeaderApplied). Guarded by mu / atomic respectively.
+	termStartIndex uint64
+	leaderReady    atomic.Bool
+
 	// Volatile state on leaders (reinitialized after election)
 	nextIndex  map[string]uint64
 	matchIndex map[string]uint64
@@ -965,6 +972,8 @@ func (rn *RaftNode) becomeLeader() {
 		Command: nil,
 	}
 	rn.ps.Log = append(rn.ps.Log, noop)
+	rn.termStartIndex = noop.Index
+	rn.leaderReady.Store(false)
 
 	// Single-node configurations commit the no-op immediately.
 	rn.maybeAdvanceCommit()
@@ -1270,6 +1279,9 @@ func (rn *RaftNode) applySingle(e LogEntry) {
 func (rn *RaftNode) finishApplied(e LogEntry) {
 	rn.mu.Lock()
 	rn.lastApplied = e.Index
+	if rn.role == RoleLeader && e.Index >= rn.termStartIndex {
+		rn.leaderReady.Store(true)
+	}
 	// Commit notification: wake Submit callers blocked on this index.
 	for _, ch := range rn.waiters[e.Index] {
 		select {
