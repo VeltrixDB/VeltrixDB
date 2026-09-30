@@ -11,6 +11,18 @@ Releases are cut automatically on every merge to `main` (GitHub release +
 
 ## [Unreleased]
 
+### Added
+
+- Product quantization for vector namespaces (`VCREATE ns dim QUANT pq
+  [PQM m] [PQTRAIN n]`): m bytes per vector (default dim/8), trained in the
+  background once PQTRAIN vectors (default 10,000) exist, with the whole
+  search beam re-ranked against the float32 vectors in the VLog.
+- `GRAPH disk`: layer-0 HNSW edges in a memory-mapped scratch file instead of
+  the Go heap. Measured at 768-dim, 10K vectors: float32 3.4 KB/vector of
+  heap, int8 1.1 KB, pq 0.49 KB, pq + disk graph 0.38 KB heap + 0.22 KB
+  mapped; recall@10 at ef=256 0.78 / 0.78 / 0.74 / 0.71
+  (`TestVectorMemoryTable`, synthetic clustered data).
+
 ### Performance
 
 - Adaptive group commit (`--group-commit=adaptive`, the new default; `fixed`

@@ -70,8 +70,11 @@ type hnswNode struct {
 	id  string
 	vec []float32 // never mutated after insert (updates add a new node); nil when quantized
 	// Quantized form (VectorIndex.quant): vec[i] ≈ code[i] × scale.
-	code    []int8
-	scale   float32
+	code  []int8
+	scale float32
+	// Product-quantized form (VectorIndex.pq, pq.go): one centroid index per
+	// subspace. Set once the namespace's codebook is trained.
+	pqc     []uint8
 	level   int
 	deleted bool
 	// neighbors[l] lists node indices adjacent at layer l (0..level).
@@ -172,11 +175,16 @@ func dequantizeInt8(code []int8, scale float32) []float32 {
 }
 
 // sim is the similarity of q to node idx: exact for float32 nodes,
-// approximate for quantized ones. Caller must hold vi.mu.
+// approximate for quantized ones. PQ nodes are decoded, so this is for
+// node-to-node comparisons during construction; query paths use a scorer.
+// Caller must hold vi.mu.
 func (vi *VectorIndex) sim(q []float32, idx int32) float32 {
 	n := vi.nodes[idx]
-	if n.code != nil {
+	switch {
+	case n.code != nil:
 		return dotF32I8(q, n.code) * n.scale
+	case n.pqc != nil:
+		return dot(q, vi.pq.decode(n.pqc))
 	}
 	return dot(q, n.vec)
 }
@@ -185,10 +193,38 @@ func (vi *VectorIndex) sim(q []float32, idx int32) float32 {
 // Caller must hold vi.mu.
 func (vi *VectorIndex) vecOf(idx int32) []float32 {
 	n := vi.nodes[idx]
-	if n.code != nil {
+	switch {
+	case n.code != nil:
 		return dequantizeInt8(n.code, n.scale)
+	case n.pqc != nil:
+		return vi.pq.decode(n.pqc)
 	}
 	return n.vec
+}
+
+// queryScorer scores one query against many nodes. For a PQ index it holds
+// the query's ADC table, built once instead of per node.
+type queryScorer struct {
+	q     []float32
+	table []float32 // nil unless vi.pq != nil
+}
+
+// scorer prepares q for a search. Caller must hold vi.mu.
+func (vi *VectorIndex) scorer(q []float32) *queryScorer {
+	sc := &queryScorer{q: q}
+	if vi.pq != nil {
+		sc.table = vi.pq.table(q)
+	}
+	return sc
+}
+
+// score is sim through a scorer. Caller must hold vi.mu.
+func (vi *VectorIndex) score(sc *queryScorer, idx int32) float32 {
+	n := vi.nodes[idx]
+	if n.pqc != nil {
+		return vi.pq.adcScore(sc.table, n.pqc)
+	}
+	return vi.sim(sc.q, idx)
 }
 
 // simItem is one (similarity, node index) pair.
@@ -319,7 +355,7 @@ func (v *visitedSet) visit(i int32) bool {
 // maxVisit > 0 stops the walk after that many visited nodes. Returns up to ef
 // accepted (similarity, index) pairs in unspecified order. Caller must hold
 // vi.mu (read or write).
-func (vi *VectorIndex) searchLayer(q []float32, eps []int32, ef, layer int, accept func(int32) bool, maxVisit int) []simItem {
+func (vi *VectorIndex) searchLayer(sc *queryScorer, eps []int32, ef, layer int, accept func(int32) bool, maxVisit int) []simItem {
 	visited := getVisited(len(vi.nodes))
 	defer visitedPool.Put(visited)
 
@@ -340,7 +376,7 @@ func (vi *VectorIndex) searchLayer(q []float32, eps []int32, ef, layer int, acce
 			continue
 		}
 		nVisited++
-		s := vi.sim(q, ep)
+		s := vi.score(sc, ep)
 		candidates.push(simItem{s, ep})
 		offer(s, ep)
 	}
@@ -350,16 +386,12 @@ func (vi *VectorIndex) searchLayer(q []float32, eps []int32, ef, layer int, acce
 		if len(results) >= ef && c.sim < results[0].sim {
 			break // best remaining candidate is worse than the worst kept result
 		}
-		node := vi.nodes[c.idx]
-		if layer >= len(node.neighbors) {
-			continue
-		}
-		for _, nb := range node.neighbors[layer] {
+		for _, nb := range vi.nbrs(c.idx, layer) {
 			if !visited.visit(nb) {
 				continue
 			}
 			nVisited++
-			s := vi.sim(q, nb)
+			s := vi.score(sc, nb)
 			if len(results) < ef || s > results[0].sim {
 				candidates.push(simItem{s, nb})
 				offer(s, nb)
@@ -375,18 +407,14 @@ func (vi *VectorIndex) searchLayer(q []float32, eps []int32, ef, layer int, acce
 // greedyDescend walks from ep down through layers (top..targetLayer+1) taking
 // the locally best neighbor at each step. Upper layers are routing-only, so
 // tombstoned nodes are valid stepping stones. Caller must hold vi.mu.
-func (vi *VectorIndex) greedyDescend(q []float32, ep int32, fromLayer, toLayer int) int32 {
+func (vi *VectorIndex) greedyDescend(sc *queryScorer, ep int32, fromLayer, toLayer int) int32 {
 	cur := ep
-	curSim := vi.sim(q, cur)
+	curSim := vi.score(sc, cur)
 	for l := fromLayer; l > toLayer; l-- {
 		for improved := true; improved; {
 			improved = false
-			node := vi.nodes[cur]
-			if l >= len(node.neighbors) {
-				break
-			}
-			for _, nb := range node.neighbors[l] {
-				if s := vi.sim(q, nb); s > curSim {
+			for _, nb := range vi.nbrs(cur, l) {
+				if s := vi.score(sc, nb); s > curSim {
 					curSim, cur = s, nb
 					improved = true
 				}
@@ -414,6 +442,7 @@ func (vi *VectorIndex) selectNeighbors(cands []simItem, m int) []int32 {
 	sort.Slice(sorted, func(i, j int) bool { return sorted[i].sim > sorted[j].sim })
 
 	selected := make([]int32, 0, m)
+	selVecs := make([][]float32, 0, m) // decoded once each
 	var pruned []int32
 	for _, c := range sorted {
 		if len(selected) >= m {
@@ -421,14 +450,15 @@ func (vi *VectorIndex) selectNeighbors(cands []simItem, m int) []int32 {
 		}
 		cv := vi.vecOf(c.idx)
 		diverse := true
-		for _, s := range selected {
-			if vi.sim(cv, s) > c.sim {
+		for _, sv := range selVecs {
+			if dot(cv, sv) > c.sim {
 				diverse = false
 				break
 			}
 		}
 		if diverse {
 			selected = append(selected, c.idx)
+			selVecs = append(selVecs, cv)
 		} else {
 			pruned = append(pruned, c.idx)
 		}
@@ -452,20 +482,28 @@ type hnswPlan struct {
 	epoch uint64
 	empty bool      // graph had no nodes when planned
 	links [][]int32 // links[l] for l in 0..min(level, maxLevel)
+	// PQ code computed while planning (outside the write lock), valid for
+	// codebook pqcb only.
+	pqc  []uint8
+	pqcb *pqCodebook
 }
 
 // planInsert searches for the new node's neighbours without mutating the
 // graph. Caller must hold vi.mu (read suffices).
 func (vi *VectorIndex) planInsert(vec []float32, level int) hnswPlan {
 	p := hnswPlan{epoch: vi.epoch}
+	if vi.pq != nil {
+		p.pqcb, p.pqc = vi.pq, vi.pq.encode(vec)
+	}
 	if len(vi.nodes) == 0 {
 		p.empty = true
 		return p
 	}
+	sc := vi.scorer(vec)
 	ep := vi.entry
 	// Phase 1: greedy descend from the top of the graph to level+1.
 	if vi.maxLevel > level {
-		ep = vi.greedyDescend(vec, ep, vi.maxLevel, level)
+		ep = vi.greedyDescend(sc, ep, vi.maxLevel, level)
 	}
 	// Phase 2: beam search on each layer from min(level, maxLevel) down to 0.
 	startLayer := level
@@ -479,12 +517,12 @@ func (vi *VectorIndex) planInsert(vec []float32, level int) hnswPlan {
 		if l == 0 {
 			// Layer 0 carries the result edges: don't spend them on
 			// tombstones, unless nothing live is reachable at all.
-			found = vi.searchLayer(vec, eps, hnswEfConstruction, 0, vi.isLive, 0)
+			found = vi.searchLayer(sc, eps, hnswEfConstruction, 0, vi.isLive, 0)
 			if len(found) == 0 {
-				found = vi.searchLayer(vec, eps, hnswEfConstruction, 0, nil, 0)
+				found = vi.searchLayer(sc, eps, hnswEfConstruction, 0, nil, 0)
 			}
 		} else {
-			found = vi.searchLayer(vec, eps, hnswEfConstruction, l, nil, 0)
+			found = vi.searchLayer(sc, eps, hnswEfConstruction, l, nil, 0)
 		}
 		p.links[l] = vi.selectNeighbors(found, hnswM)
 		if len(found) > 0 {
@@ -515,14 +553,24 @@ func (vi *VectorIndex) commitInsert(id string, vec []float32, level int, p hnswP
 		level:     level,
 		neighbors: make([][]int32, level+1),
 	}
-	if vi.quant {
+	switch {
+	case vi.quant:
 		node.code, node.scale = quantizeInt8(vec)
-	} else {
-		node.vec = vec
+	case vi.pq != nil:
+		if p.pqcb == vi.pq {
+			node.pqc = p.pqc
+		} else {
+			node.pqc = vi.pq.encode(vec) // codebook trained after planning
+		}
+	default:
+		node.vec = vec // also a PQ namespace before its codebook is trained
 	}
 	vi.nodes = append(vi.nodes, node)
 	vi.byID[id] = idx
 	vi.live++
+	if vi.adj0 != nil {
+		vi.adj0.ensure(int(idx) + 1)
+	}
 
 	if idx == 0 {
 		vi.entry = 0
@@ -534,26 +582,29 @@ func (vi *VectorIndex) commitInsert(id string, vec []float32, level int, p hnswP
 		if l > level {
 			break
 		}
-		node.neighbors[l] = selected
+		vi.setNbrs(idx, l, selected)
 		mmax := hnswM
 		if l == 0 {
 			mmax = hnswMmax0
 		}
 		// Bidirectional links with heuristic pruning on the neighbour side.
 		for _, nb := range selected {
-			nbNode := vi.nodes[nb]
-			if l >= len(nbNode.neighbors) {
+			if l > vi.nodes[nb].level {
 				continue
 			}
-			nbNode.neighbors[l] = append(nbNode.neighbors[l], idx)
-			if len(nbNode.neighbors[l]) > mmax {
+			cur := vi.nbrs(nb, l)
+			list := make([]int32, len(cur), len(cur)+1)
+			copy(list, cur) // cur may alias the disk graph's mapping
+			list = append(list, idx)
+			if len(list) > mmax {
 				base := vi.vecOf(nb)
-				items := make([]simItem, len(nbNode.neighbors[l]))
-				for i, x := range nbNode.neighbors[l] {
+				items := make([]simItem, len(list))
+				for i, x := range list {
 					items[i] = simItem{vi.sim(base, x), x}
 				}
-				nbNode.neighbors[l] = vi.selectNeighbors(items, mmax)
+				list = vi.selectNeighbors(items, mmax)
 			}
+			vi.setNbrs(nb, l, list)
 		}
 	}
 
@@ -589,6 +640,7 @@ func (vi *VectorIndex) insert(id string, vec []float32) {
 		}
 		vi.commitInsert(id, vec, level, p)
 		vi.maybeCompactLocked()
+		vi.maybeTrainPQLocked()
 		vi.mu.Unlock()
 		return
 	}
@@ -645,7 +697,7 @@ func (vi *VectorIndex) liveSnapshotLocked() []hnswOp {
 // compact builds a fresh graph from snap without holding vi.mu, then replays
 // the writes recorded meanwhile and swaps the fresh graph in.
 func (vi *VectorIndex) compact(snap []hnswOp) {
-	fresh := &VectorIndex{dim: vi.dim, quant: vi.quant, byID: make(map[string]int32, len(snap))}
+	fresh := vi.emptyLike(len(snap))
 	for _, op := range snap {
 		fresh.insertHNSW(op.id, op.vec)
 	}
@@ -659,12 +711,54 @@ func (vi *VectorIndex) compact(snap []hnswOp) {
 			fresh.insertHNSW(op.id, op.vec)
 		}
 	}
+	oldAdj := vi.adj0
 	vi.nodes, vi.byID = fresh.nodes, fresh.byID
 	vi.entry, vi.maxLevel, vi.live = fresh.entry, fresh.maxLevel, fresh.live
+	vi.adj0, vi.adjDir = fresh.adj0, fresh.adjDir
+	if oldAdj != nil {
+		oldAdj.close() // write lock held: no search can still be reading it
+	}
 	vi.pending = nil
 	vi.compacting = false
 	vi.epoch++
 	vi.compactions++
+	// A codebook trained while the fresh graph was being built left its
+	// nodes as float32.
+	vi.encodePQLocked()
+}
+
+// emptyLike returns an empty index with vi's settings and codebook (and its
+// own disk-graph file when vi has one).
+func (vi *VectorIndex) emptyLike(capacity int) *VectorIndex {
+	fresh := &VectorIndex{
+		dim: vi.dim, quant: vi.quant,
+		pqMode: vi.pqMode, pqM: vi.pqM, pqTrainAt: vi.pqTrainAt, pq: vi.pq,
+		adjDir: vi.adjDir,
+		byID:   make(map[string]int32, capacity),
+	}
+	if vi.adjDir != "" {
+		if a, err := newMappedAdj(vi.adjDir); err == nil {
+			fresh.adj0 = a
+		} else {
+			fresh.adjDir = ""
+		}
+	}
+	return fresh
+}
+
+// retire releases an index that has been replaced in the registry. It waits
+// for in-flight searches (the write lock), then unmaps the disk graph and
+// empties the index, so a search that picked it up just before the swap
+// finds no nodes rather than a closed mapping.
+func (vi *VectorIndex) retire() {
+	vi.mu.Lock()
+	defer vi.mu.Unlock()
+	if vi.adj0 != nil {
+		vi.adj0.close()
+		vi.adj0 = nil
+	}
+	vi.nodes, vi.byID, vi.live = nil, map[string]int32{}, 0
+	vi.epoch++
 }
 
 // searchHNSW returns the top-k live ids by cosine similarity.
@@ -701,8 +795,9 @@ func (vi *VectorIndex) searchFiltered(q []float32, k, ef int, accept func(id str
 		maxVisit = hnswFilterVisitBase + hnswFilterVisitPerEf*ef
 	}
 
-	ep := vi.greedyDescend(q, vi.entry, vi.maxLevel, 0)
-	found := vi.searchLayer(q, []int32{ep}, ef, 0, accept0, maxVisit)
+	sc := vi.scorer(q)
+	ep := vi.greedyDescend(sc, vi.entry, vi.maxLevel, 0)
+	found := vi.searchLayer(sc, []int32{ep}, ef, 0, accept0, maxVisit)
 	return topMatches(vi, found, k)
 }
 
@@ -711,12 +806,13 @@ func (vi *VectorIndex) searchFiltered(q []float32, k, ef int, accept func(id str
 // returns all of them. Caller must hold vi.mu.
 func (vi *VectorIndex) bruteForce(q []float32, k int, ids []string, accept func(id string) bool) []VectorMatch {
 	var items []simItem
+	sc := vi.scorer(q)
 	score := func(idx int32) {
 		n := vi.nodes[idx]
 		if n.deleted || (accept != nil && !accept(n.id)) {
 			return
 		}
-		items = append(items, simItem{vi.sim(q, idx), idx})
+		items = append(items, simItem{vi.score(sc, idx), idx})
 	}
 	if ids != nil {
 		for _, id := range ids {
@@ -749,14 +845,44 @@ func topMatches(vi *VectorIndex, items []simItem, k int) []VectorMatch {
 // adjacency), avoiding a full graph walk.
 func (vi *VectorIndex) hnswStatsBytes() int64 {
 	var b int64
+	if vi.pq != nil {
+		b += vi.pq.bytes()
+	}
 	for _, n := range vi.nodes {
-		b += int64(len(n.vec))*4 + int64(len(n.code))
+		b += int64(len(n.vec))*4 + int64(len(n.code)) + int64(len(n.pqc))
 		if n.code != nil {
 			b += 4 // scale
 		}
-		for _, adj := range n.neighbors {
+		for l, adj := range n.neighbors {
+			if l == 0 && vi.adj0 != nil {
+				continue // on the mapped file, not the heap (diskGraphBytes)
+			}
 			b += int64(len(adj)) * 4
 		}
 	}
 	return b
+}
+
+// nbrs returns node idx's adjacency at layer l. With a disk graph, layer 0
+// is a view into the mapped file, valid only while vi.mu is held. Caller
+// must hold vi.mu.
+func (vi *VectorIndex) nbrs(idx int32, l int) []int32 {
+	if l == 0 && vi.adj0 != nil {
+		return vi.adj0.get(int(idx))
+	}
+	n := vi.nodes[idx]
+	if l >= len(n.neighbors) {
+		return nil
+	}
+	return n.neighbors[l]
+}
+
+// setNbrs replaces node idx's adjacency at layer l. Caller must hold vi.mu
+// exclusively (or own a private index).
+func (vi *VectorIndex) setNbrs(idx int32, l int, list []int32) {
+	if l == 0 && vi.adj0 != nil {
+		vi.adj0.set(int(idx), list)
+		return
+	}
+	vi.nodes[idx].neighbors[l] = list
 }

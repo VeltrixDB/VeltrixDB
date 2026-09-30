@@ -393,8 +393,8 @@ func loadClusterSecret(path string) ([]byte, error) {
 
 // VCreate creates or reconfigures a vector namespace on every node by writing
 // its settings key through the replicated Put path.
-func (c *coordinator) VCreate(ns string, dim int, quant string) error {
-	val, err := c.engine.EncodeVectorNamespaceConfig(ns, dim, storage.VectorNamespaceOptions{Quantization: quant})
+func (c *coordinator) VCreate(ns string, dim int, opts storage.VectorNamespaceOptions) error {
+	val, err := c.engine.EncodeVectorNamespaceConfig(ns, dim, opts)
 	if err != nil {
 		return err
 	}

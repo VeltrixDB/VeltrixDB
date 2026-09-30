@@ -568,7 +568,7 @@ jobs:
         run: |
           set -o pipefail
           CGO_ENABLED=1 go test -race -v -timeout 600s -count=1 \
-            -run 'HNSW|Vector|Text|Tokenize|Hybrid|Search|IndexDef|ReservedKeys|Secondary|FieldIndex|RoutingKey|TransferAuth|Fanout|Distributed|RaftFSM_NamespaceHashVector' \
+            -run 'HNSW|Vector|PQ|DiskGraph|Text|Tokenize|Hybrid|Search|IndexDef|ReservedKeys|Secondary|FieldIndex|RoutingKey|TransferAuth|Fanout|Distributed|RaftFSM_NamespaceHashVector' \
             ./storage/ ./cluster/ ./cmd/server/ \
             2>&1 | tee /tmp/search-race.txt
 

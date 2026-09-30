@@ -85,6 +85,9 @@ func (f *searchFields) raw() []byte {
 
 func (f *searchFields) str() string { return string(f.raw()) }
 
+// more reports whether unread fields remain (for optional trailing fields).
+func (f *searchFields) more() bool { return f.err == nil && f.next < len(f.fields) }
+
 func (f *searchFields) u32() uint32 {
 	b := f.raw()
 	if f.err == nil && len(b) != 4 {
@@ -560,7 +563,8 @@ func handleExtOp(cmd byte, keyLen, valLen int, br *bufio.Reader, bw *bufio.Write
 	// ── SEARCH (0x1C) ───────────────────────────────────────────────────────
 	// Header: keyLen=subop, valLen=payloadLen. Payload: fields, each
 	// [4B len LE][bytes]; u32 fields are 4 bytes LE, f32 fields IEEE-754 bits.
-	//   1 VCREATE: ns, dim u32, quant ("" | none | int8)                → OK
+	//   1 VCREATE: ns, dim u32, quant ("" | none | int8 | pq)
+	//              [, pqM u32, pqTrainAt u32, graph ("" | memory | disk)] → OK
 	//   2 TSET:    ns, id, text                                        → OK
 	//   3 TDEL:    ns, id                                              → OK
 	//   4 TSEARCH: ns, k u32, query, filterField, filterOp, filterValue → matches
@@ -591,10 +595,14 @@ func handleExtOp(cmd byte, keyLen, valLen int, br *bufio.Reader, bw *bufio.Write
 		switch keyLen {
 		case searchSubVCreate:
 			ns, dim, quant := f.str(), f.u32(), f.str()
+			opts := storage.VectorNamespaceOptions{Quantization: quant}
+			if f.more() { // optional trailing fields (newer clients)
+				opts.PQSubspaces, opts.PQTrainAt, opts.Graph = int(f.u32()), int(f.u32()), f.str()
+			}
 			if f.err != nil {
 				return sendErr(f.err.Error())
 			}
-			err = coord.VCreate(ns, int(dim), quant)
+			err = coord.VCreate(ns, int(dim), opts)
 		case searchSubTSet:
 			ns, id, text := f.str(), f.str(), f.str()
 			if f.err != nil {

@@ -28,7 +28,7 @@ func TestTextHybridWire(t *testing.T) {
 	if err := tc.VCreate("kb2", 3, ""); err != nil {
 		t.Fatalf("text vcreate: %v", err)
 	}
-	if err := tc.VCreate("kb", 2, "pq"); err == nil {
+	if err := tc.VCreate("kb", 2, "bogus"); err == nil {
 		t.Fatal("unknown quantization must fail")
 	}
 

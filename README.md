@@ -290,7 +290,8 @@ INFO            → keys=N writes=N reads=N ...
 AUTH user pass  → OK
 QUIT            → BYE
 
-VCREATE ns dim [QUANT none|int8]                             → OK
+VCREATE ns dim [QUANT none|int8|pq] [PQM m] [PQTRAIN n]
+        [GRAPH memory|disk]                                  → OK
 VSET id [NS ns] f1 f2 ...                                    → OK
 VSEARCH k [NS ns] [EF n] [FILTER field op value] f1 f2 ...   → "id score" lines, END
 VDEL id [NS ns]                                              → OK
@@ -303,10 +304,20 @@ HSEARCH k [NS ns] [EF n] [ALPHA a] [CAND n] [FILTER field op value]
 ```
 
 **Vectors.** `NS` defaults to `default`; a namespace's dimension is fixed by
-its first `VSET` or by `VCREATE`. `VCREATE ... QUANT int8` keeps int8 codes in
-RAM (dim + 4 bytes per vector instead of 4 × dim) and re-ranks the top 4 × k
-graph candidates against the full float32 vectors, which are persisted in the
-VLog either way; running it on an existing namespace re-encodes it.
+its first `VSET` or by `VCREATE`. The full float32 vectors are always
+persisted in the VLog; the RAM copy can be smaller:
+
+| `VCREATE` option | RAM per vector (768-dim, measured) | Search |
+|--|--|--|
+| (default) float32 | ~3.4 KB | exact scores |
+| `QUANT int8` | ~1.1 KB | top 4 × k graph candidates re-ranked from disk |
+| `QUANT pq [PQM m]` | ~0.5 KB (m bytes of codes, default m = dim/8) | the whole beam re-ranked from disk |
+| `QUANT pq GRAPH disk` | ~0.4 KB heap + ~0.2 KB in a mapped file | as pq; layer-0 edges live in a file the kernel can page to NVMe |
+
+A PQ namespace stores float32 until it holds `PQTRAIN` vectors (default
+10,000), then trains its codebook in the background and re-encodes. Running
+`VCREATE` on an existing namespace with other settings re-encodes it. The
+graph is rebuilt from the persisted vectors at startup (it is not saved).
 
 **Text.** `TSET` indexes a document for BM25 (lowercased letter/digit runs, no
 stemming or stop words). One id names one record across all of these: `PUT

@@ -1884,14 +1884,9 @@ func handleTextConn(conn net.Conn, br *bufio.Reader, engine *storage.StorageEngi
 				writeLine("ERR " + err.Error())
 				continue
 			}
-			const usage = "ERR usage: VCREATE <ns> <dim> [QUANT none|int8]"
+			const usage = "ERR usage: VCREATE <ns> <dim> [QUANT none|int8|pq] [PQM <m>] [PQTRAIN <n>] [GRAPH memory|disk]"
 			full := strings.Fields(line)
-			quant := ""
-			switch {
-			case len(full) == 3:
-			case len(full) == 5 && strings.ToUpper(full[3]) == "QUANT":
-				quant = full[4]
-			default:
+			if len(full) < 3 || len(full)%2 == 0 {
 				writeLine(usage)
 				continue
 			}
@@ -1900,7 +1895,33 @@ func handleTextConn(conn net.Conn, br *bufio.Reader, engine *storage.StorageEngi
 				writeLine(usage)
 				continue
 			}
-			if err := coord.VCreate(full[1], dim, quant); err != nil {
+			var opts storage.VectorNamespaceOptions
+			bad := false
+			for i := 3; i+1 < len(full) && !bad; i += 2 {
+				val := full[i+1]
+				switch strings.ToUpper(full[i]) {
+				case "QUANT":
+					opts.Quantization = val
+				case "GRAPH":
+					opts.Graph = val
+				case "PQM", "PQTRAIN":
+					n, err := strconv.Atoi(val)
+					if err != nil || n < 0 {
+						bad = true
+					} else if strings.ToUpper(full[i]) == "PQM" {
+						opts.PQSubspaces = n
+					} else {
+						opts.PQTrainAt = n
+					}
+				default:
+					bad = true
+				}
+			}
+			if bad {
+				writeLine(usage)
+				continue
+			}
+			if err := coord.VCreate(full[1], dim, opts); err != nil {
 				writeLine("ERR " + err.Error())
 			} else {
 				writeLine("OK")

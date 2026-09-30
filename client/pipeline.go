@@ -771,6 +771,21 @@ func (bc *BinaryConn) searchOK(op string, subop uint16, fields ...[]byte) error 
 	return nil
 }
 
+// VectorNamespaceOptions are VCREATE's optional settings.
+type VectorNamespaceOptions struct {
+	Quantization string // "" / "none", "int8" or "pq"
+	PQSubspaces  int    // pq: bytes per vector (0 = dim/8)
+	PQTrainAt    int    // pq: vectors collected before training (0 = 10000)
+	Graph        string // "" / "memory" or "disk" (layer-0 edges in a mapped file)
+}
+
+// VCreateWithOptions creates or reconfigures vector namespace ns with the
+// full set of settings (SEARCH subop 1 with the optional trailing fields).
+func (bc *BinaryConn) VCreateWithOptions(ns string, dim int, opts VectorNamespaceOptions) error {
+	return bc.searchOK("vcreate", searchSubVCreate, []byte(ns), u32Field(dim), []byte(opts.Quantization),
+		u32Field(opts.PQSubspaces), u32Field(opts.PQTrainAt), []byte(opts.Graph))
+}
+
 // VCreate creates or reconfigures vector namespace ns (SEARCH subop 1).
 // quant is "" / "none" (float32 in RAM) or "int8" (≈4× less RAM; results
 // are re-ranked against the full-precision vectors).
