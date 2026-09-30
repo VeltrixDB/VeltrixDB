@@ -49,7 +49,9 @@ echo -e "PUT hello world\nGET hello\nPING" | nc localhost 9000
 
 These rows are historical (pure-Go path). Later server batch writes, 8 clients × 1024-key MPUT: 3.54M keys/s, P99 4.2 ms (macOS, 1M-key space) and 1.77M keys/s, P99 12.2–12.7 ms (4-CPU CI runner, tmpfs, same-host client). See [BENCHMARK_RESULTS.md](BENCHMARK_RESULTS.md#later-measurements).
 
-Full methodology: [BENCHMARKING.md](BENCHMARKING.md)
+Full methodology: [BENCHMARKING.md](BENCHMARKING.md). To compare against
+Aerospike and ScyllaDB on your own hardware — same machine, same YCSB
+workloads, one database at a time — use [bench/compare](bench/compare/README.md).
 
 ---
 

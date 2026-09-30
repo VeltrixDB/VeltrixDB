@@ -192,6 +192,7 @@ Not YCSB and not this machine; each row states its conditions.
 | Mixed-workload write P99, 1 ms flush window | **2.57 ms** | same |
 | Batch writes, C++ storage layer all on (io_uring bridge + SQPOLL, batch engine, native index) | 1.12M keys/s | same; per-part attribution pending |
 | C++ network front-end (`--net=cpp`, opt-in) vs Go | read P50 154 vs 286 µs, poll read throughput 194K vs 177K ops/s; read P99 ~3.0 vs 1.8 ms, batch writes ~12% lower | same, measured before disk reads moved off the loop; not faster overall |
+| Vector search on GloVe-100 (100K real word vectors, 100-dim, 500 queries), recall@10 at ef = 64 / 128 / 256 / 512 | float32 0.842 / 0.906 / 0.953 / 0.983 (p50 0.25 / 0.42 / 0.77 / 1.43 ms); int8 0.839 / 0.905 / 0.952 / 0.983; pq (m = 25) 0.797 / 0.870 / 0.927 / 0.969; pq + disk graph 0.788 / 0.875 / 0.931 / 0.966 | macOS, in-process, single query at a time (`TestRealEmbeddings`) |
 | Durable single-key Put, adaptive vs fixed group commit, 15 ms window | 1 writer P50 16.0 ms → 0.45 ms (63 → 2.2K writes/s); 64 writers 4.0K → 37.5K writes/s, P99 16.8 → 2.6 ms; 256 writers 15.3K → 74K writes/s; same writes per fdatasync | macOS, **emulated 300 µs fdatasync** (`TestGroupCommit_LatencyTable`); 2 ms sync: 64 writers 3.5K → 11.7K |
 | Native index vs Go map, 5M keys | full GC 21 → 0.27 ms, settled RSS 168 → 142 B/key, ~19 ns more per cache-miss lookup | engine benchmark |
 

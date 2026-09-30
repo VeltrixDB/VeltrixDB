@@ -1,0 +1,6 @@
+# YCSB B: read mostly (95/5 read/update, zipfian)
+readproportion=0.95
+updateproportion=0.05
+scanproportion=0
+insertproportion=0
+requestdistribution=zipfian

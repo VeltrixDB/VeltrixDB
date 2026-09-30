@@ -13,6 +13,18 @@ Releases are cut automatically on every merge to `main` (GitHub release +
 
 ### Added
 
+- `bench/compare` (separate Go module): go-ycsb runner with a VeltrixDB
+  driver next to go-ycsb's Aerospike and Cassandra (ScyllaDB) drivers,
+  YCSB A–F workloads, `vecbench` (real-dataset recall / QPS / p99 sweep),
+  docker-compose + `compare.sh` for one-database-at-a-time runs on the same
+  machine. The Aerospike / ScyllaDB paths are compile-checked only.
+- Nightly workflow: recall gates on GloVe-100 (100K real word vectors), a
+  20-minute search soak against an oracle, 10 SIGKILL / restart cycles with
+  every acknowledged write checked, and the group-commit / vector-memory
+  tables in the job summary.
+- Search refuses to answer while the startup index rebuild is running
+  (`search_ready` in `INFO`; `--search-allow-partial` answers anyway).
+
 - Product quantization for vector namespaces (`VCREATE ns dim QUANT pq
   [PQM m] [PQTRAIN n]`): m bytes per vector (default dim/8), trained in the
   background once PQTRAIN vectors (default 10,000) exist, with the whole
@@ -25,6 +37,9 @@ Releases are cut automatically on every merge to `main` (GitHub release +
 
 ### Performance
 
+- Quantized re-rank reads the candidates' full vectors with one parallel
+  MultiGet instead of a Get each: GloVe-100 int8 at ef=64, p50 1.9 → 0.61 ms
+  and p99 13.8 → 0.81 ms.
 - Adaptive group commit (`--group-commit=adaptive`, the new default; `fixed`
   restores the old behaviour). The WAL / VLog flush windows become upper
   bounds: a lone writer is synced immediately and concurrent writers after an

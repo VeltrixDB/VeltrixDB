@@ -1,0 +1,13 @@
+# Shared by every compare workload. recordcount / operationcount are set by
+# scripts/compare.sh (-p) so every database gets the same numbers.
+workload=core
+recordcount=1000000
+operationcount=1000000
+fieldcount=10
+fieldlength=100
+# Whole-record writes: one round trip per update for every database (see
+# ycsbdriver's package comment). YCSB's default partial update would make
+# VeltrixDB read-modify-write.
+writeallfields=true
+readallfields=true
+table=usertable

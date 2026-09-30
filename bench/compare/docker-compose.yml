@@ -1,0 +1,53 @@
+# Same-host comparison of VeltrixDB, Aerospike CE and ScyllaDB.
+#
+# Run ONE database at a time on the machine under test, so they never compete
+# for CPU, memory or the disk (scripts/compare.sh does this):
+#
+#   docker compose up -d veltrixdb      # or aerospike / scylla
+#
+# Each service gets the same CPU and memory limits and its data on the same
+# path (BENCH_DATA, default ./data — put it on the NVMe you are measuring).
+# The client (ycsb / vecbench) runs on the host; for a stricter test run it
+# on a second machine and change the addresses.
+#
+# Not run where it was written (no Docker there) — check the images start
+# and the limits apply on your machine before trusting numbers.
+x-limits: &limits
+  cpus: "${BENCH_CPUS:-8}"
+  mem_limit: "${BENCH_MEM:-16g}"
+
+services:
+  veltrixdb:
+    <<: *limits
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    command:
+      - -addr=0.0.0.0:9000
+      - -metrics-addr=0.0.0.0:2112
+      - -data=/data
+      - -cache=4096
+      # Durable writes (default): every ACK follows an fdatasync of WAL + VLog
+      # (adaptive group commit).
+    ports: ["9000:9000", "2112:2112"]
+    volumes: ["${BENCH_DATA:-./data}/veltrixdb:/data"]
+
+  aerospike:
+    <<: *limits
+    image: aerospike/aerospike-server:${AEROSPIKE_VERSION:-latest}
+    command: ["--config-file", "/opt/aerospike/etc/aerospike.conf"]
+    ports: ["3000:3000"]
+    volumes:
+      - ./aerospike.conf:/opt/aerospike/etc/aerospike.conf:ro
+      - "${BENCH_DATA:-./data}/aerospike:/opt/aerospike/data"
+
+  scylla:
+    <<: *limits
+    image: scylladb/scylla:${SCYLLA_VERSION:-latest}
+    # --smp / --memory pin Seastar to the same budget as the limits above.
+    # Durability: ScyllaDB's default commitlog_sync is periodic (10 s), i.e.
+    # a write is ACKed before it is on disk. For a like-for-like durable
+    # comparison set commitlog_sync: batch in scylla.yaml (see README).
+    command: ["--smp", "${BENCH_CPUS:-8}", "--memory", "12G", "--overprovisioned", "1", "--developer-mode", "0"]
+    ports: ["9042:9042"]
+    volumes: ["${BENCH_DATA:-./data}/scylla:/var/lib/scylla"]

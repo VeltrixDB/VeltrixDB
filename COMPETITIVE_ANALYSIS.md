@@ -186,6 +186,22 @@ Aerospike has 15+ years of NVMe optimization. ScyllaDB has been production-harde
 
 ---
 
+## Measuring it on the same hardware
+
+The tables above compare VeltrixDB runs against numbers others published on
+other machines. `bench/compare/` replaces that with one harness for all
+three: go-ycsb workloads A–F through a VeltrixDB driver and go-ycsb's own
+Aerospike and Cassandra (ScyllaDB) drivers, one database at a time on the
+same host, with the durability settings stated (see its README — ScyllaDB's
+default commit log sync and Aerospike CE's write buffer both ACK before the
+disk). No same-hardware run has been published yet; the Aerospike and
+ScyllaDB paths are compile-checked only.
+
+Vector search has no like-for-like harness against these two: VectorDBBench
+has no client for either, and `bench/compare/cmd/vecbench` ships only a
+VeltrixDB driver. VeltrixDB's own numbers on a real dataset are in
+[BENCHMARK_RESULTS.md](BENCHMARK_RESULTS.md#later-measurements) (GloVe-100).
+
 ## Tuning Roadmap to Close the Gap
 
 | Improvement | Expected Write Impact | Status |

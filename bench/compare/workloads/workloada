@@ -1,0 +1,6 @@
+# YCSB A: update heavy (50/50 read/update, zipfian)
+readproportion=0.5
+updateproportion=0.5
+scanproportion=0
+insertproportion=0
+requestdistribution=zipfian

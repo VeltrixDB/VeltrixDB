@@ -615,6 +615,26 @@ jobs:
             --sha    "${{ github.sha }}" \
             --branch "${{ github.ref_name }}"
 
+  # ── bench/compare: YCSB + vecbench harness (separate Go module) ───────────
+  # Its dependencies (go-ycsb, Aerospike / Cassandra clients) need a newer Go
+  # than the database, so it builds with the version its own go.mod names.
+  bench-compare:
+    name: "bench/compare — build + driver tests"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: bench/compare/go.mod
+          cache-dependency-path: bench/compare/go.sum
+      - name: vet + test
+        working-directory: bench/compare
+        run: |
+          go vet ./...
+          go test -count=1 ./...
+          bash -n compare.sh
+
   # ── bench: packing density + GC emergency hard gates ──────────────────────
   bench:
     name: "Bench — density + GC gates + paper-changes microbench"
