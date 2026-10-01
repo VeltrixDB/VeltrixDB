@@ -500,41 +500,31 @@ func TestSearchCrashRecovery(t *testing.T) {
 		c.Close()
 		t.Logf("cycle %d/%d: %d acknowledged writes, all visible after SIGKILL + rebuild", cycle, cycles, acked.Load())
 
-		// The in-flight writes are now settled: read back their outcome so
-		// later cycles check them too.
-		o.mu.Lock()
-		for _, e := range o.m {
-			e.inflight = false
-		}
-		o.mu.Unlock()
+		// Writes in flight at the kill have an unknown outcome; settle
+		// rewrites them to a known state so later cycles check them too.
 		o.settle(t, p)
 	}
 }
 
-// settle aligns entries whose outcome was unknown with what the server has.
+// settle rewrites every id whose last write had an unknown outcome to a
+// fresh, fully acknowledged version.
+//
+// An unknown write is three requests (PUT, TSET, VSET — or VDEL, TDEL), and
+// the server may have died between any two, so the record, the text
+// document and the vector can each hold the old or the new version. Looking
+// at one of them (say, vector presence) cannot tell which, so every unknown
+// id is overwritten, never inferred.
 func (o *oracle) settle(t *testing.T, p *proc) {
 	t.Helper()
 	c := p.dial()
 	defer c.Close()
-	all, err := c.VSearchWithOptions(0, soakVec(1, 1), veltrixclient.VectorSearchOptions{NS: soakNS})
-	if err != nil {
-		t.Fatalf("settle: %v", err)
-	}
-	have := map[int]bool{}
-	for _, h := range all {
-		if id, ok := parseSoakID(h.ID); ok {
-			have[id] = true
-		}
-	}
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	for id, e := range o.m {
-		if e.live == have[id] {
+		if !e.inflight {
 			continue
 		}
-		// An in-flight write landed (or a delete did): rewrite the id to a
-		// known state so the next exact check can include it.
-		version := e.version + 1
+		version := e.version + 1 // newer than anything that may have landed
 		o.mu.Unlock()
 		err := c.Put(soakID(id), []byte(fmt.Sprintf(`{"v":"%d"}`, version)), 0)
 		if err == nil {
@@ -547,6 +537,6 @@ func (o *oracle) settle(t *testing.T, p *proc) {
 		if err != nil {
 			t.Fatalf("settle %s: %v", soakID(id), err)
 		}
-		e.live, e.version, e.changed = true, version, time.Now()
+		e.live, e.version, e.changed, e.inflight = true, version, time.Now(), false
 	}
 }

@@ -1,6 +1,8 @@
 # Benchmarking VeltrixDB
 
-`scripts/bench.sh` runs a 6-phase sequenced workload and reports go/no-go on two hard gates: **packing density** and **GC emergency runs**. Re-run it after any storage engine change.
+`scripts/bench.sh` runs a 6-phase sequenced workload (build + start, MPut bulk load, cool-down, read-only, mixed 70R/30W, sustained MPut write stress) and reports go/no-go on two hard gates: **packing density** and **GC emergency runs**. Re-run it after any storage engine change.
+
+It builds the server and `loadtest` with `CGO_ENABLED=0` (Go map index) unless you export `CGO_ENABLED=1`. The Docker image is a cgo build (native index), so set `CGO_ENABLED=1` on Linux to measure what the image runs.
 
 ---
 
@@ -29,10 +31,16 @@ CONCURRENCY=512 BULK_DUR=120 STRESS_DUR=300 \
 | `BATCH_SIZE` | 1024 | Higher = better packing density |
 | `CONCURRENCY` | 64 | Use 512 on multi-core hosts |
 | `BULK_DUR` | 30 s | 120–300 s for production verification |
+| `READ_DUR` / `MIXED_DUR` | 30 s | Read-only and mixed phases |
 | `STRESS_DUR` | 60 s | 600 s to detect GC pressure |
-| `WAL_WINDOW_MS` | 5 | 10 for default, 2 for low latency |
+| `WAL_WINDOW_MS` | 5 | Sets both `--wal-flush-window-ms` and `--vlog-flush-window-ms` (the server default is 15) |
 | `CACHE_MB` | 1024 | 409600 on n2-highmem-64 |
-| `RAW_VLOGS` | — | Raw block-device VLog (Linux + CAP_SYS_RAWIO) |
+| `DATA_DIRS` | `/tmp/veltrixbench` | Comma-separated list → `--data-dirs`; only paths under `/tmp` are wiped first |
+| `RAW_VLOGS` | — | Raw block-device VLog (Linux, root + CAP_SYS_RAWIO) |
+| `ADDR` / `METRICS_ADDR` | `127.0.0.1:9000` / `127.0.0.1:2112` | |
+| `OUT_DIR` | `/tmp/veltrixbench-out` | Binaries, `server.log`, `run.log` |
+| `EXTRA_SERVER_FLAGS` | — | Extra server flags, e.g. `--disable-ordered-index` |
+| `CGO_ENABLED` | 0 | Build mode of the server and loadtest |
 
 ---
 
@@ -40,8 +48,11 @@ CONCURRENCY=512 BULK_DUR=120 STRESS_DUR=300 \
 
 | Gate | Condition | What failure means |
 |------|-----------|-------------------|
-| Density | `bytes/record ≤ 1.2 × (24 + value_size)` | Packing not engaged — use `--batch-size > 1` |
-| GC emergency | `vlog_gc_emergency_runs Δ == 0` | Write rate exceeds GC throughput |
+| Density | `bytes/record ≤ 1.2 × (24 + value_size)` (`veltrixdb_vlog_file_bytes` / Δ`veltrixdb_storage_writes_total` after the bulk load) | Packing not engaged — keep `BATCH_SIZE > 1` (loadtest `--batch-size`) |
+| GC emergency | `veltrixdb_vlog_gc_emergency_runs_total` Δ == 0 during the write stress | Write rate exceeds GC throughput |
+
+The script exits non-zero if either gate fails. It also prints the read P99,
+but that is not a gate.
 
 ---
 
@@ -53,7 +64,9 @@ CONCURRENCY=512 BULK_DUR=120 STRESS_DUR=300 \
 > for `MultiPut`, the ordered-index overwrite skip and the native index, all
 > of which change write-path numbers. The macOS figures also sit on a `fsync`
 > that does not flush the drive cache (see ARCHITECTURE.md, Durability).
-> Re-run before quoting them.
+> Re-run before quoting them. The single-Put rows are fixed-window group
+> commit; the default is now adaptive (see
+> [Durable single-key writes](#durable-single-key-writes-group-commit-table)).
 
 ### macOS M-series (dev)
 | Metric | Value |
@@ -182,3 +195,59 @@ To A/B it yourself:
 ```bash
 EXTRA_SERVER_FLAGS="--disable-ordered-index" ./scripts/bench.sh
 ```
+
+## Durable single-key writes: group commit table
+
+`--group-commit=adaptive` (default) vs `fixed`, with the device's fdatasync
+cost emulated so the result means the same on a laptop as on Linux:
+
+```bash
+VELTRIX_GC_TABLE=1 go test ./storage -run TestGroupCommit_LatencyTable -v
+```
+
+Reference (macOS, emulated 300 µs sync, 15 ms window): 1 writer P50 16 ms →
+0.45 ms; 64 writers 4.0K → 37.5K writes/s, P99 16.8 → 2.6 ms; 256 writers
+15.3K → 74K writes/s. `TestGroupCommit_AdaptiveGates` (every PR) fails if a
+lone writer waits for the window or concurrent writers stop sharing syncs.
+The nightly workflow prints the table in its job summary.
+
+## Vector search
+
+| What | Command | Reference (macOS) |
+|--|--|--|
+| Recall / latency on real embeddings (GloVe-100, 100K) | `scripts/ann-dataset.py glove-100-angular /tmp/ann --train 100000 --test 500` then `VELTRIX_ANN_DIR=/tmp/ann go test ./storage -run TestRealEmbeddings -v -timeout 30m` | float32 recall@10 0.953 at ef = 256, p50 0.77 ms |
+| Over the network, concurrent clients | `cd bench/compare && go run ./cmd/vecbench -addr HOST:9000 -data /tmp/ann -quant int8 -efs 64,128,256 -threads 16 -out results/` (`bench/compare` is a separate module, Go ≥ 1.25) | 20K, int8, 8 clients: 24.6K QPS at recall 0.894 |
+| RAM per vector at 768-dim | `VELTRIX_VECTOR_MEMORY=1 go test ./storage -run TestVectorMemoryTable -v` | float32 3.4 KB, int8 1.1 KB, pq 0.49 KB, pq + disk 0.38 KB |
+| Recall regression gate (every PR) | `go test ./storage -run TestSearchQualityGate -v` | measured values and gates in the file |
+| HNSW micro-benchmarks | `go test ./storage -run '^$' -bench 'HNSW' -benchtime 2000x` | search 99 µs at 20K × 128, 6 allocs |
+
+All numbers and conditions: [docs/vector-search.md](docs/vector-search.md#measured-performance).
+
+`scripts/ann-dataset.py` needs `h5py` and `numpy`. It downloads the
+ann-benchmarks HDF5 file with its own User-Agent (ann-benchmarks.com answers
+403 to Python-urllib's default), makes up to 4 attempts with a growing
+back-off, and writes through a `.part` temp file, so a failed download
+never leaves a truncated file (or a bad CI cache entry) behind. The nightly
+`Real embeddings` job runs the same command and caches `/tmp/ann`.
+
+## Search soak and crash chaos
+
+| What | Command | Reference (macOS) |
+|--|--|--|
+| Soak: concurrent upserts / deletes / searches against an oracle of acknowledged writes, RSS check, exact match after restart | `VELTRIX_SOAK_DURATION=20m go test ./tests/integration/ -run TestSearchSoak -v -timeout 40m` | 60 s: 0 results outside the oracle, RSS flat at ~1.0 GB |
+| Crash: SIGKILL mid-write, restart, every acknowledged write visible | `VELTRIX_CHAOS_CYCLES=10 go test ./tests/integration/ -run TestSearchCrashRecovery -v -timeout 25m` | 3 cycles, all acknowledged writes visible, no deleted id returned |
+
+After each crash cycle the test rewrites every id whose write had an unknown
+outcome at the SIGKILL to a fresh, fully acknowledged version, so later
+cycles check those ids too. The nightly workflow runs both (20 min, 10
+cycles). Details: [tests/integration/README.md](tests/integration/README.md).
+
+## Against Aerospike and ScyllaDB (same hardware)
+
+`bench/compare/compare.sh` runs go-ycsb workloads A–F through a VeltrixDB
+driver and go-ycsb's Aerospike and Cassandra (ScyllaDB) drivers, one database
+at a time on the same machine, and writes `results/<ts>/summary.md`. Read
+[bench/compare/README.md](bench/compare/README.md) first — in particular the
+durability settings, which differ by default between the three. No shared
+run has been published yet; the Aerospike / ScyllaDB paths are compile-checked
+only.

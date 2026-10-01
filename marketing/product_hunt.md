@@ -2,7 +2,7 @@
 
 ## Tagline
 
-NVMe key-value store — 10× cheaper storage than Redis at scale
+NVMe key-value store with built-in vector, full-text and hybrid search
 
 ---
 
@@ -16,9 +16,11 @@ The architecture that makes this work: WiscKey KV-separation, where values are a
 
 Across those 100M operations there were zero errors and zero value-log GC emergency runs: space reclamation kept up with the write rate instead of falling behind. On cgo builds the key index lives off the Go heap; with 5M keys a full Go GC takes 0.27 ms instead of 21 ms.
 
+Search is built in: HNSW vector indexes (float32, int8 or product-quantized, with an option to keep the graph's edges in a memory-mapped file), BM25 full-text search and hybrid search fused by reciprocal rank, all filtered by the record with the same id and fanned out across cluster nodes. On GloVe-100 (100K real word vectors) it measured recall@10 of 0.953 at a 0.77 ms median, one query at a time on a laptop; product quantization cuts a 768-dim vector's RAM from 3.4 KB to 0.49 KB.
+
 Production deployment is first-class: Kubernetes Operator with a CRD, Helm chart, Prometheus alerts pre-configured, Raft replication, AES-256-GCM encryption, RBAC, audit logging, and CDC support. Six client SDKs cover Go, Java, Python, Node.js, Rust, and C++.
 
-What it doesn't do yet: no RESP protocol (can't drop-in replace Redis without code changes) and no managed cloud offering. These are real limitations worth knowing before you evaluate it.
+What it doesn't do yet: no RESP protocol (can't drop-in replace Redis without code changes), no managed cloud offering, and no published same-hardware comparison with Aerospike, ScyllaDB or other vector databases (a harness is in the repo). The vector graph is rebuilt at every restart. These are real limitations worth knowing before you evaluate it.
 
 Apache 2.0. Benchmarking methodology and reproduction scripts are in the public repo.
 

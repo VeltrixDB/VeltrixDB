@@ -15,12 +15,16 @@ VeltrixDB/
 │   └── admin/          Scan, stats, compact, check, repair, hash-password
 ├── storage/
 │   ├── engine.go       Core PUT/GET/DELETE, admission control
+│   ├── batch.go        MultiPut / MultiGet (multiPutKVSep)
+│   ├── group_commit.go Adaptive / fixed group-commit pacer shared by WAL and VLog
 │   ├── wal.go          Write-Ahead Log with group-commit
 │   ├── wal_format.go   WAL record encodings (binary default, legacy text) + the one decoder
 │   ├── wal_replay.go   WAL replay on startup, WAL path helpers
 │   ├── vlog.go         Value Log (WiscKey KV separation), VLogBatcher
 │   ├── batcher.go      Async WriteBatcher (fire-and-forget API)
 │   ├── cache.go        LIRS cache, value-aware eviction
+│   ├── cache_sharded.go  Up to 256 LIRS shards keyed on high hash bits
+│   ├── bloom_shard.go  Lock-free per-shard bloom filters
 │   ├── defrag.go       VLog GC, GC bandwidth throttle, admission staleness guard
 │   ├── shard.go        8192-shard index
 │   ├── index_table.go  entryTable interface + Go map table, VELTRIXDB_INDEX selection
@@ -33,8 +37,10 @@ VeltrixDB/
 │   ├── cgo_bridge_pinner.go  CGO bridge with runtime.Pinner (Go >= 1.21)
 │   ├── cgo_toggle.go       VELTRIXDB_DISABLE_CGO_ENGINE / VELTRIXDB_URING_BRIDGE switches
 │   ├── vlog_flush_bridge_linux.go  Opt-in io_uring VLog write bridge (Linux cgo)
-│   ├── index_hugepage_linux.go  2MB hugepage mmap for Go index
-│   └── mlockall_linux.go    mlockall to prevent swap eviction
+│   ├── hnsw.go / hnsw_pq.go / pq.go / vector_index.go / vector_adj*.go  Vector search
+│   ├── text_index.go / hybrid.go / search_hooks.go  BM25, RRF fusion, reserved-key hooks
+│   ├── index_hugepage_linux.go  2MB hugepage mmap helper (no caller)
+│   └── mlockall_linux.go    mlockall helper (no caller in the server)
 ├── cpp/
 │   ├── include/
 │   │   ├── art.hpp         ART index + ArtSlabAllocator
@@ -49,10 +55,15 @@ VeltrixDB/
 │   ├── netfront.cpp      Per-core event loops: io_uring (Linux) or poll()
 │   ├── netfront.go       cgo binding; vxnfExec runs one loop iteration's requests
 │   └── stats.go          Per-stage latency histograms, logged at shutdown
+├── cmd/server/ (more)  coordinator.go (write chokepoint per --mode), raft_fsm*.go, ext_ops.go,
+│                       search_fanout.go, rebalancer.go, cluster_setup.go
+├── consensus/            Raft: election, replication, snapshots, membership, ReadIndex
 ├── cluster/
-│   ├── partition_map.go    Consistent hash ring, partition assignment
+│   ├── partition_map.go    Consistent hash ring, partition assignment, RoutingKey
+│   ├── epoch.go            Split-brain epoch fencing
+│   ├── gossip.go           TCP gossip (JSON digests)
 │   ├── failure_detection.go  Heartbeat-based failure detector
-│   └── partition_transfer.go  Shard rebalancing
+│   └── partition_transfer.go  TransferAgent: key migration to new owners after a rebalance
 ├── replication/          Async/quorum/strong replication, vector clocks
 ├── metrics/prometheus.go Prometheus metrics collector
 ├── hardware/             Hardware detection, auto-config, OS tuning
@@ -97,7 +108,7 @@ On Linux, the backing array has extra bytes for alignment padding. Storing the f
 
 ### 5. binPayloadPool is safe after engine.Put returns
 
-`Put` is synchronous — it blocks on `<-resp` until WAL fdatasync completes. Both the WAL serialiser and segment `WriteRecord` copy the value bytes before `Put` returns. Safe to pool the buffer after that point.
+`Put` is synchronous — it blocks until both the WAL and the VLog fdatasync complete. The WAL serialiser, the VLog `beginAppend` and segment `WriteRecord` all copy the value bytes before `Put` returns (the binary PUT handler also copies the value before calling it). Safe to pool the buffer after that point.
 
 ### 6. WAL does not use O_DIRECT
 
@@ -105,15 +116,17 @@ On Linux, the backing array has extra bytes for alignment padding. Storing the f
 
 ### 7. VLog before WAL in the PUT path
 
-`vl.beginAppend(value)` runs before `wal.beginAppend(entry)`. If the process crashes after VLog fdatasync but before WAL fdatasync, the value is orphaned in the VLog but the key is never written to the index — invisible, harmless.
+`vl.beginAppend(writeBytes)` (the transformed value) runs before `wal.beginAppend(entry)`, so the WAL record carries the VLog offset. If the process crashes after VLog fdatasync but before WAL fdatasync, the value is orphaned in the VLog but the key is never written to the index — invisible, harmless.
 
 ### 8. WAL and VLog flush windows must be equal
 
 Both default to 15 ms. The PUT path submits to both concurrently and waits for `max(WAL_wait, VLog_wait)`. If the windows differ, the shorter one finishes first but the caller still waits for the longer one — you get the latency cost of the longer window with no throughput benefit from the shorter one.
 
+With the default adaptive group commit (`storage/group_commit.go`) the window is only an upper bound: a lone writer is synced immediately and concurrent writers after an idle gap equal to the EWMA fdatasync time, clamped to 20 µs–2 ms (`adaptiveMinGap` / `adaptiveMaxGap`). `--group-commit=fixed` restores the full-window wait. Both flushers use the same pacer, so they still finish a batch at about the same time. `TestGroupCommit_AdaptiveGates` fails if a lone writer waits for the window or concurrent writers stop sharing syncs.
+
 ### 9. VLog.MarkDead must be called on every overwrite or delete
 
-`MarkDead(valueLen)` increments the dead-byte counter used by `GCRatio()`. Missing this call causes VLog to grow without bound because the GC never thinks there is enough garbage to trigger.
+`MarkDead(valueLen, packed)` decrements the live-byte counter (`packed` must come from `entry.IsPacked()`) used by `GCRatio()`. Missing this call causes VLog to grow without bound because the GC never thinks there is enough garbage to trigger.
 
 ### 10. vlogBlockSize must stay 4096
 
@@ -133,13 +146,13 @@ Without this, the local node has zero heartbeats in the `nodeHeartbeats` map. `c
 When `KeyValueSeparation = true`:
 - `DiskOffset` = byte offset of the VLog record header
 - `SegmentID` = disk index (which VLog file)
-- `ValueSize` = unpadded value length
+- `ValueSize` = on-disk blob length (after compression + encryption); `UncompressedSize` is the plaintext length
 
 Do not interpret these as segment-file pointers when KV separation is enabled.
 
 ### 13. VLog magic is 0x564C5402, segment magic is 0x564C5401
 
-Both file types share the same `ioPool` and `openSegmentFile` helper, but their headers are completely different:
+They use different helpers — VLog: `openVLogFile` + 4096-aligned `vlogIOPool`; segment: `openSegmentFile` + 512-aligned `ioPool` (both O_DIRECT on Linux) — and their headers are completely different:
 - VLog: 24-byte header
 - Segment: 64-byte header
 
@@ -147,41 +160,73 @@ Do not parse them interchangeably.
 
 ---
 
+
+### 14. Search indexes are updated only by the reserved-key hooks
+
+Vectors (`@vec/`), text documents (`@txt/`), vector namespace settings (`@vecns/`) and replicated index definitions (`@idxdef/`) are ordinary keys; `Put`, `Delete` and `MultiPut` call `onSearchKeyPut` / `onSearchKeyDelete` after the write commits. Never refresh an index next to a Put yourself — the hook already ran, and a second vector insert is an update that leaves a tombstone. A write path that bypasses those three functions must call the hooks.
+
+### 15. Derived keys route as their record
+
+`cluster.RoutingKey` hashes `@vec/<ns>/<id>` and `@txt/<ns>/<id>` as `<id>` and `@idx/<rule>/<value>/<id>` as `<id>`, so a rebalance keeps a record with its vector, text and index entries. `@vecns/` and `@idxdef/` are copied to every node, never moved. Distributed search filters locally and depends on this.
+
+### 16. Distributed search fails closed
+
+A peer that does not answer fails the search (and names the peer) unless `--search-allow-partial`; so does a node whose indexes are still rebuilding after a restart. Do not skip failed peers by default — a partial result looks like a correct one.
+
+### 17. Every read passes `coordinator.readBarrier()`
+
+GET, text MGET, binary MGET and the coalesced binary GET path. In raft mode it makes a newly elected leader wait until its term's no-op is applied, so writes the previous leader acknowledged are visible; with `--linearizable-reads` it runs the ReadIndex fence. A new read path that calls the engine directly loses both.
 ## Key Data Structures
 
-### IndexEntry (Go, 64 bytes)
+### IndexEntry (Go, 64 bytes — `storage/types.go`, size checked in `init`)
 
 ```go
 type IndexEntry struct {
-    Key        string   // heap-allocated
-    DiskOffset int64    // byte offset in VLog or segment file
-    SegmentID  uint16   // disk index
-    ValueSize  uint32   // unpadded value length
-    Version    uint64   // monotonically increasing
-    Flags      uint8    // FlagTombstone = 0x01
+    KeyHash          uint64  // fnv64a(key); the key itself lives in the table
+    DiskOffset       uint64  // byte offset in VLog or segment file
+    SegmentID        uint32  // disk index
+    ValueSize        uint32  // on-disk blob length
+    UncompressedSize uint32  // plaintext length
+    KeySize          uint32
+    WriteTimestampUs int64
+    TTLExpiryUs      int64
+    CRC32C           uint32  // plaintext CRC
+    ShardID          uint16
+    Flags            uint8   // Tombstone 0x01, Compressed 0x02, Encrypted 0x04, HasTTL 0x08,
+                             // ReadRepairNeeded 0x10, Pinned 0x20, Packed 0x40, Tiered 0x80
+    SchemaVersion    uint8
+    _reserved        [8]byte
 }
 ```
+
+There is no per-entry version: `se.version` is engine-wide and is written to the WAL record.
 
 ### WALEntry
 
 ```go
 type WALEntry struct {
-    Key        string
-    Value      []byte   // nil when vlogOffset > 0
-    ValueLen   int
-    CRC32      uint32
-    Version    uint64
-    Tombstone  bool
-    VLogOffset int64    // > 0 means value is in VLog
-    RespCh     chan walResp
+    Timestamp     int64
+    KeyLen        uint32
+    Key           string
+    ValueLen      uint32   // plaintext length
+    Value         []byte   // nil when VLogOffset > 0
+    Checksum      uint32   // CRC32C of the plaintext value
+    ReplicationID uint32
+    Version       uint64
+    IsTombstone   bool
+    VLogOffset    int64    // > 0 means value is in VLog
+    Packed        bool     // VLog record shares a 4 KB block
+    DiskValueLen  uint32   // on-disk length after transforms (0 = ValueLen)
+    XformFlags    uint8    // FlagCompressed | FlagEncrypted
 }
+// The response channel is not on the entry: beginAppend returns *chan error.
 ```
 
 On-disk format (binary, the default — `storage/wal_format.go`): a 48-byte little-endian header, then the key, then the value when it is inline, then a 4-byte CRC32C of every preceding byte.
 ```
-0  magic 0xB1 | 1 version | 2 flags (tombstone, packed, inline)
+0  magic 0xB1 | 1 version (1) | 2-3 flags (tombstone, packed, inline)
 4  keyLen | 8 valueLen (plaintext) | 12 diskLen | 16 CRC32C of value
-20 xflags (compressed, encrypted) | 21 zero
+20 xflags (compressed, encrypted) | 21-23 zero
 24 timestamp | 32 version | 40 vlogOffset
 48 key bytes [value bytes if inline] CRC32C(record)
 ```
@@ -196,20 +241,24 @@ ValLen:    [4 bytes]  unpadded value length
 CRC32C:    [4 bytes]  CRC32C of value bytes
 Reserved:  [4 bytes]
 WriteUs:   [8 bytes]  write time, Unix µs
-[value bytes, padded to vlogBlockSize (4096) boundary]
+[value bytes; an unpacked record is padded to the next vlogBlockSize (4096)
+ boundary, a packed record is followed directly by the next record in its block]
 ```
 
 ### Segment Record (64-byte header)
 
 ```
-Magic:     [4 bytes]  0x564C5401
-KeyLen:    [2 bytes]
-ValueLen:  [4 bytes]
-CRC32:     [4 bytes]
-Version:   [8 bytes]
-Padding:   [42 bytes] to reach 64-byte header
-[key bytes]
-[value bytes, padded to 512-byte boundary]
+0  Magic     [4 bytes]  0x564C5401
+4  Flags     [1 byte]   0x01 tombstone, 0x02 compressed
+5  Reserved  [3 bytes]
+8  KeyLen    [4 bytes]
+12 ValueLen  [4 bytes]
+16 CRC32C    [4 bytes]  of key || value
+20 Reserved  [4 bytes]
+24 WriteUs   [8 bytes]
+32 TTLUs     [8 bytes]  absolute µs, 0 = immortal
+40 Reserved  [24 bytes]
+64 [key bytes][value bytes], record padded to a 512-byte boundary
 ```
 
 ---
@@ -219,63 +268,66 @@ Padding:   [42 bytes] to reach 64-byte header
 ### Group-Commit WAL
 
 ```go
-// WAL flusher goroutine (simplified)
-func (w *WriteAheadLog) flusher() {
-    var batch []walResp
-    timer := time.NewTimer(WALFlushWindowMs)
+// WAL flusher goroutine (simplified from storage/wal.go)
+func (wal *WriteAheadLog) flusher() {
+    var bt batchTimer
     for {
         select {
-        case entry := <-w.appendCh:
-            batch = append(batch, entry)
-            if len(batch) >= WALMaxBatchEntries { // cap=4096
-                w.flush(batch)
-                batch = batch[:0]
-                timer.Reset(WALFlushWindowMs)
-            }
-        case <-timer.C:
-            if len(batch) > 0 {
-                w.flush(batch)
-                batch = batch[:0]
-            }
-            timer.Reset(WALFlushWindowMs)
+        case item := <-wal.appendCh:
+            pending = append(pending, item)
+            pendingRecords += item.n          // records, not items
+            full := drain()                    // non-blocking; stops at maxBatch records
+            if wal.pacer.schedule(&bt, len(pending), full) {
+                bt.stop()
+                flush()                        // one write(2) + one fdatasync
+            }                                  // else: timer armed (gap or window deadline)
+        case <-bt.C:
+            bt.stop()
+            flush()
+        case <-wal.doneCh:
+            // drain the channel, final flush, return
         }
     }
 }
 ```
 
-One `write(2)` and one `fdatasync` per flush: `flush()` concatenates the batch's records into one reused buffer and writes it once (CLAUDE.md invariant 41). Never reintroduce a per-entry write. `appendAll` sends a whole `MultiPut` batch on the channel in one send (invariant 42). `appendCh` has capacity 4096 to absorb write bursts.
+`schedule` flushes at once when the window is 0, the batch is full (`WALMaxBatchEntries`, default 4096), or — in adaptive mode — a lone writer is detected (one request and an EWMA batch size < 1.5). Otherwise it arms the timer for the idle gap, never past the window deadline. Fixed mode arms the full window.
+
+One `write(2)` and one `fdatasync` per flush: `flush()` concatenates the batch's records into one reused buffer and writes it once (CLAUDE.md invariant 41). Never reintroduce a per-entry write. `appendAll` sends a whole `MultiPut` batch on the channel in one send (CLAUDE.md invariant 42). `appendCh` has capacity 4096 to absorb write bursts.
 
 ### Lock-Free VLog Write Path
 
 ```go
-func (vl *VLog) beginAppend(value []byte) (int64, error) {
-    alignedLen := roundUp(24 + len(value), vlogBlockSize) // 4096 bytes
+func (vl *VLog) beginAppend(value []byte) (int64, *chan error, error) {
+    alignedLen := roundUp(24+len(value), vlogBlockSize) // 4096 bytes
+    buf := vlogIOPool.get(alignedLen)                   // 4096-aligned
+    defer vlogIOPool.put(buf)
+    writeHeader(buf, len(value), crc32c(value), nowUs)  // magic, len, CRC, write time
+    copy(buf[24:], value)                               // then zero the padding
     offset := vl.end.Add(int64(alignedLen)) - int64(alignedLen)
     // offset is exclusively reserved — no other goroutine will use it
-    buf := ioPool.get()
-    writeHeader(buf, offset, len(value), crc32(value))
-    copy(buf[24:], value)
-    vl.f.WriteAt(buf[:alignedLen], offset)
-    ioPool.put(buf)
-    return offset, nil
+    vl.file.WriteAt(buf, offset)
+    vl.flushCh <- &vlogFlushReq{...}                    // group-commit fdatasync
+    return offset, rp, nil                              // caller waits on *rp
 }
 ```
 
 POSIX guarantees `pwrite64` to non-overlapping ranges from concurrent goroutines is race-free. Throughput cap is NVMe IOPS (~450K/disk), not mutex serialisation (~10K/disk).
 
-This is the single-key path. A `MultiPut` batch goes through `VLogBatcher`: one `pwrite` of one contiguous extent plus one `fdatasync` per batch (invariant 42). On Linux cgo builds, `VELTRIXDB_URING_BRIDGE=on|sqpoll` submits that write through io_uring instead. The bridge is off by default. It can save at most one syscall per batch, and if it fails to start (e.g. seccomp blocks `io_uring_setup`), batches fall back to `pwrite`.
+This is the single-key path. A `MultiPut` batch goes through `VLogBatcher`: `Stage` returns offsets relative to the extent, `Commit` reserves the whole extent with one `vl.end.Add`, and `Flush` does one `pwrite` plus one `fdatasync` (CLAUDE.md invariant 42). On Linux cgo builds, `VELTRIXDB_URING_BRIDGE=on|sqpoll` submits that write through io_uring instead. The bridge is off by default. It can save at most one syscall per batch, and if it fails to start (e.g. seccomp blocks `io_uring_setup`), batches fall back to `pwrite`.
 
 ### WriteBatcher (Async Fire-and-Forget)
 
 ```go
 // High-throughput non-blocking write API
-batcher.BatchPut("key", value)  // returns immediately
+engine.BatchPut("key", value, ttl)  // returns immediately (WriteBatcher.Enqueue)
 
 // Flusher goroutine flushes when:
-// - 2 MB of data accumulated
-// - 4096 entries accumulated
-// - 5 ms timer fires
-// Falls back to synchronous Put when channel is full (cap=65536)
+// - 2 MB of data accumulated   (batchFlushBytes)
+// - 4096 entries accumulated   (batchFlushCount)
+// - 15 ms timer fires          (batchFlushDur)
+// Falls back to synchronous Put when channel is full (cap=65536);
+// flush runs the C++ batch engine (cgo builds) and then MultiPut.
 ```
 
 Use this when you don't need per-write durability confirmation — e.g., time-series ingestion, session writes, logging.
@@ -285,36 +337,37 @@ Use this when you don't need per-write durability confirmation — e.g., time-se
 When the TCP server receives a PUT, it peeks the bufio buffer for additional complete frames before executing:
 
 ```go
-func tryCoalescePuts(br *bufio.Reader, first putFrame) []putFrame {
-    frames := []putFrame{first}
-    for len(frames) < 256 {
-        // peek: is there another complete PUT frame waiting?
-        next, ok := peekNextPutFrame(br)
-        if !ok {
-            break
-        }
-        frames = append(frames, next)
+func tryCoalescePuts(firstKey string, firstVal []byte, br *bufio.Reader) []storage.MultiPutRequest {
+    reqs := []storage.MultiPutRequest{{Key: firstKey, Value: firstVal, TTL: -1}}
+    for len(reqs) < maxPipelineBatch { // 256
+        // only frames already buffered: Peek the 7-byte header, require
+        // cmd == binCmdPut and the whole frame in br.Buffered()
+        ...
+        reqs = append(reqs, storage.MultiPutRequest{Key: key, Value: val, TTL: -1})
     }
-    return frames
+    if len(reqs) < 2 {
+        return nil // caller uses coord.Put
+    }
+    return reqs
 }
-// Execute as one MultiPut, write all N responses, single bw.Flush()
+// Executed as one coord.MultiPut, all N responses written, single bw.Flush()
 ```
 
-This means sequential puts from the same connection automatically get batch throughput without any client changes.
+`tryCoalesceGets` does the same for buffered GET frames: one `coord.readBarrier()`, then one `engine.MultiGet`. This means pipelined requests from the same connection automatically get batch throughput without any client changes.
 
 ### Index table (Go map or off-heap native)
 
-Each shard's key → `IndexEntry` table is an `entryTable`. On cgo builds (Go >= 1.21, including macOS) the default is the off-heap C++ table in `storage/native_index.cpp`: 64-byte records, 8-byte tag|pos slots, a per-shard key arena. Arrays of a page or more are individually mmap'd (mremap growth on Linux), so the index is invisible to the Go GC. `VELTRIXDB_INDEX=map` selects the Go map, `=native` forces the C++ table, and `VELTRIXDB_DISABLE_CGO_ENGINE=1` also selects the map. `CGO_ENABLED=0` builds always use the map.
+Each shard's key → `IndexEntry` table is an `entryTable`. On cgo builds (Go >= 1.21, including macOS) the default is the off-heap C++ table in `storage/native_index.cpp`: 64-byte records, 8-byte tag|pos slots, a per-shard key arena. Arrays of a page or more are individually mmap'd (mremap growth on Linux), so the index is invisible to the Go GC; arrays from 2 MiB are also `MADV_HUGEPAGE`'d on Linux. `VELTRIXDB_INDEX=map` selects the Go map, `=native` forces the C++ table, and `VELTRIXDB_DISABLE_CGO_ENGINE=1` also selects the map. `CGO_ENABLED=0` builds always use the map.
 
-- Entries cross the boundary **by value**. The `*IndexEntry` passed to `update`/`rangeAll` callbacks is a scratch copy, valid only during the callback (invariant 45).
-- Large engines need `vm.max_map_count ≥ 262144` (`scripts/sysctl.conf`). Below that, an insert can fail with ENOMEM (invariant 46).
-- The C++ source lives in `storage/`, not behind an `#include` shim, so the Go build cache tracks it (invariant 44).
+- Entries cross the boundary **by value**. The `*IndexEntry` passed to `update`/`rangeAll` callbacks is a scratch copy, valid only during the callback (CLAUDE.md invariant 45).
+- Large engines need `vm.max_map_count ≥ 262144` (`scripts/sysctl.conf`). Below that, an insert can fail with ENOMEM (CLAUDE.md invariant 46).
+- The C++ source lives in `storage/`, not behind an `#include` shim, so the Go build cache tracks it (CLAUDE.md invariant 44).
 
 Measured with 5M keys: full GC 21 ms → 0.27 ms, settled RSS 168 → 142 B/key. Each cache-miss lookup costs ~19 ns more.
 
 ### Ordered index
 
-A put calls `ordered.Insert` only when the key was absent or tombstoned. A live key is already in the skiplist (invariant 49).
+A put calls `ordered.Insert` only when the key was absent or tombstoned. A live key is already in the skiplist (CLAUDE.md invariant 49). The same rule applies to WAL replay and the atomic-op install path.
 
 ### Read without I/O
 
@@ -350,7 +403,7 @@ C.veltrix_batch_put(engine, (*C.char)(unsafe.Pointer(&keys[0])), ...)
 
 - **Scope:** binary PUT GET DEL PING MPUT MGET only, in standalone mode. The server refuses `--auth-config`. The text protocol, AUTH, TLS and the extended binary commands need `--net=go`.
 - **One Go call per loop iteration:** `vxnfExec` receives every request that arrived in that iteration.
-- **Per-connection strict order:** a connection with a write or deferred read in flight is not parsed further (invariant 50).
+- **Per-connection strict order:** a connection with a write or deferred read in flight is not parsed further (CLAUDE.md invariant 50).
 - **Deferred reads:** GET/MGET probe with `GetNoIO` on the loop. A key that needs a VLog read is finished in a goroutine, and `vxnf_defer` blocks the connection until it is answered. `VELTRIXDB_NET_DEFER_READS=0` restores inline reads for A/B.
 - **Shutdown report:** the server logs per-stage latencies in log2 µs buckets: `iter`, `cb_enter`, `exec`, `put_sched`, `put_exec`, `wake`, `defer_sched`, `defer_exec`.
 
@@ -360,7 +413,7 @@ The front-end is opt-in and experimental. It is not faster overall. On the 4-CPU
 
 ## C++ Components
 
-> **Status:** the ART index, the io_uring priority scheduler, the C++ VLog reader and the eBPF GC throttle below are compiled but have **no Go call site**. The live VLog read path is Go (`storage/vlog.go` `ReadValue`). The C++ code that runs is the native index, the batch engine, the opt-in io_uring write bridge and `netfront/`. See [cpp/README.md](cpp/README.md).
+> **Status:** the ART index, the io_uring priority scheduler, the C++ VLog reader, the SQPOLL `UringReader`, the lock-free index and the eBPF GC throttle below are compiled (or header-only) but have **no Go call site**. The live VLog read path is Go (`storage/vlog.go` `ReadValue`). The C++ code that runs is the native index, the batch engine, the opt-in io_uring write bridge and `netfront/`. See [cpp/README.md](cpp/README.md).
 
 ### ART Index (cpp/include/art.hpp)
 
@@ -406,7 +459,7 @@ Reads `/sys/class/nvme/<dev>/device/local_cpulist` to find which CPUs have IRQ a
 
 ### Lock-Free Index (cpp/include/lockfree_index.hpp)
 
-Hugepage-backed open-addressing hash map for the secondary index:
+Hugepage-backed open-addressing hash map. **Not wired, and not safe as an index**: it stores only a 64-bit key hash (a collision returns another key's entry). The live index is `storage/native_index.cpp`.
 - 32-byte buckets (2 per 64-byte cache line)
 - 50% load factor
 - CAS upsert (`compare_exchange_strong`, release ordering)
@@ -419,17 +472,19 @@ Hugepage-backed open-addressing hash map for the secondary index:
 
 ### Partition Map
 
-- 256 partitions mapped to physical nodes via consistent hash ring
-- 64 virtual nodes per physical node (reduces key redistribution on membership changes)
-- Partition assignment stored in `PartitionMap`, replicated via gossip
+- 256 partitions by default (`ClusterConfig.PartitionCount`), assigned round-robin over active nodes sorted by ID, with rack-aware replicas (`pickReplicas`); every member computes the same table deterministically in `Rebalance`
+- Keys are placed on a consistent-hash ring: FNV-1a + fmix64 finalizer over `RoutingKey(key)`, 64 virtual nodes per physical node
+- Gossip digests carry the epoch, the partition-map version and per-node state / heartbeats, not the partition table itself
 
 ### Failure Detector
 
-State machine: `ALIVE → SUSPECT → FAILED → Recovering`
+State machine: `Active → Suspect → Failed → Recovering` (plus `Draining` for a graceful leave)
 
 ```
-heartbeatInterval: configurable
-failureThreshold: 10 seconds without heartbeat
+HeartbeatInterval: 1 s (health-check tick)
+SuspectThreshold:  3 s without heartbeat
+FailureThreshold: 10 s without heartbeat
+RecoveryInterval:  5 s
 ```
 
 Critical: call `fd.SetLocalNode(nodeID)` before `fd.Start()` — see Invariant 11.
@@ -439,7 +494,7 @@ Critical: call `fd.SetLocalNode(nodeID)` before `fd.Start()` — see Invariant 1
 | Mode | Latency | When to use |
 |------|---------|-------------|
 | Async | + | Best throughput; data may lag on replicas |
-| Quorum | ++ | N/2+1 ACKs; balanced durability |
+| Quorum | ++ | replicationFactor/2+1 copies (local counts as one); balanced durability |
 | Strong | +++ | All replicas ACK; strongest guarantee |
 
 ---
@@ -494,25 +549,22 @@ This applies to any nested struct used as a default argument inside a class body
 
 ## Adding a New Command
 
-1. Add a command byte constant in `cmd/server/main.go` (after `cmdAuth = 0x09`)
+1. Add a command byte constant in `cmd/server/main.go`. It must be **≤ 0x29**: the first byte of a connection decides binary vs text, and 0x2A+ is printable ASCII. Only 0x1D is still free — add search-style commands as sub-ops of `SEARCH` (0x1C) instead, and dispatch the new byte to `handleExtOp` explicitly
 2. Add a `handleXxx` function that reads the frame and calls the storage engine
 3. Add the command to the `switch` in the binary protocol dispatch loop
-4. Add `CMD_XXX` to the C++ `VeltrixBatchEngine` if it needs batch processing
-5. Add the op to all 4 client SDKs
-6. Add a Prometheus counter to `metrics/prometheus.go`
-7. Update the wire protocol section in `README.md` and `ops_flow.md`
+4. Route mutations through the `coordinator` (`cmd/server/coordinator.go`) so raft and replicated modes see them; a new raft op is appended at the END of the `fsmOp` iota in `raft_fsm.go` (values are persisted in the log)
+5. Reads must call `coord.readBarrier()` first (invariant 17)
+6. Add the op to the in-repo Go client (`client/`); the other SDKs live in the separate Veltrixdb-client repo
+7. Add a Prometheus metric to `metrics/prometheus.go` if needed
+8. Update the wire protocol section in `README.md`
 
 A new command is served only by `--net=go` unless you also add it to `netfront/`. There it must keep the per-connection ordering rules (invariant 50) and must not read from disk on a loop thread.
 
 ---
 
-## Adding a New Disk at Runtime
+## Changing the Disk Count
 
-1. Add the new disk path to `-data-dirs`
-2. Wait for the DaemonSet/operator to format it and create a PV
-3. The operator calls `AddDisk(path)` on the storage engine
-4. Shards are rebalanced: `shard % newNumDisks` routing takes effect for new writes
-5. Old data on old disks is migrated progressively by the compactor
+There is no runtime disk add: the storage engine has no `AddDisk`, and the disk count is fixed by `--data-dirs` at startup. Do not change the number of `--data-dirs` on an existing data set. Routing is `shard % numDisks`, and WAL replay skips every record whose key does not route to the disk it was found on under the *current* count (`storage/wal_replay.go`). Restarting with a different count therefore drops those keys from the index. To change the disk count, move the data through the cluster (add a node with the new layout and let rebalance migrate keys) or export/import with `cmd/veltrix-migrate`.
 
 Do not change `numShards` — the shard count is permanently baked into on-disk data.
 
@@ -537,7 +589,9 @@ Do not change `numShards` — the shard count is permanently baked into on-disk 
 | `veltrixdb_vlog_gc_skipped_empty_total` | Counter | GC skipped: no candidates |
 | `veltrixdb_vlog_gc_read_errors_total` | Counter | VLog read errors during GC |
 | `veltrixdb_vlog_gc_cas_fails_total` | Counter | CAS failures during GC (concurrent writes) |
-| `veltrixdb_vlog_gc_candidates_total` | Counter | Entries scanned per GC run |
+| `veltrixdb_vlog_gc_candidates_total` | Counter | Live entries scanned by GC (cumulative) |
+| `veltrixdb_vlog_gc_emergency_runs_total` | Counter | GC passes that bypassed the admission pause (garbage ≥ 65%) |
+| `veltrixdb_storage_native_index_bytes` | Gauge | Off-heap native index memory |
 | `veltrixdb_failure_detector_nodes_failed_total` | Counter | Nodes marked FAILED (compare with `..._nodes_recovered_total`) |
 | `veltrixdb_cluster_nodes_total` | Gauge | Known cluster members |
 
@@ -545,4 +599,4 @@ WAL batch size efficiency:
 ```promql
 rate(veltrixdb_storage_writes_total[1m]) / rate(veltrixdb_storage_wal_flushes_total[1m])
 ```
-Target > 100 at 10 ms window + 10K writes/s/disk.
+Target > 100 at 10 ms window + 10K writes/s/disk in fixed mode. In adaptive mode (default) the ratio follows concurrency: ~1 for a lone writer, ~N for N concurrent writers (64 writers → 64 writes per flush measured).

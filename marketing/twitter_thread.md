@@ -67,6 +67,17 @@ Each piece exists to extract NVMe performance, not paper over it.
 
 ---
 
+**Tweet 6b — Search** [252 chars]
+Built in, not bolted on:
+
+• HNSW vector search (float32 / int8 / PQ)
+• BM25 full-text + hybrid (reciprocal-rank fusion)
+• Filters on the record with the same id
+
+GloVe-100, 100K real vectors: recall@10 0.953, 0.77 ms median (laptop, 1 query at a time).
+
+---
+
 **Tweet 7 — Kubernetes story** [252 chars]
 Production-grade from day one:
 

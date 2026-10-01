@@ -36,12 +36,27 @@ RECORDS=10000000 OPS=10000000 THREADS=128 WORKLOADS="a b c d f" ./compare.sh
 VECTORS=1 ANN_DIR=/mnt/nvme0/ann VEC_ARGS="-quant pq -graph disk" ./compare.sh
 ```
 
+`compare.sh` defaults: `DBS="veltrixdb aerospike scylla"`, `WORKLOADS="a b c f"`,
+`RECORDS=1000000`, `OPS=1000000`, `THREADS=64`, `START=1` (docker compose
+up / stop each database in turn). With `START=0` it uses databases that are
+already running at `VELTRIX_ADDR` (default `127.0.0.1:9000`),
+`AEROSPIKE_HOST` and `SCYLLA_HOSTS` (default `127.0.0.1`).
+
+`scripts/ann-dataset.py` needs `h5py` and `numpy`. It downloads
+`http://ann-benchmarks.com/<name>.hdf5` with its own User-Agent
+(ann-benchmarks.com answers 403 to Python-urllib's default), makes up to 4
+attempts with a growing back-off, and writes through a `.part` temp file so
+a failed download never leaves a truncated `.hdf5` behind. It writes
+`<name>.train.fvecs` and `<name>.test.fvecs`; ground truth is not copied
+(the consumers compute exact neighbours).
+
 ## Making the numbers comparable
 
 Publish a result only with all of these stated next to it:
 
 1. **Same machine, same disk, one database running at a time.** The client on
-   a second machine is better still (`START=0` + addresses).
+   a second machine is better still (`START=0` plus `VELTRIX_ADDR` /
+   `AEROSPIKE_HOST` / `SCYLLA_HOSTS`).
 2. **Durability.** VeltrixDB ACKs after `fdatasync` of WAL and VLog (default).
    ScyllaDB's default `commitlog_sync: periodic` ACKs before the write is on
    disk; set `commitlog_sync: batch` for an equal comparison, or report both.

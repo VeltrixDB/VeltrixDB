@@ -6,7 +6,7 @@
 
 The serving path is Go, with two C++ exceptions on a cgo build: the
 per-shard index tables live off the Go heap in C++ (default on every cgo
-build, macOS included), and `--net=cpp` swaps in an opt-in C++ network
+build with Go >= 1.21, macOS included), and `--net=cpp` swaps in an opt-in C++ network
 front-end. Most of what is under `cpp/` has no Go call site at all — the
 dashed boxes below are the honest boundary, not the file tree.
 
@@ -67,8 +67,8 @@ flowchart TB
 ### What is NOT in that diagram
 
 `cpp/` also contains an ART index, a 3-tier priority io_uring scheduler, a C++
-VLog, a LIRS cache, a defragmenter and an eBPF GC throttle — roughly 5,400
-lines. They compile and link, and **nothing in Go calls them**. The SQPOLL
+VLog, a LIRS cache, a defragmenter and an eBPF GC throttle — with the C++
+shard and write path, roughly 4,800 lines (~5,500 with the `allocator.hpp`, `index_entry.hpp` and `lockfree_index.hpp` headers only they use — the figure `cpp/README.md` gives). They compile and link, and **nothing in Go calls them**. The SQPOLL
 `UringReader` is compiled into cgo builds by a shim but has no Go call site
 either; the VLog read path is Go (`storage/vlog.go:ReadValue`). See
 [cpp/README.md](cpp/README.md).
@@ -93,8 +93,9 @@ With 8 disks, 1024 of the 8192 shards land on each. A failure on one disk
 doesn't affect the other 7.
 
 The Go `numShards` and the C++ `kNumShards` must stay equal — see invariant 1.
-`StorageConfig.NumShards` is **vestigial**: it is defaulted and validated but
-nothing reads it, and changing it has no effect.
+`StorageConfig.NumShards` is **deprecated and ignored**: the index always uses
+the `numShards` constant, and `NewStorageEngine` only logs a warning when the
+field is set to anything other than 8192.
 
 > **Sizing trap.** Anything sized *per shard* is multiplied by **8192**, not
 > 1024. The Bloom default was written as "4 M bits/shard × 1024 shards =
@@ -106,13 +107,16 @@ nothing reads it, and changing it has no effect.
 
 ## Key Components
 
-**In-Memory Index** — one table per shard. Each entry is ~64 B: disk offset,
-disk index, value size, flags, TTL and a monotone version counter. No value
-bytes. On a cgo build the table is C++ off the Go heap
+**In-Memory Index** — one table per shard. Each entry is 64 B (`IndexEntry`, `storage/types.go`):
+key hash, disk offset, disk index, on-disk and plaintext value sizes, key size,
+write timestamp, TTL deadline, plaintext CRC32C, shard ID, flags and schema
+version. No value bytes; the engine's version counter goes into the WAL
+record, not the entry. On a cgo build the table is C++ off the Go heap
 (`storage/native_index.cpp`): dense 64 B records, 8 B tag/position slots and a
 per-shard key arena, invisible to the GC. With 5M keys that took a full GC from
 21 ms to 0.27 ms and settled RSS from 168 to 142 B/key, for ~19 ns more per
-cache-miss lookup. Arrays of a page or more are individually mmap'd, so large
+cache-miss lookup. Arrays of a page or more are individually mmap'd (from 2 MiB also
+`MADV_HUGEPAGE` on Linux), so large
 engines need `vm.max_map_count` ≥ 262144 (`scripts/sysctl.conf`) or inserts
 can fail with ENOMEM. `CGO_ENABLED=0`, `VELTRIXDB_INDEX=map` or
 `VELTRIXDB_DISABLE_CGO_ENGINE=1` select the Go map instead. (The C++ ART tree
@@ -127,7 +131,7 @@ to 256 independent caches, **each with its own mutex**.
 > cache-wide mutex therefore serialised every read in the engine and undid the
 > 8192-way index sharding entirely — profiling put **21.7% of total CPU** in
 > that one lock, 98.98% of it in `Get`. Sharding took a cache hit from
-> **711 ns to 92 ns**. Never collapse it back (invariant 36).
+> **711 ns to 92 ns**. Never collapse it back (CLAUDE.md invariant 36).
 >
 > The trade: per-shard budgets are not a global budget, so a skewed keyspace
 > can evict from a hot shard while a cold one has room.
@@ -138,7 +142,11 @@ otherwise deletes would leave bits set forever and the false-positive rate
 would climb.
 
 **WAL** — group-commit: N writes share one `write(2)` and one `fdatasync`.
-Default 15 ms window. One WAL per disk. Records are binary and checksummed
+Adaptive by default (`storage/group_commit.go`, `--group-commit=adaptive`): the
+15 ms window is an upper bound — a lone writer is synced at once, concurrent
+writers after an idle gap equal to the EWMA fdatasync time (clamped to
+20 µs–2 ms); `fixed` waits the whole window. The VLog flusher uses the same
+pacer. A flush also fires early at `--wal-max-batch` (4096) records. One WAL per disk. Records are binary and checksummed
 (see the write path); a `MultiPut` enqueues one item per batch, not one per
 key.
 
@@ -148,8 +156,9 @@ an atomic add, so there is no mutex on the write path. A batch reserves its
 whole extent with one add and writes it with one `pwrite` and one `fdatasync`
 (one SQE with the opt-in io_uring bridge).
 
-**Block Packing** — batched writes pack up to ~26 records into a 4 KB VLog
-block. For 128 B values that is 4096 B → 152 B per record (27× density).
+**Block Packing** — batched writes (`VLogBatcher`) pack up to ~26 records into
+a 4 KB VLog block. For 128 B values that is 4096 B → 152 B per record (~26×
+density); records larger than a block fall back to the unpacked layout.
 Single `Put` stays on the unpacked lock-free path.
 
 **Value transform** — `transformForWrite` is the single chokepoint for
@@ -192,7 +201,7 @@ sequenceDiagram
     end
 
     Note over E: unblocks at max(WAL, VLog), not the sum
-    E->>I: install IndexEntry (DiskOffset, Version++)
+    E->>I: install IndexEntry (DiskOffset, SegmentID = disk)
     E->>CA: insert
     E-->>C: OK
 ```
@@ -209,12 +218,12 @@ unreferenced garbage that the next GC pass reclaims, and the client never got
 an OK. Safe.
 
 **What the WAL record must carry.** Records are binary (`storage/wal_format.go`):
-a 48-byte header — magic `0xB1`, flags (tombstone / packed / inline value),
+a 48-byte little-endian header — magic `0xB1`, format version (1), flags (tombstone / packed / inline value),
 key length, `valueLen`, `diskLen`, plaintext CRC32C, `xflags`, timestamp,
 version, `vlogOffset` — then the key, the value if inline, and a CRC32C over
 the whole record. The legacy text form is still read (and written by the
-server under `--wal-format=text`, for rollback only; it logs a warning that
-such records cannot carry keys containing `|` or `\n`):
+server under `--wal-format=text`, for rollback only; the engine logs a warning
+that keys containing `|` or `\n` are not crash-safe in that format):
 
 ```
 timestamp|tombstone|key|valueLen|crc32hex|version|vlogOffset|packed|diskLen|xflags
@@ -246,6 +255,7 @@ flowchart TD
     D -->|"maybe present"| E["RLock shard, look up IndexEntry"]
     E -->|absent| N
     E -->|"expired TTL"| X(["ErrKeyExpired"])
+    E -->|"dirty value in RAM<br/>(KV separation off)"| H
     E -->|found| F["VLog ReadValue at DiskOffset<br/>4 KB-aligned pread<br/>verify magic + CRC32C"]
     F --> G["decrypt → decompress → migrate-on-read"]
     G --> H["insert into cache"]
@@ -303,11 +313,15 @@ Protects reads from being starved by heavy writes:
 
 | Read EWMA | Action |
 |-----------|--------|
-| < 15 ms | Normal — GC runs at full speed |
-| ≥ 15 ms | GC bandwidth capped at 60 MB/s (`gcLatencyThresholdNs`) |
+| ≤ 15 ms | Normal — GC runs at full speed |
+| > 15 ms | GC bandwidth capped at 60 MB/s (`gcLatencyThresholdNs`); 200 MB/s once garbage ≥ 50% |
 | > 20 ms | GC paused + each PUT sleeps 2 ms (`admissionThrottleNs`) |
 | < 10 ms | Everything resumes (`admissionResumeNs`) |
-| No reads for 4 min | EWMA treated as stale — GC resumes |
+| No reads for 4 min | At the next GC pass the EWMA is treated as stale: reset to 0, pause and write throttle cleared (`gcEWMAStaleDuration`) |
+
+The EWMA (α = 1/8) is updated on every 64th read (`readEWMASampleEvery`).
+Separately, when more than 20% of a GC batch loses its CAS to concurrent
+writes, each `Put` sleeps 1 ms for the next 200 ms (`GCBackpressureUntilNs`).
 
 ---
 
@@ -322,7 +336,13 @@ When garbage builds up, GC escalates automatically to avoid death-spirals:
 | 50–65% (critical) | unlimited / 200 MB/s | yes | 60 s |
 | ≥ 65% (emergency) | unlimited | **no** | 30 s |
 
-Emergency mode logs `[gc] disk=N EMERGENCY` and increments `veltrixdb_vlog_gc_emergency_runs_total`.
+Bandwidth is "unlimited while read EWMA ≤ 15 ms / capped above it". The
+intervals are `DefragInterval` (default 120 s), halved and quartered by the
+worst disk's ratio (`nextInterval`). The 30% trigger is `--gc-threshold`
+(`DefragThreshold`). Every pass ends by rebuilding the bloom filters.
+
+When admission control has paused GC, an emergency pass bypasses the pause,
+logs `[gc] disk=N EMERGENCY` and increments `veltrixdb_vlog_gc_emergency_runs_total`.
 
 ---
 
@@ -346,7 +366,7 @@ The Go layer is fully functional on its own. C++ is optional — the native inde
 Two consequences worth internalising:
 
 - **The Docker image is `CGO_ENABLED=1`** (native index; the io_uring VLog bridge is opt-in via `VELTRIXDB_URING_BRIDGE=on|sqpoll`). Kubernetes' RuntimeDefault seccomp profile blocks `io_uring_setup`, in which case an opted-in bridge does not start and VLog batches use pwrite; the native index needs no privileges. `--build-arg CGO_ENABLED=0` builds the old pure-Go static image.
-- **CI job `node-6-cpp` compiles the C++** — the CMake target, the cgo shims, and `scripts/build.sh` end to end — and runs the storage suite with the C++ engine and the io_uring bridge on. `node-5-race` runs the native index under `-race`. Every other job is `CGO_ENABLED=0`.
+- **CI job `node-6-cpp` compiles the C++** — the CMake target, the cgo shims, and `scripts/build.sh` end to end — and runs the storage suite with the C++ engine and the io_uring bridge on. `node-5-race` runs the native index under `-race`. `node-7-search` runs its search tests under `-race` with cgo on and the C++ engine off, and the `net-bench` workflow builds `netfront/` with cgo. Every other job is `CGO_ENABLED=0`.
 
 ---
 
@@ -377,17 +397,61 @@ Compare with `scripts/net-bench.sh` (see BENCHMARKING.md) on the target
 hardware; a Mac cannot show a difference, since loopback caps round trips at
 ~60K/s for both.
 
+## Search subsystem
+
+Vector, full-text and hybrid search are derived state over reserved keys
+(user guide: [docs/vector-search.md](docs/vector-search.md)).
+
+```
+PUT / Delete / MultiPut of a reserved key
+   @vec/<ns>/<id>   float32 blob ──► HNSW index of <ns>   (hnsw.go, vector_index.go)
+   @txt/<ns>/<id>   UTF-8 text  ──► BM25 index of <ns>    (text_index.go)
+   @vecns/<ns>      settings    ──► create / re-encode <ns> (quant, pq_m, graph)
+   @idxdef/<name>   field       ──► CreateFieldIndex / DropFieldIndex
+        │
+        └── storage/search_hooks.go runs after the write commits, so replication,
+            raft apply, snapshot restore and partition transfer all index correctly
+```
+
+- **HNSW** (M = 16, 32 on layer 0, efConstruction = 200, efSearch = 64):
+  diversity-heuristic neighbour selection, deletes as tombstones compacted in
+  the background once they exceed 30 % of nodes and number at least 1024, inserts planned under the read lock and linked under the
+  write lock, updates as tombstone + fresh node.
+- **Quantization:** int8 codes (dim + 4 B) or product quantization (m B,
+  default m = dim/8, 256 centroids per subspace, k-means codebooks trained in
+  the background once 10000 vectors exist); searches re-rank 4×k candidates
+  (PQ: the whole beam) against the float32 vectors read back with one
+  parallel MultiGet.
+- **Disk graph:** layer-0 adjacency as 132-byte records in an unlinked,
+  memory-mapped scratch file (`vector_adj.go`).
+- **Text:** BM25 inverted index (k1 = 1.2, b = 0.75); hybrid = weighted
+  reciprocal-rank fusion of the two lists, rrfK = 60, α default 0.5
+  (`hybrid.go`).
+- **Startup:** `RebuildSearchIndexes` applies `@vecns/` settings, then loads
+  vectors and documents on all cores; until it finishes searches return
+  `ErrSearchRebuilding` (`INFO` → `search_ready`).
+- **Cluster:** `cluster.RoutingKey` routes the derived keys as their record;
+  `cmd/server/search_fanout.go` fans searches out over the transfer listener
+  (HMAC-signed with `--cluster-secret-file`), sums BM25 statistics first, and
+  fails the request if a peer does not answer (`--search-allow-partial`).
+  Peers marked failed are skipped; `--search-timeout-ms` (2000) bounds a peer
+  call and `--search-fanout=false` keeps searches local.
+
 ## Cluster
 
 ```
-cluster/   partition_map.go    consistent-hash ring (FNV-1a, 64 vnodes/node), epoch fencing
-           failure_detection.go heartbeat SUSPECT → FAILED state machine
-           gossip.go            TCP gossip listener + digest exchange
+cluster/   partition_map.go    consistent-hash ring (FNV-1a + fmix64, 64 vnodes/node), 256 partitions, RoutingKey
+           epoch.go             epoch fencing (stale-epoch updates / transfers rejected)
+           failure_detection.go heartbeat Active → Suspect (3 s) → Failed (10 s) → Recovering
+           gossip.go            TCP gossip listener + JSON digest exchange
+           partition_transfer.go TransferAgent: key migration over HTTP (/transfer/keys)
 
 replication/ async / quorum / strong replication modes
-             vector clocks, anti-entropy, tombstone watermarks
+             vector clocks, anti-entropy
+             (tombstone watermarks live in storage/tombstone_replicated.go; nothing sets them yet)
 
-consensus/  Raft — leader election + log replication + snapshots
+consensus/  Raft — leader election, log replication, snapshots, single-server
+            membership changes, ReadIndex; Submit group-commits one fsync per batch
 ```
 
 ### Deployment modes (`--mode`) — what is actually wired into the serving path
@@ -400,12 +464,12 @@ INCR / DECR / SETNX / TXN, text and binary protocols) goes through it.
 | `--mode` | How writes are handled | Consistency guarantee |
 |----------|------------------------|-----------------------|
 | `standalone` (default) | Straight to the local engine — byte-for-byte the pre-existing single-node path. No Raft, no replication, no redirects. | Single-node linearizable (one writer, one copy). |
-| `raft` | Ops are gob-encoded and submitted to a Raft log (`consensus`), committed by quorum, and applied on every node via a storage-backed FSM (`cmd/server/raft_fsm.go`). Non-leaders reject writes with a `MOVED <leader-addr>` redirect. | **Linearizable writes** (single Raft group, quorum commit). Reads default to local applied state (fast, possibly stale); with `--linearizable-reads`, GET runs the **ReadIndex** fence (`consensus/read_index.go`) — quorum-confirmed, never stale, one heartbeat round-trip per read. |
+| `raft` | Ops are gob-encoded and submitted to a Raft log (`consensus`), committed by quorum, and applied on every node via a storage-backed FSM (`cmd/server/raft_fsm.go`). Non-leaders reject writes with a `MOVED <leader-addr> <leader-id>` redirect. | **Linearizable writes** (single Raft group, quorum commit). Reads default to local applied state (fast, possibly stale; a freshly elected leader first waits for its term's no-op to apply — `WaitLeaderApplied`); with `--linearizable-reads`, GET runs the **ReadIndex** fence (`consensus/read_index.go`) — quorum-confirmed, never stale, one heartbeat round-trip per read. |
 | `replicated` | The write is applied to the local engine, then handed to the replication engine. The `--consistency` flag decides when the client is ACKed. | Primary-copy durability across N copies; **NOT** linearizable under concurrent writers (no single-writer ordering). Reads are local. |
 
 **`--consistency` (replicated mode):**
 
-- `eventual` (async) — ACK immediately after the local write; replicas catch up in the background.
+- `eventual` (async, the default) — ACK immediately after the local write; replicas catch up in the background.
 - `quorum` — ACK only after a majority of replicas (counting the local copy) have applied the write.
 - `strong` — ACK only after **all** replicas have applied the write.
 
@@ -421,7 +485,9 @@ because Raft delivers the identical log order to every node.  Results for ops
 that return a value/status (CAS/INCR/SETNX/TXN) are returned to the submitting
 client via a per-request result side-channel keyed by a node-unique request id.
 `Snapshot`/`Restore` dump and reload the keyspace via the engine's paginated
-`ScanCursor`.
+`ScanCursor`. `ApplyBatch` (`raft_fsm_batch.go`, `consensus.BatchStateMachine`)
+coalesces consecutive committed PUTs into one `MultiPut`; other ops break the
+run and apply singly, in log order.
 
 ### Cluster-aware client & topology
 
@@ -439,8 +505,8 @@ term/leader, peers, partition epoch, and per-replica replication lag.
   (LPUSH/RPUSH/LPOP/RPOP/SADD/SREM) writes now route through the coordinator
   in ALL modes: raft replays them deterministically via dedicated FSM ops;
   replicated mode ships their composite-key KV effects as ordinary
-  replication traffic (the replica's apply hook also refreshes its in-RAM
-  vector index for `@vec/` keys).
+  replication traffic (the replica applies them with `Put`/`Delete`, whose
+  search hooks refresh its in-RAM vector and text indexes).
 - Vector / text / hybrid search (`cmd/server/search_fanout.go`) fans out to
   every non-failed node over the transfer listener and merges; BM25 runs in
   two phases so every node scores with cluster-wide statistics. The ring
@@ -460,8 +526,10 @@ term/leader, peers, partition epoch, and per-replica replication lag.
 
 ### Remaining gaps
 
-- Replicated-mode secondary-index METADATA (IDXCREATE/IDXDROP) is node-local;
-  raft mode replicates it.
-- QUERY / RANGE / SCANCUR reads are always local in cluster modes.
+- RANGE / SCANCUR reads are local in cluster modes (QUERY, IDXQUERY and the
+  searches fan out; IDXCREATE / IDXDROP replicate in both modes via
+  `@idxdef/` keys).
+- The search indexes are not persisted; each node rebuilds them at startup
+  and refuses searches until done.
 - repl-ship has no back-pressure to the source and only LWW conflict
   resolution.

@@ -7,14 +7,24 @@ The pattern:
   3. At question time: embed the question, VSEARCH top-k, GET the texts,
      assemble the prompt for your LLM.
 
-One database holds both sides, so a deleted document can never keep serving
-from a stale vector index — VDEL and DELETE share one write path, one WAL,
-one backup.
+One database holds both sides: the record (PUT / DEL) and its vector
+(VSET / VDEL) share one write path, one WAL, one backup. They are separate
+keys, though — DEL removes only the record, so delete a chunk with DEL and
+VDEL (the vector otherwise stays searchable).
 
 This demo uses a deterministic hashing bag-of-words embedder so it runs with
 no dependencies. In production, swap `embed()` for a real model
 (voyage-3, text-embedding-3-small, all-MiniLM-L6-v2, ...) — every other line
 stays the same.
+
+This demo's VSET / VSEARCH use the vector namespace "default".
+Keyword + semantic retrieval: also store each chunk's text with
+`TSET <key> NS default TEXT <text>` (one line, no newlines) and query with
+`HSEARCH k NS default VEC ... QUERY <question>` (reciprocal-rank fusion of
+vector and BM25 results; both halves must use the same namespace). Large
+corpora can use `VCREATE <ns> <dim> QUANT pq` to cut vector RAM ~7× (measured
+at 768-dim; less at small dimensions, where graph edges dominate). See
+docs/vector-search.md.
 
 Run:  python3 rag_semantic_search.py [host] [port]     (default 127.0.0.1 9000)
 """

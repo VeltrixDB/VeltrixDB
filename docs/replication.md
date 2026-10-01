@@ -1,11 +1,13 @@
 # Replication in VeltrixDB
 
-VeltrixDB uses two replication mechanisms that work at different layers:
+VeltrixDB has two replication mechanisms. The server uses exactly one of them, chosen by `--mode` (`cmd/server/coordinator.go`):
 
-1. **Raft Consensus** (`consensus/raft.go`) — synchronous, strongly consistent replication of the write-ahead log across a Raft group. This is the primary durability guarantee.
-2. **Replication Engine** (`replication/engine.go`) — asynchronous (or quorum/strong) replication of writes to replica nodes, used for read scaling, geographic distribution, and cross-cluster DR.
+1. **Raft Consensus** (`consensus/raft.go`, `--mode=raft`) — every mutating command goes through a replicated Raft log and is applied on every node in log order. Linearizable writes; non-leaders answer writes with a `MOVED <addr> <id>` redirect.
+2. **Replication Engine** (`replication/engine.go`, `--mode=replicated`) — primary-copy replication: a node applies the write locally, then ships it to its peers; `--consistency=eventual|quorum|strong` decides when the client is acknowledged.
 
-Both need the Go network front-end (`--net=go`, the default). `cmd/server` refuses `--net=cpp|uring|poll` with `--mode=raft` or `--mode=replicated`: the C++ front-end is standalone-only and its writes would bypass Raft and replication.
+`--mode=standalone` (the default) uses neither. Both distributed modes need the Go network front-end (`--net=go`, the default). `cmd/server` refuses `--net=cpp|uring|poll` outside standalone (`--net=<x> serves --mode=standalone only (writes bypass Raft/replication routing)`): the C++ front-end writes straight to the local engine.
+
+Listener ports are derived from a node's client `--addr` port P: replication P+1 (`--repl-addr`), Raft RPC P+2 (`--raft-addr`), gossip P+3 (`--gossip-addr`), partition transfer P+5 (`--transfer-addr`). Peers always use the derived offsets. `--cluster-tls-cert/-key/-ca` enable TLS on the Raft, replication and transfer links; `--cluster-mtls` additionally requires client certificates on the replication and transfer listeners.
 
 ---
 
@@ -24,8 +26,10 @@ Raft replicates every write as a log entry across all nodes in the Raft group be
 |-----------|------|
 | `RaftNode` | Core Raft state machine per node |
 | `persistentState` | Survives crashes: `CurrentTerm`, `VotedFor`, `Log` |
-| `Transport` | TCP layer for `RequestVote` and `AppendEntries` RPCs |
-| `StateMachine` | Interface applied once a log entry commits (`StorageEngine`) |
+| `Transport` | gob-over-TCP layer for `RequestVote`, `AppendEntries` and `InstallSnapshot` RPCs |
+| `StateMachine` | Interface applied once a log entry commits — in the server, `raftFSM` (`cmd/server/raft_fsm.go`), a `SnapshotStateMachine` and `BatchStateMachine` over the `StorageEngine` |
+
+Each log entry's command is a gob-encoded `fsmCmd`. The op codes (`fsmOp`, persisted in the log, so new ones are only ever appended): `opPut`, `opDelete`, `opMultiPut`, `opCAS`, `opIncr`, `opDecr`, `opSetNX`, `opTxn`, `opNSPut`, `opNSDelete`, `opNSDrop`, `opHSet`, `opHDel`, `opHExpire`, `opVSet`, `opIdxCreate`, `opIdxDrop`, `opLPush`, `opRPush`, `opLPop`, `opRPop`, `opSAdd`, `opSRem`, `opVDel`. Ops that return a value (CAS, INCR, TXN, pops, …) get it back through a per-request result channel keyed by a node-salted request ID. Cluster membership changes are separate `EntryConfig` entries (`AddServer` / `RemoveServer`, `consensus/membership.go`).
 
 ### The Write Path (Leader)
 
@@ -33,13 +37,16 @@ Raft replicates every write as a log entry across all nodes in the Raft group be
 Client PUT
     │
     ▼
-Submit(command)           ← only succeeds on the leader
-    │
-    ├─ Append LogEntry{Term, Index, Command} to local log
-    ├─ Persist log to raft_state.gob (writeStateFile, async)
+Submit(command)           ← only succeeds on the leader; enqueues to submitCh
     │
     ▼
-broadcastAppendEntries()  ← one goroutine per peer, parallel
+flusher goroutine         ← group commit: drains up to 4096 pending Submits
+    ├─ Append every LogEntry{Term, Index, Command} under one rn.mu section
+    ├─ Persist log to raft_state.gob (writeStateFile: one fsync for the batch,
+    │                                 outside rn.mu, before replication)
+    │
+    ▼
+broadcastAppendEntries()  ← once per batch; one goroutine per peer, parallel
     │
     ├─ peer 2: AppendEntries RPC → ACK
     ├─ peer 3: AppendEntries RPC → ACK  ← quorum (2 of 3)
@@ -48,13 +55,13 @@ broadcastAppendEntries()  ← one goroutine per peer, parallel
 maybeAdvanceCommit()      ← advance commitIndex when quorum ACKs
     │
     ▼
-applier goroutine         ← sm.Apply(command) → StorageEngine.Put/Delete
-    │
+applier goroutine         ← raftFSM.ApplyBatch / Apply → StorageEngine
+    │                        (consecutive PUTs coalesce into one MultiPut)
     ▼
 Submit() returns nil      ← client receives OK
 ```
 
-**Key invariant**: `Submit()` polls `lastApplied >= targetIndex` with a 5-second deadline. The entry is only visible to clients after `sm.Apply()` runs on the leader.
+**Key invariant**: `Submit()` blocks on a per-index commit waiter that the applier signals after applying that entry, with a 5-second deadline (`submit timeout: entry N not committed within 5s`); losing leadership fails it with `ErrNotLeader`. The entry is only visible to clients after the state machine has applied it on the leader. The applier wakes on commit notifications and on a 1 ms ticker.
 
 ### The Write Path (Follower)
 
@@ -90,12 +97,14 @@ startElection()
             │
             ▼
         Peer grants vote if:
+          0. the candidate is in the peer's current configuration
           1. args.Term >= peer.currentTerm
           2. peer hasn't voted in this term (or already voted for this candidate)
           3. Candidate log is at least as up-to-date (§5.4.1: compare last term, then length)
             │
             ▼
-        Collect votes → become leader when votes > N/2
+        Collect votes → become leader when votes ≥ len(config)/2 + 1
+        (a single-node configuration wins immediately)
 ```
 
 **Randomized timeouts** (400–800 ms) prevent multiple nodes from starting elections simultaneously. Even with 3 nodes starting at the same instant, the different random delays mean at most one reaches candidate before the others.
@@ -106,33 +115,36 @@ When a new leader is elected, it cannot directly commit log entries from previou
 
 ```go
 // becomeLeader() in raft.go
-noop := LogEntry{Term: rn.ps.CurrentTerm, Index: lastIdx+1, Command: nil}
+noop := LogEntry{Term: rn.ps.CurrentTerm, Index: rn.lastLogIndex() + 1, Command: nil}
 rn.ps.Log = append(rn.ps.Log, noop)
+rn.termStartIndex = noop.Index
 ```
 
-Once the no-op is committed (quorum ACK), all prior-term entries before it are also implicitly committed. The applier goroutine skips nil-command entries:
+Once the no-op is committed (quorum ACK), all prior-term entries before it are also implicitly committed. The applier skips nil-command entries (and config entries):
 
 ```go
-if len(e.Command) > 0 {
+if e.Type == EntryNormal && len(e.Command) > 0 {
     rn.sm.Apply(e.Command)
 }
 ```
 
-This is why the first observable effect after a leader election may be a short (≤ 50 ms) delay before writes are accepted — the no-op must commit first.
+The new leader persists the no-op and broadcasts it immediately, so it normally commits within one round trip. Writes submitted meanwhile are accepted; they commit after the no-op.
+
+**Reads on a new leader wait for the no-op too.** Until the no-op is applied, the new leader's state machine may not yet contain entries its predecessor committed and acknowledged. Serving a local GET in that window returned "not found" for an acknowledged write (`TestRaftClusterFailover` failed intermittently this way; nothing was lost). `RaftNode.WaitLeaderApplied` blocks reads on a leader until `lastApplied ≥` its no-op index (≤ `readIndexTimeout`, 2 s); after that it is one atomic load. Followers never wait — their local reads are stale by design; use `--linearizable-reads` for the ReadIndex fence. GET and every MGET path go through the same barrier (`coordinator.readBarrier`). Without it, a unit test missed the acknowledged write in 20 of 20 failovers; with it, 0 of 20.
 
 ### Persistence
 
-Raft state (`CurrentTerm`, `VotedFor`, log entries) is persisted to `<dataDir>/raft_state.gob` using a **temp-file rename** pattern for atomicity:
+Raft state (`CurrentTerm`, `VotedFor`, log entries) is persisted (gob) to `<dataDir>/raft_state.gob` using a **temp-file rename** pattern for atomicity. The server's Raft `dataDir` is `<--data>/raft` (the `--data` flag, even when `--data-dirs` is set).
 
 ```
 1. Write to raft_state_<random>.tmp
-2. f.Sync()         ← fdatasync
+2. f.Sync()         ← fsync
 3. os.Rename(tmp, raft_state.gob)  ← atomic on POSIX
 ```
 
-If the process crashes mid-write, the old `raft_state.gob` is untouched. The new file is only visible after the rename succeeds.
+If the process crashes mid-write, the old `raft_state.gob` is untouched. The new file is only visible after the rename succeeds. The whole log is rewritten on each persist, which is why snapshots matter.
 
-Once the retained log reaches `SnapshotThreshold` entries (default 8192) and the state machine implements `SnapshotStateMachine`, the applied prefix is replaced by a snapshot in `<dataDir>/raft_snapshot.gob` (same temp-file + fsync + rename pattern). On restart the snapshot is restored before the log tail is replayed; a follower that needs compacted entries receives one `InstallSnapshot` RPC.
+Once the retained log reaches `SnapshotThreshold` entries (default 8192) and the state machine implements `SnapshotStateMachine` (the server's `raftFSM` does), the applied prefix is replaced by a snapshot in `<dataDir>/raft_snapshot.gob` (same temp-file + fsync + rename pattern). On restart the snapshot is restored before the log tail is replayed; a follower that needs compacted entries receives one single-shot `InstallSnapshot` RPC. Limits of the server snapshot: it is the whole live keyspace as key/value pairs, capped at 256 MB (a larger one is skipped with `snapshot too large ... skipping compaction`, and the log keeps growing), and TTLs are not preserved — restored keys become immortal.
 
 Raft state is separate from the storage engine's own WAL, which each node replays on startup independently (see [node-lifecycle.md](node-lifecycle.md#crash-recovery-on-the-crashed-node)).
 
@@ -148,26 +160,30 @@ Raft state is separate from the storage engine's own WAL, which each node replay
 
 ## Layer 2: Replication Engine (Async/Quorum/Strong)
 
-The `ReplicationEngine` (`replication/engine.go`) handles cross-node replication independently of Raft. It is used when you need read replicas, geographic distribution, or configurable consistency levels beyond Raft's quorum.
+The `ReplicationEngine` (`replication/engine.go`) backs `--mode=replicated`. It does not use Raft: there is no leader election or single-writer ordering, and every node accepts writes. Quorum/Strong give durability across N copies before the ACK, but not linearizability under concurrent writers. Reads are always local.
 
 ### Consistency Levels
 
-| Level | Behavior | Use Case |
-|-------|----------|----------|
-| `EventualConsistency` | Fire-and-forget — write returns immediately, replication is async | Maximum write throughput |
-| `QuorumConsistency` | Wait for RF/2 + 1 replica ACKs | Balanced consistency + availability |
-| `StrongConsistency` | Wait for ALL replica ACKs | No data loss even on primary failure |
+Set per server with `--consistency` (default `eventual`; the library's `DefaultReplicationConfig` defaults to `QuorumConsistency` with `AsyncReplication`, but the server overrides the level). `replFactor` is `ReplicationFactor` (3); the local write counts as one copy.
 
-Default: `QuorumConsistency` with `AsyncReplication` mode.
+| Level | Client is ACKed after | Use Case |
+|-------|----------|----------|
+| `EventualConsistency` (`eventual`) | the local write — replication is async | Maximum write throughput |
+| `QuorumConsistency` (`quorum`) | RF/2 + 1 copies (local + RF/2 replicas) have the write | Balanced consistency + availability |
+| `StrongConsistency` (`strong`) | RF copies have the write | Survives primary failure |
+
+Quorum/Strong return `ErrReplicationTimeout` when the copies are not reached within `ReplicationTimeout` (10 s).
 
 ### Write Replication Flow
 
 ```
-StorageEngine.Put(key, value)
+coordinator.Put(key, value)            (cmd/server/coordinator.go)
     │
+    ├─ StorageEngine.Put(key, value)    ← local write first
     ▼
 ReplicationEngine.OnLocalWrite(op)
-    │ (enqueued to writeQueue channel, cap 10000)
+    │ (registered in pendingWrites, enqueued to writeQueue, cap 10000;
+    │  never blocks — a full queue returns "write queue full")
     ▼
 backgroundReplicationWorker()
     │ batches up to BatchSize (100) entries or FlushIntervalMs (10 ms)
@@ -175,19 +191,19 @@ backgroundReplicationWorker()
 replicateBatch(ops)
     ├─ goroutine → replica 1: sendReplicationRPC(ops) → TCP
     ├─ goroutine → replica 2: sendReplicationRPC(ops) → TCP
-    └─ goroutine → replica 3: sendReplicationRPC(ops) → TCP
-    │
-    └─ Wait based on ConsistencyLevel:
-       StrongConsistency  → wg.Wait() (all replicas)
-       QuorumConsistency  → wait for RF/2+1 acks
-       EventualConsistency → fire-and-forget
+    └─ … (every replica not in FAILED state)
+
+coordinator, for quorum/strong:
+    WaitForReplication(seq, target, 10000 ms)
+       polls every 1 ms until 1 + #replicas with LastAckSeqNum ≥ seq ≥ target
+       (target = RF/2+1 for quorum, RF for strong)
 ```
 
-Each replica runs a `ReplicationServer` that receives the batch over TCP and calls `applyFn` (typically `StorageEngine.Put`) for each operation.
+Deletes replicate the same way as tombstone ops. `MultiPut` is replicated entry by entry. Each replica runs a `ReplicationServer` (default port client+1) that receives the batch — a `RELP` magic header plus a gob-encoded `[]*WriteOperation` — and calls `applyFn` for each operation: `StorageEngine.Delete` for a tombstone, otherwise `StorageEngine.Put`. Vector, text and index-definition writes replicate as plain keys on their reserved prefixes; the engine's search hooks update the replica's RAM indexes.
 
 ### Version Vectors
 
-Every `WriteOperation` carries a `VersionVector` — a per-node logical clock map. Version vectors enable causal ordering detection:
+`WriteOperation` has a `VersionVector` field (a per-node logical clock map) with these helpers:
 
 ```go
 // HappenedBefore: vv causally precedes other
@@ -197,75 +213,71 @@ func (vv *VersionVector) HappenedBefore(other *VersionVector) bool
 func (vv *VersionVector) Concurrent(other *VersionVector) bool
 ```
 
-When two writes to the same key are **concurrent** (neither causally precedes the other), the `ConflictResolutions` metric increments and last-write-wins semantics apply (highest `WriteTimestampUs`).
+They are not wired in: the server does not set `VersionVector` on its writes, nothing compares them, and no conflict resolution runs. A replica simply applies each received op with `Put`/`Delete`, in arrival order. The `ConflictResolutions` counter (`veltrixdb_replication_conflict_resolutions_total`) is never incremented.
 
 ### Anti-Entropy
 
-The `backgroundAntiEntropyWorker` runs every 30 seconds. It compares each replica's `LastAckSeqNum` against `pendingWrites`. Any operations the replica hasn't acknowledged are re-sent:
+The `backgroundAntiEntropyWorker` runs every 30 seconds (`AntiEntropyInterval`). For each replica in state `LAG` or `SYNC_PENDING` it re-sends every op in `pendingWrites` whose sequence number is above that replica's `LastAckSeqNum`:
 
 ```
 Anti-entropy check (every 30 s)
     │
     ▼
-For each lagging replica:
+For each replica in LAG / SYNC_PENDING:
     find ops where seqNum > replica.LastAckSeqNum
-    sendReplicationRPC(pendingOps)
+    sendToReplica(pendingOps)
     │
     ▼
-Replica catches up (state → ReplicaStateSync)
+Success → state SYNC, LastAckSeqNum advanced
 ```
 
-Anti-entropy ensures replicas that were temporarily unavailable (network partition, restart) eventually converge.
+`pendingWrites` only holds ops not yet acked by every replica. Anti-entropy is not a full-state sync: it never compares keyspaces, and it does not touch replicas in `FAILED` state.
 
 ### Replica States
 
 | State | Meaning |
 |-------|---------|
-| `SYNC` | Replica is up-to-date |
-| `SYNC_PENDING` | Replica acknowledged partial batch |
-| `LAG` | Replica is behind; anti-entropy will catch it up |
-| `FAILED` | Replica unreachable; replication skipped until recovery |
+| `SYNC` | Last send to the replica succeeded |
+| `SYNC_PENDING` | Defined, but never set by the current code |
+| `LAG` | Set only by backpressure: lag above `BackpressureLagBytes` (0 = disabled, the server default). Anti-entropy retries it |
+| `FAILED` | Set on any failed send. FAILED replicas are skipped by `replicateBatch` and by anti-entropy, and nothing in `replication/` moves them back to `SYNC` — in practice a replica stays failed until the primary restarts |
 
 ### Lag Monitoring
 
-The `backgroundLagMonitor` runs every second, aggregating `LagBytes` and `LagNs` across all replicas into `ReplicationMetrics`. Exposed via Prometheus as:
+The `backgroundLagMonitor` runs every second and sums each replica's `LagBytes` (un-acked bytes since its last successful send) into `ReplicationMetrics.ReplicaLagBytes`. Exposed via Prometheus as:
 - `veltrixdb_replication_lag_bytes`
-- `veltrixdb_replication_lag_nanoseconds`
+- `veltrixdb_replication_lag_nanoseconds` — reads `ReplicaLagNs`, which nothing writes, so it is always 0 (per-replica `LagNs` holds the last send's duration and is visible only via `GetReplicaLag`)
+
+Other replication metrics: `veltrixdb_replication_writes_total`, `veltrixdb_replication_failures_total`, `veltrixdb_replication_anti_entropy_runs_total`, `veltrixdb_replication_vector_clock_updates_total`.
 
 ### Tombstone Coordination
 
-The `TombstoneCoordinator` (`storage/tombstone_replicated.go`) prevents the GC from reaping tombstone entries before all replicas have acknowledged them:
+The `TombstoneCoordinator` (`storage/tombstone_replicated.go`) is meant to keep the GC from reaping tombstones before every replica has acknowledged them:
 
 ```
-CanReapTombstone(key, writeTimestamp) → false
-    if any replica's acked timestamp < writeTimestamp
+CanReapTombstone(tombstoneTsUs, nowUs, gracePeriodSec) → false
+    if the tombstone is younger than the grace period, or
+    if any replica's acked watermark < tombstoneTsUs
 ```
 
-Without this, a GC pass could delete a tombstone before a slow replica sees it — causing the replica to resurrect a logically-deleted key on next anti-entropy sync.
+It is not wired in yet: the replication engine never calls `SetReplicaWatermark`, and the defragmenter's `reapExpiredTombstones` uses only `GCGracePeriodSec` (86400 s) and never calls `CanReapTombstone`. A replica that misses a delete for longer than the grace period is not protected.
 
 ---
 
-## Putting It Together: Raft + Replication Engine
+## Raft vs. the Replication Engine
 
-In a full VeltrixDB cluster:
+The two layers are alternatives, not a stack: `buildCoordinator` builds either a Raft coordinator or a replicated one, never both, and in raft mode no `ReplicationEngine` exists.
 
 ```
-                ┌─────────────────────────────────────┐
-                │          Raft Group (3 nodes)        │
-                │                                      │
-Client  ──────► │  Leader ──AppendEntries──► Follower  │
-                │          ──AppendEntries──► Follower  │
-                │                                      │
-                │  (Raft commit = quorum WAL durable)  │
-                └──────────────┬──────────────────────┘
-                               │ after Raft commit
-                               ▼
-                    ReplicationEngine.OnLocalWrite()
-                               │
-                    ┌──────────┴──────────┐
-                    ▼                     ▼
-               Async replica         Async replica
-               (read scaling)        (DR / geo)
+--mode=raft                                --mode=replicated
+┌──────────────────────────────┐           ┌──────────────────────────────┐
+│ Client ──► Leader            │           │ Client ──► any node          │
+│   (follower: MOVED <addr>)   │           │   local Put, then            │
+│ Leader ──AppendEntries──► F  │           │   OnLocalWrite ──► replicas  │
+│        ──AppendEntries──► F  │           │   ACK per --consistency      │
+│ commit = quorum persisted    │           │                              │
+│ apply on every node (FSM)    │           │                              │
+└──────────────────────────────┘           └──────────────────────────────┘
 ```
 
-Raft provides **linearizability** within the cluster — no committed write is lost. The Replication Engine provides **eventual consistency** (or stronger) to read replicas and DR copies without adding to the write critical path.
+Raft mode gives **linearizable writes**; reads are local (possibly stale on followers) unless `--linearizable-reads`. Replicated mode gives **eventual consistency** by default, or N-copy durability before the ACK with `quorum`/`strong`.
