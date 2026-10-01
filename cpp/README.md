@@ -21,7 +21,7 @@ calls it.
 
 Two more C++ components run in a cgo binary but do not live here: the
 off-heap native index (`storage/native_index.cpp`, default on every cgo build
-including macOS; kept in `storage/` so the Go build cache tracks it) and the
+with Go ≥ 1.21, including macOS; kept in `storage/` so the Go build cache tracks it) and the
 opt-in network front-end (`netfront/`, `--net=cpp|uring|poll`).
 
 **All four** are compiled **into the Go package** by the cgo shims in
@@ -35,7 +35,7 @@ in the static archive. Anything that did not link that archive — including a
 plain `CGO_ENABLED=1 go build ./storage/...`, and `go test -race`, which
 requires cgo — failed with `undefined reference to 'veltrix_bridge_create'`.
 
-## Not reachable from Go (~5,400 lines)
+## Not reachable from Go (~5,500 lines)
 
 Compiled by `CMakeLists.txt` into `libveltrixdb_engine.a`, but nothing in Go
 calls them. They link into the binary and do nothing.
@@ -45,8 +45,8 @@ calls them. They link into the binary and do nothing.
 - `lirs_cache.cpp`, `shard.cpp`, `write_path.cpp`, `defragmenter.cpp`
 - `vlog.cpp` — C++ VLog reader/writer
 - `ebpf_gc_throttle.cpp` — cgroup/eBPF GC bandwidth throttle
-- `allocator.hpp`, `index_entry.hpp`, `lockfree_index.hpp` — headers used only
-  by the above
+- `allocator.hpp`, `index_entry.hpp` — headers used only by the above
+- `lockfree_index.hpp` — header-only; `#include`d by nothing at all
 
 `vlog.cpp` and `ebpf_gc_throttle.cpp` were in *neither* the CMake target nor
 any cgo shim until recently, so they were compiled by nothing at all. They are
@@ -81,7 +81,8 @@ Go cannot get there.
 ## Turning it off (and on)
 
 `VELTRIXDB_DISABLE_CGO_ENGINE=1` skips constructing the io_uring bridge and
-the C++ batch engine, and selects the Go map index, leaving the pure-Go paths
+the C++ batch engine, and selects the Go map index (unless
+`VELTRIXDB_INDEX=native` is set explicitly), leaving the pure-Go paths
 in place. No effect on a `CGO_ENABLED=0` build, where all are already stubs.
 
 The io_uring VLog bridge alone is opt-in: `VELTRIXDB_URING_BRIDGE=on` (no
@@ -107,7 +108,16 @@ into a 30-minute timeout.
 ## Build and CI
 
 - `scripts/build.sh` (Linux, without `--go-only`) builds the CMake target and
-  links it with `CGO_ENABLED=1`.
+  links it with `CGO_ENABLED=1`. It configures
+  `cmake -S cpp -B cpp/build -DCMAKE_BUILD_TYPE=Release` (gcc/g++,
+  `-O3 -march=native`, static libstdc++/libgcc) and runs
+  `cmake --build cpp/build`. The target `veltrixdb_engine` (static) needs
+  CMake ≥ 3.20, C++20 and liburing (`find_library(... REQUIRED)`);
+  `CMakeLists.txt` itself also adds `-march=native -msse4.2 -fno-rtti`, and
+  Release builds enable LTO.
+- `-DVELTRIX_BUILD_TESTS=ON` (default OFF) adds `cpp/tests` when GTest is
+  found — but there is no `cpp/tests` directory, so with GTest installed that
+  option fails at configure time. Leave it off.
 - The **Docker image is `CGO_ENABLED=1`**: it carries the native index, the
   batch engine and the (opt-in) io_uring bridge from the shims above, but not
   the CMake archive — nothing from the "not reachable" list. The cgo
@@ -125,7 +135,7 @@ into a 30-minute timeout.
 
 Decide one of these, rather than leaving it ambiguous a third time:
 
-1. **Delete the unreachable set** (~5,400 lines; `git log` keeps it). Correct
+1. **Delete the unreachable set** (~5,500 lines; `git log` keeps it). Correct
    if nobody is going to write the bindings this quarter. Nothing else depends
    on it — the four shim-compiled files include none of it.
 2. **Wire one component and benchmark it** against the Go path it replaces. If

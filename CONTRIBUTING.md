@@ -35,7 +35,8 @@ go test ./...
 # Run the server locally
 go run ./cmd/server -addr :9000 -data ./dev-data -cache 256
 
-# E2E tests (requires a running server on :9000)
+# E2E tests (builds /tmp/veltrixdb and /tmp/veltrix-loadtest if missing and
+# starts its own servers on VELTRIX_PORT, default 9000 — the port must be free)
 ./tests/e2e/run_all.sh
 
 # Benchmark with pass/fail gates
@@ -47,6 +48,8 @@ For the full C++ build, CMake plus the io_uring layer (Linux only):
 # Requires liburing, GCC/Clang with C++20 support
 VERSION=1.0.0 ./scripts/build.sh --output ./dist
 ```
+
+`go.mod` targets Go 1.19, but the native index (and the Linux `runtime.Pinner` batch path) is built only with Go ≥ 1.21; an older toolchain gets the Go map index. CI uses Go 1.21.
 
 macOS is fully supported for development. A cgo build there uses the native index and the poll() backend of the C++ front-end. The io_uring code (the opt-in VLog write bridge and the `netfront/` io_uring backend) and the C++ batch engine are Linux-only and not required for most contributions. Set `VELTRIXDB_INDEX=map` to run a cgo build on the Go map index.
 
@@ -69,7 +72,9 @@ If you edited C++ that a `storage/cgo_*_linux.cpp` shim `#include`s from `cpp/sr
 - **Density gate**: `bytes/record ≤ 1.2 × (24 + value_size)` — block packing must be working
 - **GC emergency gate**: `gc_emergency_runs Δ == 0` — no GC death spirals
 
-Both gates must pass on your branch before submitting.
+Both gates must pass on your branch before submitting. `bench.sh` builds with `CGO_ENABLED=0` unless you export `CGO_ENABLED=1`.
+
+If you touched search, the long-running integration tests are env-gated: `VELTRIX_SOAK_DURATION=2m go test ./tests/integration/ -run TestSearchSoak -v` and `VELTRIX_CHAOS_CYCLES=3 go test ./tests/integration/ -run TestSearchCrashRecovery -v` (see [tests/integration/README.md](tests/integration/README.md)). The nightly workflow runs them for 20 min and 10 cycles.
 
 ### 2. Read CLAUDE.md
 
@@ -109,10 +114,10 @@ One logical change per PR. A bug fix should not include unrelated refactoring. I
 ## Code style
 
 - Standard `gofmt` formatting — run `gofmt -w .` before committing
-- No external dependencies unless strictly necessary (the project uses Go stdlib + `prometheus/client_golang`)
+- No external dependencies unless strictly necessary (the main module uses Go stdlib + `prometheus/client_golang` + `klauspost/compress`; `bench/compare` is a separate module with its own dependencies)
 - Comments only where the *why* is non-obvious — well-named identifiers explain the *what*
 - Error handling: return errors, don't swallow them; `fmt.Errorf("context: %w", err)` wrapping
-- For C++ changes: follow the existing namespace (`veltrix`), use the constructor initializer list pattern for nested structs (see Invariant 12 in CLAUDE.md)
+- For C++ changes: follow the existing namespace (`veltrix`), use the constructor initializer list pattern for nested structs (see Invariants 12 and 14 in CLAUDE.md)
 
 ---
 
@@ -134,9 +139,9 @@ For large changes, consider opening a draft PR early to get feedback on the appr
 ## Areas actively looking for contribution
 
 - **RESP protocol compatibility** — the single most-requested feature. Implementing a RESP3 layer so Redis clients work without code changes.
-- **Raft log snapshots** — prevents slow restarts on large clusters. Needs care around the WAL replay / index rebuild interplay.
-- **Native range/prefix scans** — currently a workaround via NSSCAN. A proper range scan API needs thought around the 1024-shard scatter-gather cost.
-- **Client SDK improvements** — connection pool tuning, timeout handling, retry logic across the 6 SDKs.
+- **Raft snapshots at scale** — snapshots exist (`consensus/snapshot.go`, `raftFSM.Snapshot`), but they gob-encode the whole keyspace into one in-memory blob, ship it in a single InstallSnapshot message and do not preserve TTLs. Chunked / streaming snapshots are needed for large datasets.
+- **Read barrier coverage** — in raft mode GET and MGET pass the read barrier, but namespace, hash and `RANGE` / `SCANCUR` reads do not yet (CLAUDE.md invariant 58).
+- **Client SDK improvements** — the SDKs live in the separate Veltrixdb-client repository ([clients/README.md](clients/README.md)) and do not yet expose the search API; connection pool tuning, timeout handling and retry logic are also open.
 - **Documentation** — tutorials, getting-started guides, and runbooks are always useful.
 
 ---

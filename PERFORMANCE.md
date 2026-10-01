@@ -8,11 +8,14 @@ WAL and VLog both use group commit: concurrent writes share one `fdatasync`.
 Every write is acknowledged only after the sync that covers it.
 
 **Adaptive (default, `--group-commit=adaptive`).** The flush window is an
-upper bound, not a wait. A writer that is alone is synced at once (latency ≈
-one fdatasync). When writers are concurrent, a batch stays open until no new
-write has arrived for about one fdatasync, or the window expires, or the
-batch cap is reached. Measured with an emulated 300 µs device sync, 15 ms
-window (`TestGroupCommit_LatencyTable`, macOS):
+upper bound, not a wait. A writer that is alone (one request in the batch and
+an EWMA of < 1.5 requests per recent flush) is synced at once (latency ≈ one
+fdatasync). When writers are concurrent, a batch stays open until no new
+write has arrived for an idle gap equal to the EWMA of recent fdatasync times,
+clamped to 20 µs–2 ms, or the window expires, or the batch cap
+(`--wal-max-batch`, default 4096) is reached (`storage/group_commit.go`).
+Measured with an emulated 300 µs device sync, 15 ms window, macOS
+(`VELTRIX_GC_TABLE=1 go test ./storage -run TestGroupCommit_LatencyTable -v`):
 
 | Writers | Fixed 15 ms window | Adaptive |
 |--|--|--|
@@ -41,7 +44,7 @@ writes/s ≈ goroutines × (1000 / window_ms)
 | Lowest latency (low concurrency) | 0 ms | ~0.2 ms |
 | Low latency | 2 ms | ~2.2 ms |
 | 100K+ writes/s | **5 ms** | ~5.2 ms |
-| Former default | **15 ms** | ~15.2 ms |
+| Default window | **15 ms** | ~15.2 ms |
 | Maximum throughput | 20 ms | ~20.2 ms |
 
 P99 figures in the fixed table are Linux NVMe. **Do not size against a macOS
@@ -57,16 +60,18 @@ Always use `MultiPut` / `MultiGet` when writing or reading multiple keys. They s
 
 | Method | Throughput | When to use |
 |--------|-----------|-------------|
-| Individual PUT | ~10K/s per goroutine at 10 ms | Single key |
+| Individual PUT | ≈ 1 / fdatasync per goroutine (adaptive; 2,186/s at an emulated 300 µs sync), 1000 / window_ms in fixed mode | Single key |
 | MultiPut 1024 keys | ~108K/s (macOS) / ~426K/s (Linux) | Any multi-key write |
 
 The MultiPut row is historical (before the one-`write(2)`-per-batch WAL flusher
 and the ordered-index fix). Current server numbers, 8 clients × 1024-key MPUT:
 **3.54M keys/s, P99 4.2 ms** over a 1M-key space on macOS (1.45M / 9.6 ms
 before the ordered-index fix), and **1.77M keys/s, P99 12.2–12.7 ms** on a
-4-CPU CI runner (tmpfs, client on the same host, Go front-end, C++ storage off).
+4-CPU CI runner (tmpfs, client on the same host, Go front-end, C++ storage off:
+`ENGINES=nocgo NETS=go ./scripts/net-bench.sh`, whose batch phase is
+`loadtest --mode write --concurrency 8 --batch-size 1024`).
 
-The TCP server automatically coalesces back-to-back PUTs from the same connection into a MultiPut — you get batch performance without client changes.
+The binary-protocol handler coalesces pipelined PUT frames that are already buffered on one connection into a MultiPut (`tryCoalescePuts`, cmd/server/main.go) — pipelining binary clients get batch performance without code changes. Text-protocol PUTs and a client that waits for each reply are not coalesced.
 
 ---
 
@@ -82,7 +87,7 @@ Batch writes pack multiple records per 4 KB VLog block. Density gain at common v
 | 512 B | 536 B | **7.6×** |
 | 4 KB+ | 4096 B | 1× |
 
-Packing is automatic for `MultiPut` and pipelined PUTs. Single `Put` uses the unpacked lock-free path. Verify: `veltrixdb_vlog_file_bytes / veltrixdb_storage_writes_total ≈ value_size + 24`.
+Packing is automatic for `MultiPut` and pipelined binary PUTs. A single `Put` uses the unpacked lock-free path, which pads each record to a full 4 KB block. Verify: `veltrixdb_vlog_file_bytes / veltrixdb_storage_writes_total ≈ value_size + 24`.
 
 ---
 
@@ -90,8 +95,8 @@ Packing is automatic for `MultiPut` and pipelined PUTs. Single `Put` uses the un
 
 ```bash
 -cache 65536      # 64 GB
---auto-tune       # VeltrixDB picks 85% of available RAM
---read-heavy      # 400 GB preset + scan-resistant tuning
+--auto-tune       # cache = 85% of an 80%-of-RAM budget (≈68% of RAM); ignores -cache
+--read-heavy      # 400 GB cache, LIRRatio 0.95, GC every 300 s, TTL scan every 60 s (-cache still wins)
 ```
 
 Check hit rate: `veltrixdb_cache_hits_total / (hits + misses)`. Small values (≤256 B) resist eviction more — sized workloads with tiny values benefit the most from cache.
@@ -103,7 +108,10 @@ Check hit rate: `veltrixdb_cache_hits_total / (hits + misses)`. Small values (�
 On cgo builds (the default, including macOS and the Docker image) the index
 lives off the Go heap in per-shard C++ tables, so the GC does not scan it.
 Measured with 5M keys: full GC **21 ms → 0.27 ms**, settled RSS **168 → 142
-B/key**, at a cost of ~19 ns more per cache-miss lookup.
+B/key**, at a cost of ~19 ns more per cache-miss lookup. The ordered index
+adds ~90 B/key on top unless `--disable-ordered-index`. Compare the two
+implementations with `go test ./storage -run '^$' -bench 'Index_Footprint|Index_Get' -benchtime 1x`
+(the footprint benchmark uses 2M keys and excludes the ordered index).
 
 ```bash
 VELTRIXDB_INDEX=map ./veltrixdb ...      # opt out: Go map index (also CGO_ENABLED=0 builds)
@@ -222,7 +230,7 @@ accordingly.
 | Symptom | Check | Fix |
 |---------|-------|-----|
 | Write P99 high | `veltrixdb_storage_write_admission_throttles_total` rising | Read latency too high — see admission control |
-| Cache hit rate low | `vlog_gc_skipped_empty_total` rising | Increase `-cache` or enable KV separation |
+| Cache hit rate low | `veltrixdb_cache_evictions_total` rising, `cache_size_bytes` ≈ `cache_max_size_bytes` | Increase `-cache` (or reclaim ~90 B/key with `--disable-ordered-index` and give it to the cache) |
 | GC not running | `vlog_gc_skipped_paused_total` rising | Wait 4 min for stale EWMA to clear |
 | `reads_total = 0` with traffic | Old binary | Update — the missing metrics call is fixed |
 | False failure alerts (single node) | `fd.SetLocalNode` not called | Fix before `fd.Start()` in your cluster setup |

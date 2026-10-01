@@ -38,13 +38,14 @@ BackupEngine.FullBackup(destDir)
     ├─ 2. For each disk i:
     │      ├─ snapshot vlogEnd = vlogs[i].end.Load()   (atomic)
     │      ├─ copyFileRange(vlog_active.dat, disk<i>/vlog.dat, 0, vlogEnd)
-    │      │    uses pread64 → safe alongside concurrent appends
+    │      │    own read-only fd, Seek + io.CopyN of exactly vlogEnd bytes
+    │      │    (skipped when vlogEnd == 0)
     │      └─ copyFileFull(wal.log, disk<i>/wal.log)
     │
     └─ 3. Write manifest.json
 ```
 
-**The engine continues serving traffic during backup.** The VLog copy uses `pread64` (random-position read), which is safe alongside concurrent VLog appends to non-overlapping byte ranges. Appends after `vlogEnd` is snapshotted are simply not included in this backup.
+**The engine continues serving traffic during backup.** The VLog copy opens its own read-only descriptor, seeks to the start offset and copies exactly `vlogEnd − start` bytes, so it never reads the region concurrent appends are writing. Appends after `vlogEnd` is snapshotted are simply not included in this backup. Only `vlog_active.dat` is copied: with `--raw-vlogs` (VLog on a raw block device) there is no such file and the backup silently contains no VLog data.
 
 ### Backup Directory Structure
 
@@ -89,19 +90,39 @@ be := storage.NewBackupEngine(se)
 manifest, err := be.FullBackup("/backups/full-20260523")
 ```
 
-### CLI
+### HTTP and CLI
+
+Against a **running** server, use the admin API (`POST /admin/backup`, loopback-only unless `--admin-token` is set). The backup is written by the server process, so `dest_dir` is a path on the server's filesystem:
 
 ```bash
-# Full backup to local directory
-./veltrix backup full --addr :9000 --out /backups/full-20260523
+# Full backup (what `veltrix backup DEST_DIR` sends; the veltrix CLI sends no admin token)
+curl -s -X POST localhost:2112/admin/backup -d '{"type":"full","dest_dir":"/backups/full-20260523"}'
+veltrix --addr 127.0.0.1:2112 backup /backups/full-20260523
 
-# Full backup + upload to S3 in one step
-./veltrix backup full-cloud \
-  --addr :9000 \
-  --out /tmp/backup \
-  --bucket s3://my-bucket/veltrix/ \
-  --region us-east-1
+# Incremental (base_dir must hold the base backup's manifest.json)
+curl -s -X POST localhost:2112/admin/backup \
+  -d '{"type":"incremental","dest_dir":"/backups/incr-20260523-150000","base_dir":"/backups/full-20260523"}'
 ```
+
+The response is JSON with `status`, `type`, `backup_id`, `dest_dir`, `num_disks`, `duration_ms` and the full `manifest`.
+
+`veltrixdb-backup` (`cmd/backup`) opens the data directories with **its own engine instance** and backs that up. Run it only against the data dirs of a **stopped** server: pointed at a live server's directories it runs a second engine on the same files (no lock prevents it), and in testing this produced an empty backup and truncated the live `wal.log` and `vlog_active.dat`.
+
+```bash
+# Full backup of a stopped node's data dirs
+veltrixdb-backup full --data-dirs=/mnt/nvme0,/mnt/nvme1 --dest=/backups/full-20260523
+
+# Incremental relative to a previous backup directory
+veltrixdb-backup incremental --data-dirs=/mnt/nvme0,/mnt/nvme1 \
+  --dest=/backups/incr-20260523-150000 --base=/backups/full-20260523
+
+# Full backup + upload to S3 in one step (stages in a temp dir, then uploads)
+veltrixdb-backup full-cloud \
+  --data-dirs=/mnt/nvme0,/mnt/nvme1 \
+  --provider=s3 --bucket=my-bucket --region=us-east-1
+```
+
+All three accept `--cache-mb` (default 64) for the engine they open.
 
 ---
 
@@ -126,11 +147,12 @@ BackupEngine.IncrementalBackup(destDir, baseManifest)
     │         ← latest compacted WAL (includes all live keys)
     │
     └─ 3. Write manifest.json with BaseBackupDir = base backup ID
+          (an empty vlog_delta.dat is written when no bytes were appended)
 ```
 
 **Each incremental WAL is a complete snapshot** — it covers all live keys at that moment, not just changed keys. The WAL is small (one record per live key, no values in KV-separation mode), so copying it fully each time is cheap.
 
-**The VLog delta is append-only** — it captures exactly `[baseEnd, curEnd)` bytes. Because VLog offsets are stable (values are never moved except by GC), these byte ranges are self-contained.
+**The VLog delta is append-only** — it captures exactly `[baseEnd, curEnd)` bytes. VLog offsets never change: GC relocates a live value by appending a new copy at the tail (and later punches holes in the dead head of the file), so these byte ranges are self-contained.
 
 ### Incremental Backup Directory Structure
 
@@ -238,17 +260,19 @@ err := storage.Restore(chain, roots, dests)
 ### CLI
 
 ```bash
-# Restore from local backup chain
-./veltrix backup restore \
-  --chain /backups/full-20260523,/backups/incr-20260523-150000 \
-  --data-dirs /mnt/nvme0,/mnt/nvme1,...
+# Restore from local backup chain (oldest first; one --data-dirs entry per disk)
+veltrixdb-backup restore \
+  --chain=/backups/full-20260523,/backups/incr-20260523-150000 \
+  --data-dirs=/mnt/nvme0,/mnt/nvme1,...
 
-# Download from cloud then restore
-./veltrix backup download \
-  --bucket s3://my-bucket/veltrix/ \
-  --backup-id full-1748001600000000000 \
-  --out /backups/full
+# Download from cloud then restore (--cloud-path is what upload printed)
+veltrixdb-backup download \
+  --provider=s3 --bucket=my-bucket --region=us-east-1 \
+  --cloud-path=veltrixdb-backups/full-1748001600000000000/ \
+  --dest=/backups/full
 ```
+
+`Restore` does not check that the target directories are empty: it overwrites `vlog_active.dat` and `wal.log` in them (`restore-pitr`, below, does refuse non-empty targets).
 
 ---
 
@@ -258,7 +282,7 @@ PITR = **base full backup + continuously archived WAL**. A background `WALArchiv
 
 ### Enabling WAL Archiving
 
-Archiving is driven by four `StorageConfig` fields and attached to a running engine:
+In `cmd/server`, archiving is enabled with `--archive-dir` (plus `--archive-interval-ms`, default 1000; `--archive-max-age-sec`, default 0 = keep forever; `--archive-max-bytes`, default 0 = unlimited); the server starts the archiver right after the engine and stops it before the engine closes. From Go, the same four `StorageConfig` fields drive it:
 
 ```go
 cfg := storage.DefaultStorageConfig()
@@ -378,7 +402,7 @@ applied, err := storage.RestorePITR(baseDir, archiveDir, target, destDirs)
 | Durability boundary | Only fdatasync-covered WAL bytes are archived — a segment never contains a torn record |
 | Deletes | Tombstones are archived and replayed; restoring past a delete removes the key |
 | Archive corruption | Detected via per-segment CRC32C before replay; restore aborts. Binary records also carry their own CRC32C, checked on decode |
-| Lower bound | Targets at or before the base backup's `engine_version` are rejected — restore the base (or an older base) directly |
+| Lower bound | `version:N` targets at or before the base backup's `engine_version` are rejected — restore the base (or an older base) directly. Archived entries at or below `engine_version` are never applied, whatever the target |
 | Coverage requirement | Archiving must be running from before the base backup until the target moment; pruned segments shrink the restorable window |
 | GC race window | If VLog GC reclaims a superseded value in the (interval-sized) window before it is archived, that brief intermediate value is skipped (`EntriesSkipped` counter); the final state of the key is always correct |
 | Crash of the archiver / restart | Segment sequence numbers continue across restarts; the current WAL is re-archived from byte 0, which is safe (replay is version-filtered and order-preserving) |
@@ -389,19 +413,21 @@ applied, err := storage.RestorePITR(baseDir, archiveDir, target, destDirs)
 
 The `backup_cloud.go` module (`storage/backup_cloud.go`) extends backup with cloud storage:
 
-| Command | Description |
+| `veltrixdb-backup` command | Description |
 |---------|-------------|
-| `upload` | Upload a local backup directory to cloud storage |
-| `download` | Download a cloud backup to local |
-| `list-cloud` | List all cloud backups and their metadata |
-| `full-cloud` | Full backup + upload in one step |
+| `upload --src=DIR` | Upload a local backup directory to cloud storage; prints the cloud path |
+| `download --cloud-path=PATH --dest=DIR` | Download a cloud backup to local |
+| `list-cloud` | List all cloud backups (cloud path, backup ID, size) |
+| `full-cloud --data-dirs=DIRS` | Full backup (engine opened by the tool — server stopped) + upload in one step |
 
-Cloud backups use the same manifest format — the manifest is uploaded alongside the backup files.
+Every cloud command takes `--provider=s3|gcs|azure`, `--bucket` (S3/GCS bucket or Azure container) and `--prefix` (default `veltrixdb-backups`), plus provider auth: `--region`, `--aws-access-key`, `--aws-secret-key` (env `AWS_REGION`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`); `--gcs-cred-file`, `--gcs-token` (env `GOOGLE_APPLICATION_CREDENTIALS`, `GCS_ACCESS_TOKEN`); `--azure-account`, `--azure-key` (env `AZURE_STORAGE_ACCOUNT`, `AZURE_STORAGE_KEY`).
+
+Cloud backups use the same manifest format — the manifest is uploaded alongside the backup files under `<prefix>/<backup_id>/`, where `backup_id` comes from `manifest.json`.
 
 ### Cloud Backup Structure (S3 Example)
 
 ```
-s3://my-bucket/veltrix/
+s3://my-bucket/veltrixdb-backups/
 ├── full-1748001600000000000/
 │   ├── manifest.json
 │   ├── disk0/wal.log
@@ -420,10 +446,10 @@ s3://my-bucket/veltrix/
 
 | Concern | How It's Handled |
 |---------|-----------------|
-| Concurrent writes during backup | VLog copy uses `pread64(offset, vlogEnd)` — reads only up to the snapshotted end; new appends beyond `vlogEnd` are ignored |
+| Concurrent writes during backup | VLog copy reads through its own descriptor only up to the snapshotted end; new appends beyond `vlogEnd` are ignored |
 | Partial VLog write mid-copy | WAL checkpoint happens before VLog snapshot; WAL and VLog are consistent with each other at the snapshot point |
-| GC compaction moving values during backup | GC rewrites VLog records to new offsets and updates WAL entries via CAS; WAL checkpoint after GC pass ensures WAL offsets are stable |
-| Crash during backup | Backup directory is partially written — use the manifest to detect completeness; incomplete backups are unusable, re-run the backup |
+| GC compaction moving values during backup | GC appends relocated copies at the VLog tail and swaps the in-memory index entry via CAS; the WAL checkpoint records the offsets the index held at that moment. Backup does not pause GC, so a GC pass between the checkpoint and the VLog copy can relocate a value and punch a hole over its old offset, which the checkpoint still references |
+| Crash during backup | Backup directory is partially written — `manifest.json` is written last, so a directory without it is incomplete; re-run the backup |
 | Manifest write failure | Manifest is written via temp-file rename (`manifest.json.tmp` → `manifest.json`) — atomic on POSIX |
 
 ---
@@ -468,10 +494,10 @@ Check these after every backup run:
 
 | Item | Why Excluded | Recovery |
 |------|-------------|----------|
-| Raft log (`raft_state.gob`) | Cluster state; not needed for single-node restore | Recreated on startup |
+| Raft state (`raft_state.gob`, `raft_snapshot.gob`) | Cluster state; not needed for single-node restore | Recreated on startup |
 | In-memory LIRS cache | Volatile by design | Cache warms up after restart |
 | Bloom filters | Rebuilt from index on startup | Automatic |
-| Segment files (`seg_*.dat`) | Superseded by WAL+VLog | Not needed |
+| Segment file (`seg_active.dat`) | Superseded by WAL+VLog | Not needed |
 | Prometheus metrics | Ephemeral | Not needed |
 
 A restored node starts with a cold cache but immediately serves correct data from the rebuilt index and VLog.

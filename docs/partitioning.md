@@ -21,6 +21,8 @@ key  ──► FNV-1a hash ──► shard_id = hash & 0x1FFF  (0..8191)
 
 Cluster routing only applies in `--mode=raft` or `--mode=replicated`, and those modes need the Go network front-end (`--net=go`, the default). The server refuses to start with `--net=cpp|uring|poll` outside `--mode=standalone`, because the C++ front-end writes straight to the local engine and would bypass Raft/replication routing.
 
+The server does not forward a request to the key's owner. Routing is done by the cluster-aware client (`client/client.go`): it fetches the topology (`TOPOLOGY` command), builds the same ring (64 virtual nodes) and sends each key to `ring.GetNode(cluster.HashKey(key))`. In raft mode the leader takes every write and followers answer `MOVED`. Membership is static: each server registers the nodes named in `--peers` (and `--seeds`) at startup.
+
 ### Consistent Hash Ring
 
 The `ConsistentHashRing` (`cluster/partition_map.go`) maps a continuous 64-bit hash space onto physical nodes using **virtual nodes**:
@@ -43,7 +45,7 @@ type ConsistentHashRing struct {
 key = "user:42"
     │
     ▼
-hash = FNV-1a(RoutingKey("user:42"))   →   uint64 hash value
+hash = fmix64(FNV-1a(RoutingKey("user:42")))   →   uint64 hash value
     │
     ▼
 Binary search in sortedKeys for first virtualNode hash >= key hash
@@ -61,7 +63,9 @@ Route request to node-2
 `RoutingKey` (`cluster/partition_map.go`) is the key itself, except for
 derived search keys, which route as the record they belong to:
 `@vec/<ns>/<id>` and `@txt/<ns>/<id>` route as `<id>`, and
-`@idx/<rule>/<value>/<id>` as `<id>`. A rebalance therefore keeps a record,
+`@idx/<rule>/<value>/<primary>` as `<primary>`. The hash is FNV-1a passed
+through the MurmurHash3 `fmix64` finalizer (`hashValue`), so sequential keys
+spread across the ring instead of landing on one arc. A rebalance therefore keeps a record,
 its vector, its text document and its secondary-index entries on one node,
 so each node can evaluate search filters on its own data. Server and cluster
 client use the same function.
@@ -84,10 +88,10 @@ type PartitionMap struct {
 **256 hash partitions** divide the uint64 range into equal-sized buckets:
 
 ```
-partition_i covers hash range: [i × (2^64/256), (i+1) × (2^64/256))
+partition_i covers hash range: [i × (MaxUint64/256), (i+1) × (MaxUint64/256))
 ```
 
-Each partition has a primary node and up to `ReplicationFactor - 1` replica nodes.
+Each partition has a primary node and up to `ReplicationFactor - 1` replica nodes. The partition table is metadata (topology views, admin); key placement and migration use the ring (`GetNodeForKey`), not the table.
 
 ### PartitionInfo
 
@@ -109,7 +113,7 @@ type PartitionInfo struct {
 nodes, err := pm.GetReplicasForKey(key)
 ```
 
-Internally: hash the key, find the primary on the ring, then walk the ring clockwise skipping physical nodes already seen until `ReplicationFactor` distinct nodes are collected.
+Internally: hash the key, list the distinct physical nodes clockwise from it on the ring, then pick `ReplicationFactor` of them with the same rack-aware `pickReplicas` as `Rebalance` (first copy = ring successor).
 
 ---
 
@@ -120,12 +124,12 @@ Each cluster node cycles through these states:
 | State | Meaning |
 |-------|---------|
 | `ACTIVE` | Fully operational, accepting reads and writes |
-| `SUSPECT` | Missing heartbeats for 3 s — health uncertain |
-| `FAILED` | Missing heartbeats for 10 s — removed from routing |
-| `RECOVERING` | Recently came back online — being re-integrated |
-| `DRAINING` | Graceful departure in progress — ring already updated, data evacuating |
+| `SUSPECT` | No heartbeat for 3 s — health uncertain; back to ACTIVE on the next heartbeat |
+| `FAILED` | No heartbeat for 10 s — left out of `Rebalance`'s partition table and of search fan-out (it stays on the ring) |
+| `RECOVERING` | A FAILED node heartbeated again, or answered the recovery ping. Like FAILED it is left out of `Rebalance`; nothing in `cluster/` moves it back to ACTIVE |
+| `DRAINING` | Set by `RemoveNodeAndRebalance` just before the node is removed from the ring |
 
-State transitions are propagated via the **gossip protocol** — every node sends its view of cluster state to 3 random peers every second. All nodes converge to a consistent view within a few gossip rounds.
+States are derived locally: each node's `FailureDetector` checks heartbeat ages every second. Heartbeats arrive through **gossip** — every second a node exchanges digests with 3 random peers, and a node whose heartbeat counter advanced in a digest counts as alive (so liveness spreads transitively). Receivers do not adopt the sender's view of node states. With `--auto-rebalance` (default on), joins, removals, and transitions to FAILED / ACTIVE / RECOVERING trigger `Rebalance` + `MigrateToNewOwners` after a 3 s debounce (`cmd/server/rebalancer.go`).
 
 ---
 
@@ -181,18 +185,21 @@ For each key:
     │
     ▼
 Fan out to destination nodes in parallel:
-    ├─ Batch 500 keys × ≤64 KB average ≈ 32 MB per HTTP POST /transfer/keys
+    ├─ Batch 500 keys × ≤64 KB average ≈ 32 MB per HTTP POST /transfer/keys (JSON)
     ├─ Destination receives batch → calls store.Put(key, value, ttl) for each
+    │   (any failed Put → HTTP 500 for the batch)
     └─ After confirmed delivery: store.Delete(key) locally
 ```
 
-**Safety guarantee**: `Put` on destination happens before `Delete` on source. If the HTTP POST fails, keys are NOT deleted locally — the next `MigrateToNewOwners()` call retries.
+**Safety guarantee**: `Put` on destination happens before `Delete` on source. Only keys in batches the destination acknowledged with HTTP 200 are deleted; on the first failed batch the rest of that destination's keys stay local and the next `MigrateToNewOwners()` call retries them. A "connection refused" is retried 3 times, 100 ms apart; each HTTP call times out after 60 s.
 
-**Pinned keys**: `@vecns/<ns>` (vector namespace settings) and `@idxdef/<name>` (secondary-index definitions) are needed on every node, so they are *copied* to each destination — sent first in its batch — and never deleted locally.
+**Epoch fencing**: every batch carries the sender's membership epoch (advanced by each AddNode/RemoveNode and by newer epochs seen in gossip); a receiver whose epoch is newer refuses it with HTTP 409.
+
+**Pinned keys**: `@vecns/<ns>` (vector namespace settings) and `@idxdef/<name>` (secondary-index definitions) are needed on every node, so they are *copied* to each destination — placed at the head of its key list, ahead of the migrated keys — and never deleted locally.
 
 **Search indexes follow the keys**: the destination's `Put` and the source's `Delete` run the engine's search hooks, so migrated vectors and documents become searchable on the new owner and disappear from the old one. (Before these hooks, migrated vectors stayed searchable on the source and were unsearchable on the destination.)
 
-**Authentication**: with `--cluster-secret-file` (or `VELTRIXDB_CLUSTER_SECRET`) every request on the transfer listener — `/transfer/keys` and the distributed-search endpoint `/internal/search` — carries an HMAC-SHA256 over time, method, path and body, and is refused (HTTP 401) if it does not verify or is more than 5 minutes off the receiver's clock. `/transfer/health` stays open. Without a secret or mTLS the server logs that the listener is unauthenticated.
+**Authentication**: with `--cluster-secret-file` (or `VELTRIXDB_CLUSTER_SECRET`; at least 16 bytes, whitespace trimmed) every request on the transfer listener — `/transfer/keys` and the distributed-search endpoint `/internal/search` — carries `X-Veltrix-Cluster-Time` (unix seconds) and `X-Veltrix-Cluster-Auth` (hex HMAC-SHA256 over time, method, path and body), and is refused (HTTP 401) if it does not verify or is more than 5 minutes off the receiver's clock. `/transfer/health` stays open. Without a secret or mTLS (`--cluster-mtls`) the server logs `[transfer] WARNING: listener <addr> is unauthenticated (no --cluster-secret-file and no mTLS) ...`.
 
 **Concurrency**: Each destination node receives its batch in a separate goroutine. A cluster-wide migration is parallel across all `N-1` destination nodes simultaneously.
 
@@ -204,11 +211,12 @@ Fan out to destination nodes in parallel:
 1. pm.AddNode(nodeID, address, port)
    ├─ Create Node{state=ACTIVE}
    ├─ Add 64 virtual nodes to ConsistentHashRing
-   └─ pm.Version++
+   └─ pm.Version++, epoch++
 
 2. pm.Rebalance(256)
    ├─ Recompute partition assignments with new node included
-   └─ ~1/N of partitions reassigned to new node
+   └─ Re-deals every partition round-robin over the new node list (most
+      primaries change; key placement follows the ring, where ~1/N of keys move)
 
 3. ta.MigrateToNewOwners()  [background goroutine]
    ├─ Scan all local keys
@@ -216,13 +224,13 @@ Fan out to destination nodes in parallel:
    └─ Stream to new node in 500-key batches
         ├─ New node receives via POST /transfer/keys
         └─ Source deletes after confirmed delivery
-
-4. Gossip propagates updated PartitionMap to all nodes
 ```
+
+Gossip does not carry membership: every member must run `AddNode` itself (the server does it for `--peers` at startup). Because `Rebalance` is deterministic, members with the same node set compute the same table.
 
 **Shortcut**: `pm.AddNodeAndRebalance(nodeID, addr, port, transferAddr, 256, ta)` combines steps 1–3 in one call.
 
-The migration runs in the background. Reads/writes continue normally during migration — the ring immediately routes new requests to the new node, and in-flight data is transferred concurrently.
+The migration runs in the background. Reads/writes continue normally during migration — a client that has refreshed its topology routes new requests to the new node at once, while existing keys are transferred concurrently (a key read on the new owner before its batch lands is not found yet).
 
 ---
 
@@ -267,7 +275,7 @@ pm.ForceRemoveNode(nodeID, 256)
     (no data migration — surviving replicas are the source of truth)
 ```
 
-After `ForceRemoveNode`, the Replication Engine's anti-entropy mechanism re-replicates the missing RF-1 copies to restore the desired replication factor on surviving nodes.
+Nothing re-creates the lost copies afterwards: the Replication Engine's anti-entropy only re-sends un-acked writes to lagging replicas and never copies existing data, so the replication factor stays reduced for keys the dead node held.
 
 ---
 
@@ -277,24 +285,26 @@ Cluster topology changes (node state, partition map version) propagate via **epi
 
 ```
 Every 1 second, each node:
-    1. Build GossipMessage{senderID, partitionMapVersion, nodeStates}
-    2. Select 3 random peer nodes (fanout=3)
-    3. Send gossip async to each peer
+    1. Advance its own heartbeat counter
+    2. Build GossipDigest{sender, epoch, map_version, ts, nodes{state, hb, addrs, rack}}
+    3. Select 3 random peer nodes (fanout=3)
+    4. Per peer: one short TCP connection — send digest (JSON), merge the reply
 ```
 
-A receiver that sees a higher `PartitionMapVer` than its own fetches the latest map. Within `O(log N)` gossip rounds, all nodes converge to the same view. This means topology changes propagate to a 100-node cluster in ~7 rounds (~7 seconds at 1s gossip interval).
+A receiver records a heartbeat for the sender and for every node whose counter advanced, adopts gossip addresses and racks (self-reported entries win), ignores nodes it does not know, and advances its epoch to a newer remote one. A digest with a stale epoch still counts as liveness but its metadata is ignored. `map_version` is sent but not acted on: no node fetches a partition map from a peer.
 
 ---
 
 ## Partition Map Versioning
 
-Every mutation to the partition map increments `pm.Version`. Nodes reject operations based on stale maps: if a node's `PartitionMap.Version` is lower than the cluster's current version, it fetches the latest before routing.
+Every mutation to the partition map increments `pm.Version` (reported in topology and gossip). The version is not used to reject anything; the fencing check is the separate membership **epoch** (`cluster/epoch.go`), which transfer batches carry (stale → HTTP 409).
 
 ```go
 // Version increments on:
 pm.AddNode(...)      → Version++
 pm.RemoveNode(...)   → Version++
 pm.UpdateNodeState(...)  → Version++ (on actual state change)
+pm.UpdateNodeHeartbeat(...) → Version++ (SUSPECT → ACTIVE only)
 pm.Rebalance(...)    → Version++
 ```
 
@@ -307,8 +317,10 @@ pm.Rebalance(...)    → Version++
 | `ReplicationFactor` | 3 | Copies of each partition (1 primary + 2 replicas) |
 | `VirtualNodesPerNode` | 64 | Virtual nodes per physical node on the ring |
 | `PartitionCount` | 256 | Total hash partitions |
-| `HeartbeatInterval` | 1 s | Gossip tick interval |
-| `SuspectThreshold` | 3 s | Missed heartbeats before SUSPECT |
-| `FailureThreshold` | 10 s | Missed heartbeats before FAILED |
+| `GossipInterval` / `Fanout` | 1 s / 3 | Gossip tick interval and peers per round |
+| `HeartbeatInterval` | 1 s | Failure-detector check interval |
+| `SuspectThreshold` | 3 s | Heartbeat age before SUSPECT |
+| `FailureThreshold` | 10 s | Heartbeat age before FAILED |
+| `rebalanceDebounce` | 3 s | Auto-rebalance debounce (`--auto-rebalance`, default true) |
 | `transferBatchSize` | 500 keys | Keys per HTTP migration batch |
 | `transferHTTPTimeout` | 60 s | Timeout per migration HTTP call |

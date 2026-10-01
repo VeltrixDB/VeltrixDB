@@ -1,6 +1,6 @@
 # VeltrixDB Disaster Recovery Runbook
 
-> Assumes `kubectl` admin rights and pods labelled `app.kubernetes.io/name=veltrixdb` in `-n veltrixdb`.
+> Assumes `kubectl` admin rights and pods labelled `app.kubernetes.io/name=veltrixdb` in `-n veltrixdb` (the `kubectl veltrix` plugin's defaults, `cmd/kubectl-veltrix`). The plugin reaches `/admin/*` through `kubectl port-forward` (a loopback connection) and sends no admin token, so it only works on servers started without `--admin-token`.
 
 ---
 
@@ -26,11 +26,11 @@ kubectl describe pod -n veltrixdb POD
 |----------|-------|-----|
 | `[wal] replay of … stopped at byte N of M after K records` | Torn final write on crash (small `M − N`), or WAL damage (large) — every record is CRC32C-checked and replay stops at the first bad one | Restart pod once; if recurring or `M − N` is large, the WAL is damaged: wipe this node and let replication refill it (§2), or restore from backup (§5) in standalone mode |
 | `panic: native index: insert failed (out of memory?)` | `vm.max_map_count` too low for the off-heap native index (cgo builds) | Apply `scripts/sysctl.conf` (`vm.max_map_count = 262144`) on the node; or set `VELTRIXDB_INDEX=map` to use the Go map index |
-| `bad magic at offset O` | Silent disk corruption | Drain node, replace disk, re-join |
+| `vlog bad magic at offset O` / `vlog CRC32C mismatch at offset O` | Silent disk corruption | Drain node, replace disk, re-join |
 | `[search] rebuilt N vectors and M text documents in T` | Normal after every start: search indexes are rebuilt from the persisted keys; searches are refused until this line (`INFO` → `search_ready=1`) | Nothing — size restart windows by T for large vector namespaces |
 | client error `search indexes are still rebuilding after restart (loaded x of y)` | A search reached a node before its rebuild finished | Retry; or run with `--search-allow-partial` if incomplete results are acceptable |
 | `[transfer] WARNING: listener … is unauthenticated` | No `--cluster-secret-file` and no cluster mTLS | Mount the same secret on every node (`VELTRIXDB_CLUSTER_SECRET`) and restart |
-| `encryption: no key in VELTRIXDB_ENCRYPTION_KEY` | Missing secret | `kubectl create secret generic veltrixdb-enc --from-literal=key=BASE64_32B` |
+| `encryption: enabled but no key in VELTRIXDB_ENCRYPTION_KEY and no EncryptionKeyPath set` | `--encrypt-at-rest` with no key (env unset, no `--encryption-key-path`) | `kubectl create secret generic veltrixdb-enc --from-literal=key=BASE64_32B` |
 
 ---
 
@@ -107,37 +107,53 @@ The emergency-mode GC (Invariant 23) keeps the system upright automatically — 
 ## 5. Backup & restore
 
 ```bash
-# Full backup (engine can be running)
+# Full backup of a RUNNING server: through the admin API, written on the
+# server's own filesystem (dest_dir is a path inside the pod)
+kubectl port-forward -n veltrixdb POD 2112:2112 &
+curl -s -X POST localhost:2112/admin/backup \
+  -d '{"type":"full","dest_dir":"/mnt/nvme0/backup/'$(date +%F)'"}'
+# incremental: {"type":"incremental","dest_dir":"...","base_dir":"<previous backup dir>"}
+# (equivalent for a full backup: veltrix --addr 127.0.0.1:2112 backup DEST_DIR)
+
+# veltrixdb-backup (cmd/backup) opens the data dirs with its OWN engine:
+# run it only while the server is STOPPED. Pointed at a live server's
+# directories it races the server and can truncate wal.log / vlog_active.dat.
+# It is not in the server image (the Dockerfile builds only cmd/server).
 veltrixdb-backup full --data-dirs=/mnt/nvme0,...,/mnt/nvme7 --dest=/backup/$(date +%F)
 
-# Upload to S3
+# Upload to S3 (prints the cloud path: <prefix>/<backup_id>/, default
+# prefix veltrixdb-backups, backup_id from manifest.json, e.g. full-<unix-ns>)
 veltrixdb-backup upload --src=/backup/$(date +%F) \
   --provider=s3 --bucket=my-bucket --region=us-east-1
 
 # Download and restore (stop the engine first)
-veltrixdb-backup download --provider=s3 --bucket=my-bucket \
-  --cloud-path=veltrixdb-backups/$(date +%F) --dest=/tmp/restore
+veltrixdb-backup download --provider=s3 --bucket=my-bucket --region=us-east-1 \
+  --cloud-path=veltrixdb-backups/full-1748001600000000000/ --dest=/tmp/restore
 veltrixdb-backup restore --chain=/tmp/restore --data-dirs=/data-new
 ```
 
 Backups and PITR restores write a binary WAL; restoring into a build that predates the binary WAL needs the §8 procedure first. See [backup-restore.md](backup-restore.md).
 
-Or via Kubernetes volume snapshots:
-```bash
-kubectl create volumesnapshot veltrixdb-disk-0 -n veltrixdb \
-  --persistentvolumeclaim=data-veltrixdb-0
-```
+Or via Kubernetes volume snapshots, if your CSI driver supports them (a
+`VolumeSnapshot` manifest per PVC; there is no `kubectl create volumesnapshot`
+subcommand). This repository ships no snapshot manifests. Run
+`POST /admin/checkpoint` first so `wal.log` is a compacted checkpoint.
 
 ---
 
 ## 6. Encryption key rotation
 
-Online rotation is not supported. Use the offline sequence:
+Key rotation is **not implemented**. The engine loads exactly one key at
+startup (`storage/encrypt.go`) and has no per-record key version, so values
+written under the old key cannot be decrypted once the key is replaced, and
+there is no command that re-encrypts in place. `kubectl veltrix migrate`
+(`POST /admin/migrate`) only rewrites records whose schema version is older
+than the current one; it does not re-encrypt.
 
-1. Stop all pods: `kubectl scale statefulset/veltrixdb --replicas=0 -n veltrixdb`
-2. Generate new key: `openssl rand 32 | base64`
-3. Update secret: `kubectl create secret generic veltrixdb-enc --from-literal=key=NEW_KEY --dry-run=client -o yaml | kubectl apply -f -`
-4. Start pods and run: `kubectl veltrix migrate` (forces full rewrite at new key)
+The only way to change the key is to move the data through a client: read
+every key from a node running with the old key and write it into a fresh
+node (empty data dirs) started with the new key, then cut over. Do **not**
+swap the Secret under existing data.
 
 ---
 
@@ -182,6 +198,8 @@ pipeline. It refuses to scan a host whose server is still listening.
 ```bash
 kubectl scale statefulset veltrixdb --replicas=0     # or stop the unit
 veltrix-repair --data-dirs /mnt/nvme0,/mnt/nvme1 --repair
+# encrypted deployments: add --encrypt-at-rest (key from VELTRIXDB_ENCRYPTION_KEY
+# or --encryption-key-path); non-zstd data: --compression=none|flate
 ```
 
 Each `wal.log` is copied to `wal.log.prerepair.<timestamp>` before anything is

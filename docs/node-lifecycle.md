@@ -2,6 +2,8 @@
 
 This document explains exactly what happens at each stage of a node's life in a VeltrixDB cluster — from joining to leaving, and from graceful shutdown to sudden crash.
 
+**What `cmd/server` does vs. the library.** A server builds its membership once, at startup, from `--peers id@host:port,...` (or `--seeds nodeID=host:port,...`): every listed node is `AddNode`d to the local partition map. There is no admin endpoint or command that adds, drains or removes a node at runtime, and gossip does not carry membership (`cluster/gossip.go`: nodes a digest names that the receiver does not know are ignored). In `--mode=raft` / `--mode=replicated`, `--auto-rebalance` (default true) subscribes to membership events and, after a 3 s debounce, runs `Rebalance` + `MigrateToNewOwners` (`cmd/server/rebalancer.go`). The join / drain / force-remove calls below (`AddNodeAndRebalance`, `RemoveNodeAndRebalance`, `ForceRemoveNode`, `RaftNode.AddServer`) are Go APIs in `cluster/` and `consensus/` for an embedding program; the server does not call them.
+
 ---
 
 ## Node Failover (Leader Goes Down)
@@ -32,7 +34,7 @@ T=401 ms node-3 receives RequestVote:
          └─ resetElectionTimer()
 
 T=401 ms node-2 receives VoteGranted from node-3:
-         votes = 2 (self + node-3) > 3/2  →  becomeLeader()
+         votes = 2 (self + node-3) ≥ quorum (3/2 + 1 = 2)  →  becomeLeader()
 
 T=401 ms node-2 becomeLeader():
          ├─ role = Leader
@@ -40,18 +42,19 @@ T=401 ms node-2 becomeLeader():
          ├─ nextIndex[node-3] = lastLogIndex + 1
          ├─ matchIndex[node-3] = 0
          ├─ Append no-op entry (term=2)   ← Raft §5.4.2
-         └─ broadcastAppendEntries()       ← includes no-op
+         └─ persist raft_state.gob, then broadcastAppendEntries()
+                                           ← sent at once, includes no-op
 
-T=451 ms node-2's no-op entry ACKed by node-3 (quorum)
+T≈402 ms node-2's no-op entry ACKed by node-3 (quorum) — one round trip
          ├─ maybeAdvanceCommit() → commitIndex advances past no-op
          └─ New leader ready to accept client writes
 ```
 
 ### What Clients Experience
 
-- **Writes to the old leader**: Return `ErrNotLeader`. Clients should retry — a well-behaved client retries with exponential backoff until it finds the new leader.
-- **New writes to `node-2`**: Accepted and committed normally ~450 ms after the old leader went down.
-- **Reads from followers**: Always served from local state (up to the committed `commitIndex`). Stale reads are possible if a follower hasn't received the latest commits yet.
+- **Writes to a non-leader**: answered `MOVED <leader-addr> <leader-id>`, or `MOVED - (leader unknown, retry)` while no leader is known (`cmd/server/coordinator.go`); writes to the dead old leader simply fail to connect. Clients retry with backoff until they reach the new leader.
+- **New writes to `node-2`**: Accepted and committed normally once it is elected (~400–800 ms after the last heartbeat) plus one round trip for the no-op.
+- **Reads from followers**: served from local state (whatever the follower has applied). Stale reads are possible if a follower hasn't received the latest commits yet. With `--linearizable-reads`, followers redirect GETs to the leader, which runs a ReadIndex fence.
 - **Reads from the new leader**: held until the new leader has applied its term's no-op (typically one heartbeat round, bounded by 2 s), so they include every write the old leader acknowledged. Before this barrier a GET immediately after failover could return "not found" for an acknowledged write (`TestRaftClusterFailover`).
 - **Searches**: fail with `search incomplete: ... did not answer` naming the dead node until the failure detector marks it failed, then run on the remaining nodes (`--search-allow-partial` answers without it straight away).
 
@@ -59,11 +62,11 @@ T=451 ms node-2's no-op entry ACKed by node-3 (quorum)
 
 Any write that received an `OK` response from the old leader was committed by quorum — at least 2 of 3 nodes persisted it to `raft_state.gob`. The new leader will apply those entries before accepting new writes.
 
-Writes that received `ErrNotLeader` or timed out may or may not have been committed. Clients with **at-least-once** semantics should retry with idempotent operations (use `SetIfNotExists` / `CompareAndSwap` for exactly-once semantics).
+Writes that received `MOVED` were not submitted. Writes that timed out or lost their connection may or may not have been committed. Clients with **at-least-once** semantics should retry with idempotent operations (use `SetIfNotExists` / `CompareAndSwap` for exactly-once semantics).
 
 ### The No-Op Entry (Why It Matters)
 
-When `node-2` becomes leader, it cannot immediately commit any uncommitted entries from term 1 — Raft §5.4.2 prohibits committing prior-term entries directly. The no-op entry in term 2 propagates through the cluster; once committed, it implicitly commits all prior-term entries that precede it. This is why there is a brief (~50 ms) window after leader election before the new leader accepts writes.
+When `node-2` becomes leader, it cannot immediately commit any uncommitted entries from term 1 — Raft §5.4.2 prohibits committing prior-term entries directly. The no-op entry in term 2 propagates through the cluster; once committed, it implicitly commits all prior-term entries that precede it. Until the no-op commits (one replication round trip) the new leader holds local reads (`WaitLeaderApplied`, up to 2 s).
 
 ---
 
@@ -74,20 +77,23 @@ When `node-2` becomes leader, it cannot immediately commit any uncommitted entri
 ### Phase 1: Register the Node
 
 ```go
-pm.AddNodeAndRebalance("node-4", "10.0.0.4", 9000, "10.0.0.4:9100", 256, ta)
+pm.AddNodeAndRebalance("node-4", "10.0.0.4", 9000, "10.0.0.4:9005", 256, ta)
 ```
 
-This performs four steps atomically from the coordinator's perspective:
+(`cmd/server` derives the transfer listener as client port + 5, e.g. `:9005`; `--transfer-addr` overrides it locally.) This runs, on the partition map it is called on:
 
 ```
-1. pm.AddNode("node-4", "10.0.0.4", 9000)
+1. pm.AddNodeWithTransfer("node-4", "10.0.0.4", 9000, "10.0.0.4:9005")
    ├─ Node{state=ACTIVE} added to Nodes map
    ├─ 64 virtual nodes added to ConsistentHashRing
-   └─ pm.Version++
+   ├─ pm.Version++, pm.epoch++ (split-brain fencing)
+   └─ transfer address registered
 
-2. Gossip propagates new PartitionMap version to all nodes
-   └─ All nodes learn about node-4 within ~7 gossip rounds (≈7 s)
+2. pm.Rebalance(256)
+3. go ta.MigrateToNewOwners()      (only if ta != nil)
 ```
+
+Gossip does **not** propagate the new member: every node's partition map must have `AddNode("node-4", ...)` called on it (for `cmd/server`, restart every node with node-4 in `--peers`). Once node-4 is known, gossip carries its liveness, gossip address and rack.
 
 ### Phase 2: Rebalance (Partition Reassignment)
 
@@ -95,12 +101,13 @@ This performs four steps atomically from the coordinator's perspective:
 pm.Rebalance(256)
     │
     ▼
-256 partitions recalculated with 4 nodes:
-    Before: node-1, node-2, node-3 each own ~85 partitions primary
-    After:  node-1, node-2, node-3, node-4 each own ~64 partitions primary
+256 partitions reassigned round-robin over the ACTIVE nodes (sorted by ID):
+    Before: node-1, node-2, node-3 each own 85–86 partitions primary
+    After:  node-1, node-2, node-3, node-4 each own 64 partitions primary
+    (no data has moved yet)
 
-    ~21 partitions per node are reassigned to node-4
-    (but no data has moved yet — only routing table updated)
+Key ownership itself comes from the consistent-hash ring, not this table:
+node-4's 64 vnodes take roughly a quarter of the key space.
 ```
 
 ### Phase 3: Data Migration (Background)
@@ -109,18 +116,20 @@ pm.Rebalance(256)
 TransferAgent.MigrateToNewOwners()   [runs in background goroutine]
     │
     ▼
-ScanKeys() → enumerate all keys on node-1 (the coordinator)
+ScanKeys() → enumerate all live keys on the node that owns ta
     │
     ▼
 For each key:
-    hash = FNV-1a(key)
+    hash = fmix64(FNV-1a(RoutingKey(key)))   ← @vec/@txt/@idx keys route as their record
     newOwner = ring.GetNode(hash)
-    if newOwner == "node-4": queue for migration
+    if newOwner != local node: queue for newOwner
+    (@vecns/ and @idxdef/ keys are copied to every destination, never moved)
 
     ▼
-Fan out to node-4 via HTTP:
-    POST http://10.0.0.4:9100/transfer/keys
-    Body: {src:"node-1", keys:[{k,v,ttl}, ...]}  (500 keys per batch)
+Fan out to each new owner in parallel via HTTP:
+    POST http://10.0.0.4:9005/transfer/keys
+    Body: {src:"node-1", epoch:E, keys:[{k,v,ttl}, ...]}  (500 keys per batch)
+    (HMAC-signed with --cluster-secret-file; a stale epoch gets 409)
     │
     ▼
 node-4 receives and puts each key into its local StorageEngine
@@ -129,19 +138,21 @@ node-4 receives and puts each key into its local StorageEngine
 node-1 deletes successfully-migrated keys locally
 ```
 
-**During migration**, reads/writes to migrating keys are still served correctly — the ring routes new requests to `node-4` immediately after rebalance, and old requests to `node-1` are still served from its local copy until deleted.
+**During migration**, the ring routes requests for re-owned keys to `node-4` as soon as it is added, but a key is only on `node-4` once its batch has been delivered: until then a read routed to `node-4` can miss it. `node-1` keeps its copy until the batch succeeds (failed batches are not deleted and are retried on the next migration).
 
 ### Phase 4: Raft Group Expansion
 
-To add `node-4` to the Raft consensus group (so it participates in quorum decisions):
+To add `node-4` to the Raft consensus group (so it participates in quorum decisions), call on the leader:
 
 ```go
-raftNode.AddPeer("node-4")
-// node-4 creates its own RaftNode with the cluster peers and starts
-// receiving AppendEntries from the current leader
+err := raftNode.AddServer("node-4")
+// appends a configuration entry and blocks until it commits under the new
+// quorum; ErrNotLeader on followers, ErrConfigChangeInProgress while an
+// earlier change is uncommitted. node-4 runs its own RaftNode and receives
+// AppendEntries (or InstallSnapshot) from the leader.
 ```
 
-Once `node-4`'s Raft log is caught up (leader's `nextIndex["node-4"]` matches `matchIndex["node-4"]`), it counts toward quorum.
+`AddPeer` still exists but is deprecated: it changes only the local view, without consensus. The new member counts toward quorum as soon as the configuration entry is in effect; `RemoveServer(id)` is the inverse. `cmd/server` never calls either — its Raft membership is the static `--peers` list.
 
 ---
 
@@ -149,15 +160,7 @@ Once `node-4`'s Raft log is caught up (leader's `nextIndex["node-4"]` matches `m
 
 **Scenario**: `node-3` is being decommissioned — hardware replaced, cluster shrinking.
 
-### Step 1: Mark as Draining
-
-```go
-pm.UpdateNodeState("node-3", NodeStateDraining)
-```
-
-State becomes `DRAINING`. Health checks and metrics see a deliberate departure. New requests stop being routed to `node-3`.
-
-### Step 2: Remove from Ring + Rebalance
+### Step 1: Drain, Remove from Ring, Rebalance
 
 ```go
 pm.RemoveNodeAndRebalance("node-3", 256, node3TransferAgent)
@@ -165,21 +168,25 @@ pm.RemoveNodeAndRebalance("node-3", 256, node3TransferAgent)
 
 Internally:
 ```
-1. pm.RemoveNode("node-3")
-   ├─ Delete from Nodes map
-   ├─ Remove 64 virtual nodes from ring
-   └─ pm.Version++
+1. pm.UpdateNodeState("node-3", NodeStateDraining)
+   └─ state DRAINING, so health checks and metrics see a deliberate departure
+      (routing is unchanged until step 2: the ring ignores node state)
 
-2. pm.Rebalance(256)
+2. pm.RemoveNode("node-3")
+   ├─ Delete from Nodes map
+   ├─ Remove 64 virtual nodes from ring   ← new requests stop routing here
+   └─ pm.Version++, pm.epoch++
+
+3. pm.Rebalance(256)
    └─ node-3's partitions reassigned to node-1 and node-2
 
-3. [background] node3TransferAgent.MigrateToNewOwners()
+4. [background] node3TransferAgent.MigrateToNewOwners()
    └─ Scan node-3's local keys → identify new owners → transfer
 ```
 
-**Critical**: The `TransferAgent` passed to `RemoveNodeAndRebalance` MUST be `node-3`'s own agent (`ta.localNodeID == "node-3"`). Using another node's agent would scan the wrong data store.
+**Critical**: The `TransferAgent` passed to `RemoveNodeAndRebalance` MUST be `node-3`'s own agent (`ta.localNodeID == "node-3"`); any other agent is rejected with an error. `nil` skips evacuation. Like node addition, this changes only the partition map it is called on — every node's map must drop node-3.
 
-### Step 3: Evacuation Completes
+### Step 2: Evacuation Completes
 
 ```
 [transfer] evacuating node=node-3
@@ -187,7 +194,7 @@ Internally:
 [transfer] evacuation complete node=node-3
 ```
 
-Once all keys are transferred, `node-3` can be safely shut down. Its Raft log entries are already replicated to `node-1` and `node-2`, so no committed data is lost.
+Once all keys are transferred, `node-3` can be safely shut down. Its Raft log entries are already replicated to `node-1` and `node-2`, so no committed data is lost. In raft mode, also remove it from the Raft configuration with `RemoveServer("node-3")` on the leader.
 
 ---
 
@@ -198,17 +205,15 @@ Once all keys are transferred, `node-3` can be safely shut down. Its Raft log en
 ### Detection Timeline
 
 ```
-T=0 s   node-2 crashes
-T=1 s   FailureDetector.checkNodeHealth() tick on node-1 and node-3
-        timeSinceHeartbeat > SuspectThreshold (3 s): NOT YET
-T=3 s   checkNodeHealth() tick:
-        timeSinceHeartbeat = 3 s > SuspectThreshold
-        → UpdateNodeState("node-2", NodeStateSuspect)
-T=10 s  checkNodeHealth() tick:
-        timeSinceHeartbeat = 10 s > FailureThreshold
-        → UpdateNodeState("node-2", NodeStateFailed)
-        → failedNodes["node-2"] = true
-        → push "node-2" to recoveryQueue
+T=0 s     node-2 crashes (last heartbeat recorded via gossip, 1 s rounds)
+T=1 s     FailureDetector.checkNodeHealth() tick (every 1 s) on node-1 and node-3
+          timeSinceHeartbeat > SuspectThreshold (3 s): NOT YET
+T≈3–4 s   first tick with timeSinceHeartbeat > 3 s
+          → UpdateNodeState("node-2", NodeStateSuspect)
+T≈10–11 s first tick with timeSinceHeartbeat > FailureThreshold (10 s)
+          → UpdateNodeState("node-2", NodeStateFailed)
+          → failedNodes["node-2"] = true
+          → push "node-2" to recoveryQueue
 ```
 
 ### If node-2 Was the Raft Leader
@@ -225,7 +230,8 @@ The `backgroundRecoveryWorker` attempts to recover the failed node:
 
 ```go
 func (fd *FailureDetector) attemptNodeRecovery(nodeID string) bool {
-    if fd.pingNode(nodeID, node.Address, node.Port) {
+    node := fd.partitionMap.Nodes[nodeID]          // under pm.mu.RLock
+    if fd.pingNode(node.Address, node.Port) {       // TCP "PING\n", needs a reply, 2 s timeout
         // Node is back online
         fd.partitionMap.UpdateNodeState(nodeID, NodeStateRecovering)
         fd.triggerRebalance()
@@ -235,7 +241,7 @@ func (fd *FailureDetector) attemptNodeRecovery(nodeID string) bool {
 }
 ```
 
-Up to `MaxRecoveryRetries` (3) attempts are made, spaced `RecoveryInterval` (5 s) apart. If all fail, the node stays `FAILED` and an operator must intervene.
+Up to `MaxRecoveryRetries` (3) attempts are made. A failed attempt re-queues the node immediately, so the attempts run back to back, each bounded by the 2 s ping timeout (`RecoveryInterval`, 5 s, only drives an idle ticker). If all fail, the node stays `FAILED` until a heartbeat arrives (see step 6 below) or an operator intervenes.
 
 ### Crash Recovery on the Crashed Node
 
@@ -269,8 +275,12 @@ When `node-2` restarts:
 
 5. node-2 is caught up → counts toward quorum again
 
-6. FailureDetector.RecordHeartbeat("node-2")
-   └─ UpdateNodeState("node-2", NodeStateRecovering) → NodeStateActive
+6. FailureDetector.RecordHeartbeat("node-2")   (gossip from node-2 again)
+   └─ FAILED → UpdateNodeState("node-2", NodeStateRecovering)
+      Nothing moves a node from RECOVERING back to ACTIVE: it stays
+      RECOVERING (shown in /admin/cluster), and Rebalance, which assigns
+      partitions only to ACTIVE nodes, leaves it out of the partition
+      table. Key routing uses the ring, which still contains it.
 ```
 
 ### Force-Remove (Node Never Comes Back)
@@ -281,7 +291,7 @@ If `node-2` cannot be recovered (hardware is destroyed):
 pm.ForceRemoveNode("node-2", 256)
 ```
 
-This removes the node from the ring and rebalances partition assignments to `node-1` and `node-3`. No data evacuation — surviving replicas already have the data (replication factor ensures this). The Replication Engine's anti-entropy re-replicates any missing copies to restore `RF=3`.
+This removes the node from the ring and rebalances partition assignments to `node-1` and `node-3`. No data evacuation — surviving replicas are the source of truth; restoring the replica count is left to the replication layer (`ForceRemoveNode` itself triggers no re-replication).
 
 ---
 
@@ -297,8 +307,10 @@ When a crashed node comes back online after repair:
 5. Once matchIndex[recovered_node] == leader.lastLogIndex:
    ├─ Committed entries are re-applied to StorageEngine
    └─ Node is fully caught up
-6. PartitionMap.UpdateNodeState → NodeStateActive
-7. Node re-enters ring → new writes routed to it
+6. Peers' failure detectors see its heartbeat again → RECOVERING
+   (if it had been marked FAILED; a SUSPECT node goes straight back to ACTIVE)
+7. It never left the ring (only ForceRemoveNode / RemoveNode take it out),
+   so keys it owns route to it throughout
 ```
 
 During the catch-up phase, the recovering node serves reads from its potentially-stale local state. Clients that need strong consistency should read from the leader or use quorum reads.
@@ -341,11 +353,11 @@ Rolling back a node that was not stopped cleanly after step 1 leaves binary reco
 
 | Event | Data Loss? | Write Downtime | Read Downtime |
 |-------|-----------|----------------|---------------|
-| Leader failover (Raft 3-node) | None (committed writes safe) | ~400–800 ms election + ~50 ms no-op commit | None (followers serve reads) |
+| Leader failover (Raft 3-node) | None (committed writes safe) | ~400–800 ms election + one round trip for the no-op | None (followers serve reads) |
 | Node addition | None | None | None |
 | Graceful removal (DRAINING) | None | None | None |
 | Node crash (follower, RF=3) | None (2 of 3 have data) | None | None |
-| Node crash (leader, RF=3) | None (committed writes) | ~450 ms | None |
+| Node crash (leader, RF=3) | None (committed writes) | ~400–800 ms | None |
 | Two nodes crash (RF=3) | Possible (quorum lost) | Indefinite until 1 recovers | Degraded |
 | Force-remove dead node | None (surviving replicas) | None | None |
 
@@ -358,10 +370,10 @@ Rolling back a node that was not stopped cleanly after step 1 leaves binary reco
 | `veltrixdb_failure_detector_nodes_failed_total` | Counter: nodes marked FAILED by the heartbeat monitor |
 | `veltrixdb_failure_detector_nodes_recovered_total` | Counter: nodes that recovered after being marked FAILED. Failed minus recovered over a window = nodes still down |
 | `veltrixdb_failure_detector_false_positives_total` | Nodes suspected then recovered (flapping) |
-| `veltrixdb_cluster_nodes_total` | Registered cluster nodes |
-| `veltrixdb_cluster_partition_migrations_total` | Data migration batches completed |
+| `veltrixdb_cluster_nodes_total` | Gauge: registered cluster nodes |
+| `veltrixdb_cluster_partition_migrations_total` | Exported but never incremented (always 0): nothing in `cluster/` adds to `PartitionMigrations`. Use the `[transfer] migration done  moved=N` log line |
 | `veltrixdb_cluster_rebalances_total` | Partition map rebalances triggered |
 
 There is no gauge for nodes currently in SUSPECT state, and the Raft term and
 leader are not Prometheus metrics: read them from `GET /admin/cluster`
-(`term`, `leader_id`) or `veltrix nodes`.
+(`raft.term`, `raft.leader_id`, raft mode only) or `veltrix nodes`.

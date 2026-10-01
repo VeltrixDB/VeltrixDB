@@ -19,13 +19,39 @@ Requires: h5py, numpy (pip install h5py numpy).
 import argparse
 import os
 import struct
+import shutil
 import sys
+import time
 import urllib.request
 
 import h5py
 import numpy as np
 
 BASE = "http://ann-benchmarks.com/{}.hdf5"
+# ann-benchmarks.com answers 403 to urllib's default "Python-urllib/x.y"
+# User-Agent, so send our own.
+USER_AGENT = "Mozilla/5.0 (compatible; veltrixdb-ann-dataset/1.0)"
+
+
+def download(url, dest, attempts=4):
+    """Fetch url to dest via a temp file, so a failed download never leaves a
+    truncated file behind (the CI cache would keep it)."""
+    tmp = dest + ".part"
+    for i in range(1, attempts + 1):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+            with urllib.request.urlopen(req, timeout=120) as resp, open(tmp, "wb") as f:
+                shutil.copyfileobj(resp, f, 1 << 20)
+            os.replace(tmp, dest)
+            return
+        except Exception as e:  # noqa: BLE001 — retry any network error
+            if os.path.exists(tmp):
+                os.remove(tmp)
+            if i == attempts:
+                raise
+            wait = 5 * i
+            print(f"download failed ({e}); retry {i}/{attempts - 1} in {wait}s", file=sys.stderr)
+            time.sleep(wait)
 
 
 def write_fvecs(path, arr):
@@ -51,7 +77,7 @@ def main():
     if not os.path.exists(h5):
         url = BASE.format(a.name)
         print(f"downloading {url}", file=sys.stderr)
-        urllib.request.urlretrieve(url, h5)
+        download(url, h5)
     with h5py.File(h5, "r") as f:
         train = f["train"][: a.train]
         test = f["test"][: a.test]

@@ -11,15 +11,16 @@ Technical documentation for VeltrixDB internals.
 | [replication.md](replication.md) | Raft consensus replication + async Replication Engine; consistency levels; anti-entropy; version vectors |
 | [partitioning.md](partitioning.md) | Consistent hash ring; virtual nodes; partition assignment; rebalancing; data migration via TransferAgent |
 | [node-lifecycle.md](node-lifecycle.md) | Node failover (leader election timeline); node addition; graceful removal; crash detection and recovery |
-| [backup-restore.md](backup-restore.md) | Full and incremental backup; cloud backup (S3/GCS/Azure); restore procedure; backup safety guarantees |
+| [backup-restore.md](backup-restore.md) | Full and incremental backup (`POST /admin/backup`, `veltrixdb-backup`); cloud backup (S3/GCS/Azure); restore procedure; point-in-time recovery (WAL archiving, `restore-pitr`); backup safety guarantees |
 | [vector-search.md](vector-search.md) | Vector, full-text and hybrid search: commands, float32 / int8 / PQ / disk-graph layouts, filters, clusters, restarts, measured recall / latency / RAM |
+| [redis-comparison.md](redis-comparison.md) | VeltrixDB vs Redis: when to use each |
 
 ## Existing Docs
 
 | Document | What It Covers |
 |----------|---------------|
-| [DR_RUNBOOK.md](DR_RUNBOOK.md) | Disaster recovery runbook; encryption key rotation; data corruption recovery |
-| [SOC2_CONTROLS.md](SOC2_CONTROLS.md) | SOC 2 compliance controls |
+| [DR_RUNBOOK.md](DR_RUNBOOK.md) | Disaster recovery runbook: crash loops, data corruption, write outage, GC death-spiral, backup & restore, encryption keys (no rotation), transform-metadata repair, WAL format rollback |
+| [SOC2_CONTROLS.md](SOC2_CONTROLS.md) | SOC 2 Trust Service Criteria mapping: what VeltrixDB provides, operator obligations, disclosed gaps |
 | [TESTING_GUIDE.md](TESTING_GUIDE.md) | How to run unit, cgo/native-index, `netfront/`, integration and e2e tests; what each CI job runs |
 | [../BENCHMARKING.md](../BENCHMARKING.md) | Bench harness gates; `scripts/net-bench.sh`; group-commit table; vector benchmarks |
 | [../BENCHMARK_RESULTS.md](../BENCHMARK_RESULTS.md) | Every measured number with its conditions (June 2026 YCSB; October 2026 group commit, YCSB, vectors, stability) |
@@ -40,10 +41,14 @@ Technical documentation for VeltrixDB internals.
 | Off-heap native index (cgo) | `storage/native_index.cpp`, `storage/index_table_native.go` |
 | Raft consensus | `consensus/raft.go` |
 | Cluster partition map | `cluster/partition_map.go` |
-| Failure detection + gossip | `cluster/failure_detection.go` |
+| Failure detection + gossip | `cluster/failure_detection.go`, `cluster/gossip.go` |
 | Data migration | `cluster/partition_transfer.go` |
 | Replication engine | `replication/engine.go` |
-| Backup / restore | `storage/backup.go`, `cmd/backup/main.go` |
+| Backup / restore | `storage/backup.go`, `cmd/backup/main.go`, `adminapi/admin.go` (`/admin/backup`) |
+| Cloud backup (S3 / GCS / Azure) | `storage/backup_cloud.go` |
+| WAL archiving + point-in-time recovery | `storage/pitr.go` |
+| Admin HTTP API + its auth guard | `adminapi/admin.go`, `adminapi/guard.go`, `cmd/server/admin_cluster.go` |
+| Auto-rebalance on membership change | `cmd/server/rebalancer.go` |
 | TCP server | `cmd/server/main.go` |
 | C++ network front-end (`--net=cpp\|uring\|poll`, opt-in) | `netfront/` |
 | Profiling listener (`--pprof-addr`) | `cmd/server/pprof.go` |
