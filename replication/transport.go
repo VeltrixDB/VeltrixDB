@@ -241,6 +241,30 @@ func (c *ReplicationClient) Send(ops []*WriteOperation) error {
 }
 
 // Close shuts down the client.
+// Ping makes one round trip with the replica: an empty batch, which the
+// ReplicationServer acks without applying anything.  Unlike Send it never
+// retries or sleeps — the engine's recovery worker owns the backoff.
+func (c *ReplicationClient) Ping() error {
+	c.sendMu.Lock()
+	defer c.sendMu.Unlock()
+
+	conn, err := c.getConn()
+	if err != nil {
+		return err
+	}
+	conn.SetDeadline(time.Now().Add(replDialTimeout))
+	if err := sendBatch(conn, []*WriteOperation{}); err != nil {
+		c.closeConn()
+		return err
+	}
+	if err := readAck(conn); err != nil {
+		c.closeConn()
+		return fmt.Errorf("read ack: %w", err)
+	}
+	c.backoff = 100 * time.Millisecond
+	return nil
+}
+
 func (c *ReplicationClient) Close() {
 	close(c.done)
 	c.mu.Lock()

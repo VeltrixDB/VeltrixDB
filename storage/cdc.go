@@ -10,8 +10,12 @@ package storage
 //
 // Design choices:
 //   - Subscribers receive events through a per-subscription buffered channel.
-//     A slow subscriber is auto-disconnected if its channel fills up; the
-//     producer side never blocks.  This is the same trade-off Kafka makes:
+//     A slow subscriber is auto-disconnected after 3 consecutive drops on a
+//     full channel; the producer side never blocks.
+//   - Every engine write path emits: Put, Delete, MultiPut (MPUT, coalesced
+//     pipelined PUTs, TXN commit, Raft ApplyBatch, WriteBatcher) and the
+//     atomic ops (CAS / INCR / DECR / SETNX). One event per key, always Op
+//     "PUT" or "DEL", emitted after the key's index entry is installed.  This is the same trade-off Kafka makes:
 //     consumers must keep up or be evicted.
 //   - The broker is in-process only.  For cross-process / cross-region CDC,
 //     a tail consumer reads from the in-process channel and writes to its
@@ -36,12 +40,19 @@ type CDCEvent struct {
 	Timestamp int64 // microseconds since Unix epoch
 }
 
+// cdcEvictAfterDrops is how many CONSECUTIVE drops evict a subscriber. A
+// successful send resets the count, so a consumer that briefly falls behind
+// but keeps draining is never evicted for drops spread over its lifetime.
+const cdcEvictAfterDrops = 3
+
 // cdcSubscription is one open subscriber's send channel.
 type cdcSubscription struct {
-	id      uint64
-	ch      chan CDCEvent
-	prefix  string // empty = match all
-	dropped uint64 // events dropped for this subscriber (channel full)
+	id     uint64
+	ch     chan CDCEvent
+	prefix string // empty = match all
+	// consecutiveDrops counts drops since the last successful send. Atomic:
+	// Broadcast runs concurrently from every writing goroutine.
+	consecutiveDrops atomic.Uint32
 }
 
 // CDCBroker fan-outs events to all live subscribers. Methods are safe for
@@ -50,6 +61,9 @@ type CDCBroker struct {
 	mu     sync.RWMutex
 	nextID uint64
 	subs   map[uint64]*cdcSubscription
+	// nsubs mirrors len(subs) so Broadcast with no subscribers — the normal
+	// case — is one atomic load, without touching mu.
+	nsubs atomic.Int32
 
 	// Total events broadcast and dropped — exposed via metrics layer.
 	totalBroadcast atomic.Uint64
@@ -62,7 +76,8 @@ func NewCDCBroker() *CDCBroker {
 }
 
 // Subscribe returns a receive-only channel and a cancel function. bufferSize
-// caps how many events can queue before the subscriber is auto-disconnected.
+// caps how many events can queue before drops start; cdcEvictAfterDrops
+// consecutive drops auto-disconnect the subscriber.
 // keyPrefix filters events: only keys starting with the prefix are sent. Empty
 // prefix means subscribe to all.
 func (b *CDCBroker) Subscribe(bufferSize int, keyPrefix string) (<-chan CDCEvent, func()) {
@@ -74,57 +89,78 @@ func (b *CDCBroker) Subscribe(bufferSize int, keyPrefix string) (<-chan CDCEvent
 	id := b.nextID
 	sub := &cdcSubscription{id: id, ch: make(chan CDCEvent, bufferSize), prefix: keyPrefix}
 	b.subs[id] = sub
+	b.nsubs.Store(int32(len(b.subs)))
 	b.mu.Unlock()
 
 	cancel := func() {
 		b.mu.Lock()
-		if s, ok := b.subs[id]; ok {
-			close(s.ch)
-			delete(b.subs, id)
-		}
+		b.removeLocked(id)
 		b.mu.Unlock()
 	}
 	return sub.ch, cancel
 }
 
+// removeLocked closes and forgets subscription id. Caller holds b.mu (write).
+func (b *CDCBroker) removeLocked(id uint64) {
+	if s, ok := b.subs[id]; ok {
+		close(s.ch)
+		delete(b.subs, id)
+		b.nsubs.Store(int32(len(b.subs)))
+	}
+}
+
+// hasSubscribers reports whether any subscriber is registered. A hint for
+// batch producers that would otherwise build one event per key for nobody.
+func (b *CDCBroker) hasSubscribers() bool { return b.nsubs.Load() > 0 }
+
+// countBroadcasts records n events that were not sent because there were no
+// subscribers, keeping totalBroadcast equal to the number of mutations.
+func (b *CDCBroker) countBroadcasts(n int) { b.totalBroadcast.Add(uint64(n)) }
+
 // Broadcast delivers ev to every interested subscriber. Non-blocking on slow
 // subscribers — if a channel is full, the event is dropped for that subscriber.
-// Three or more consecutive drops auto-disconnect the subscription.
+// cdcEvictAfterDrops (3) CONSECUTIVE drops auto-disconnect the subscription;
+// any successful send resets the count.
+//
+// Sends happen under the read lock. They are non-blocking selects, so the
+// lock is held for microseconds, and holding it is what makes them safe:
+// close(s.ch) only ever runs under the write lock, so no Broadcast can send
+// on a channel that an eviction or cancel is closing (sending on a snapshot
+// after RUnlock could panic with "send on closed channel").
 func (b *CDCBroker) Broadcast(ev CDCEvent) {
 	b.totalBroadcast.Add(1)
-	b.mu.RLock()
-	if len(b.subs) == 0 {
-		b.mu.RUnlock()
+	if b.nsubs.Load() == 0 {
 		return
 	}
-	// Snapshot subs to a slice so we don't hold the lock while sending.
-	snapshot := make([]*cdcSubscription, 0, len(b.subs))
+	evict := false
+	b.mu.RLock()
 	for _, s := range b.subs {
 		if s.prefix != "" && !hasPrefix(ev.Key, s.prefix) {
 			continue
 		}
-		snapshot = append(snapshot, s)
-	}
-	b.mu.RUnlock()
-
-	var toEvict []uint64
-	for _, s := range snapshot {
 		select {
 		case s.ch <- ev:
+			// Load first: a store on every send would bounce the line
+			// between writers for no reason when nothing was dropped.
+			if s.consecutiveDrops.Load() != 0 {
+				s.consecutiveDrops.Store(0)
+			}
 		default:
 			b.totalDropped.Add(1)
-			s.dropped++
-			if s.dropped >= 3 {
-				toEvict = append(toEvict, s.id)
+			if s.consecutiveDrops.Add(1) >= cdcEvictAfterDrops {
+				evict = true
 			}
 		}
 	}
-	if len(toEvict) > 0 {
+	b.mu.RUnlock()
+
+	if evict {
 		b.mu.Lock()
-		for _, id := range toEvict {
-			if s, ok := b.subs[id]; ok {
-				close(s.ch)
-				delete(b.subs, id)
+		for id, s := range b.subs {
+			// Re-checked under the write lock: a send that succeeded in
+			// between reset the count, and that subscriber stays.
+			if s.consecutiveDrops.Load() >= cdcEvictAfterDrops {
+				b.removeLocked(id)
 			}
 		}
 		b.mu.Unlock()

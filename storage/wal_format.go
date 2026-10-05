@@ -33,6 +33,28 @@ import (
 //
 // All integers little-endian.
 //
+// # Version 2: records that carry a TTL
+//
+// A key written with a TTL gets a version-2 record (byte 1 = 2): the same
+// 48 bytes, then
+//
+//	 48     8  TTL expiry — absolute Unix MICROSECONDS, int64 > 0
+//	           (IndexEntry.TTLExpiryUs semantics: the deadline, not a duration)
+//	 56     …  key bytes, then value bytes when the inline flag is set
+//	  end   4  CRC32C of every byte above
+//
+// Records without a TTL are still written as version 1, byte for byte as
+// before, so existing WAL files and the no-TTL hot path are unchanged; the
+// decoder accepts both versions in any mix. Replay installs FlagHasTTL +
+// TTLExpiryUs from the field, and a record already past its expiry at replay
+// is applied as an expiry (the key is tombstoned, as the TTL scanner would),
+// never resurrected. Before this field existed the WAL carried no TTL at all,
+// so every TTL'd key came back immortal after any restart.
+//
+// A build without version-2 support stops decoding at the first such record —
+// it fails that build's version check, which it treats like a torn tail — and
+// drops it and every record after it. See "Mixed files and rollback".
+//
 // # Why it replaced the text format
 //
 // The text format was `ts|tomb|key|valueLen|crc|version|vlogOffset|packed|
@@ -54,14 +76,22 @@ import (
 // The decoder reads both encodings, record by record, keyed on the first
 // byte, so an upgraded node simply keeps appending binary records after the
 // text ones already in wal.log. A pre-binary build cannot read binary
-// records: to roll back, restart the new build once with --wal-format=text,
-// which makes the clean-shutdown checkpoint rewrite wal.log as text, then
-// downgrade.
+// records, and no build older than the TTL field can read a version-2 record
+// or a text record with the 11th (TTL) field: both end its replay there, and
+// everything after is lost. To roll back to ANY older build, restart the new
+// build once with --wal-format=text-legacy and stop cleanly: the checkpoint
+// rewrites wal.log as 8/10-field text with no TTL field, which every build
+// since the text format reads. The price is that keys written with a TTL come
+// back immortal on the older build — exactly what that build did to them on
+// every restart anyway. --wal-format=text keeps the TTL field and is therefore
+// only readable by builds with this change.
 
 const (
 	walBinMagic      = 0xB1
-	walBinVersion    = 1
+	walBinVersion    = 1 // record without a TTL
+	walBinVersionTTL = 2 // record with the 8-byte TTL expiry at offset 48
 	walBinHeaderSize = 48
+	walBinTTLSize    = 8
 	walBinTrailer    = 4
 
 	walBinFlagTombstone = 1 << 0
@@ -99,9 +129,15 @@ func appendWALRecordBinary(buf []byte, entry *WALEntry) []byte {
 	}
 
 	start := len(buf)
-	var h [walBinHeaderSize]byte
+	var h [walBinHeaderSize + walBinTTLSize]byte
+	hdrLen := walBinHeaderSize
 	h[0] = walBinMagic
 	h[1] = walBinVersion
+	if entry.TTLExpiryUs > 0 {
+		h[1] = walBinVersionTTL
+		binary.LittleEndian.PutUint64(h[walBinHeaderSize:], uint64(entry.TTLExpiryUs))
+		hdrLen += walBinTTLSize
+	}
 	binary.LittleEndian.PutUint16(h[2:], flags)
 	binary.LittleEndian.PutUint32(h[4:], uint32(len(entry.Key)))
 	binary.LittleEndian.PutUint32(h[8:], entry.ValueLen)
@@ -111,7 +147,7 @@ func appendWALRecordBinary(buf []byte, entry *WALEntry) []byte {
 	binary.LittleEndian.PutUint64(h[24:], uint64(entry.Timestamp))
 	binary.LittleEndian.PutUint64(h[32:], entry.Version)
 	binary.LittleEndian.PutUint64(h[40:], uint64(entry.VLogOffset))
-	buf = append(buf, h[:]...)
+	buf = append(buf, h[:hdrLen]...)
 	buf = append(buf, entry.Key...)
 	if inline {
 		buf = append(buf, entry.Value...)
@@ -123,7 +159,7 @@ func appendWALRecordBinary(buf []byte, entry *WALEntry) []byte {
 type walReader struct {
 	br  *bufio.Reader
 	off int64 // bytes consumed by fully decoded records
-	hdr [walBinHeaderSize]byte
+	hdr [walBinHeaderSize + walBinTTLSize]byte
 }
 
 func newWALReader(r io.Reader) *walReader {
@@ -157,13 +193,21 @@ func (r *walReader) next() (walReplayEntry, error) {
 }
 
 func (r *walReader) nextBinary() (walReplayEntry, error) {
-	if _, err := io.ReadFull(r.br, r.hdr[:]); err != nil {
+	if _, err := io.ReadFull(r.br, r.hdr[:walBinHeaderSize]); err != nil {
 		return walReplayEntry{}, tailOrIOErr(err)
 	}
-	h := r.hdr[:]
-	if h[1] != walBinVersion {
+	hdrLen := walBinHeaderSize
+	switch r.hdr[1] {
+	case walBinVersion:
+	case walBinVersionTTL:
+		if _, err := io.ReadFull(r.br, r.hdr[walBinHeaderSize:]); err != nil {
+			return walReplayEntry{}, tailOrIOErr(err)
+		}
+		hdrLen += walBinTTLSize
+	default:
 		return walReplayEntry{}, errWALTail
 	}
+	h := r.hdr[:hdrLen]
 	flags := binary.LittleEndian.Uint16(h[2:])
 	keyLen := binary.LittleEndian.Uint32(h[4:])
 	valueLen := binary.LittleEndian.Uint32(h[8:])
@@ -175,9 +219,9 @@ func (r *walReader) nextBinary() (walReplayEntry, error) {
 	if inline {
 		bodyLen += int(valueLen)
 	}
-	rec := make([]byte, walBinHeaderSize+bodyLen+walBinTrailer)
+	rec := make([]byte, hdrLen+bodyLen+walBinTrailer)
 	copy(rec, h)
-	if _, err := io.ReadFull(r.br, rec[walBinHeaderSize:]); err != nil {
+	if _, err := io.ReadFull(r.br, rec[hdrLen:]); err != nil {
 		return walReplayEntry{}, tailOrIOErr(err)
 	}
 	crcAt := len(rec) - walBinTrailer
@@ -185,7 +229,7 @@ func (r *walReader) nextBinary() (walReplayEntry, error) {
 		return walReplayEntry{}, errWALTail
 	}
 
-	body := rec[walBinHeaderSize:crcAt]
+	body := rec[hdrLen:crcAt]
 	e := walReplayEntry{
 		key:         string(body[:keyLen]),
 		isTombstone: flags&walBinFlagTombstone != 0,
@@ -197,6 +241,11 @@ func (r *walReader) nextBinary() (walReplayEntry, error) {
 		timestampNs: int64(binary.LittleEndian.Uint64(h[24:])),
 		version:     binary.LittleEndian.Uint64(h[32:]),
 		vlogOffset:  int64(binary.LittleEndian.Uint64(h[40:])),
+	}
+	if hdrLen > walBinHeaderSize {
+		if ttl := int64(binary.LittleEndian.Uint64(h[walBinHeaderSize:])); ttl > 0 {
+			e.ttlExpiryUs = ttl
+		}
 	}
 	if inline {
 		e.value = body[keyLen:]
@@ -218,13 +267,19 @@ func tailOrIOErr(err error) error {
 	return err
 }
 
-// nextText decodes one legacy text record. The 6-, 7-, 8- and 10-field
+// nextText decodes one legacy text record. The 6-, 7-, 8-, 10- and 11-field
 // layouts are all accepted:
 //
 //	6:  timestamp|tombstone|key|valueLen|crc32hex|version
 //	7:  …|vlogOffset
 //	8:  …|vlogOffset|packed
 //	10: …|vlogOffset|packed|diskLen|xflags
+//	11: …|vlogOffset|packed|diskLen|xflags|ttlExpiryUs
+//
+// ttlExpiryUs (decimal, absolute Unix µs) is written only for keys with a
+// TTL, and never under --wal-format=text-legacy. Parsers older than it split
+// on at most 10 fields, so they read "xflags|ttl" as the xflags field, fail
+// to parse it and stop replay there — which is why rollback uses text-legacy.
 //
 // followed by "value\n" when !tombstone && valueLen > 0 && vlogOffset == 0.
 // Shorter layouts parse with diskLen = valueLen and xflags = 0 — correct for
@@ -240,7 +295,7 @@ func (r *walReader) nextText() (walReplayEntry, error) {
 	consumed := int64(len(line))
 	line = strings.TrimRight(line, "\r\n")
 
-	parts := strings.SplitN(line, "|", 10)
+	parts := strings.SplitN(line, "|", 11)
 	if len(parts) < 6 {
 		return walReplayEntry{}, errWALTail
 	}
@@ -292,6 +347,15 @@ func (r *walReader) nextText() (walReplayEntry, error) {
 			e.diskLen = uint32(dl)
 		}
 		e.xflags = uint8(xf)
+	}
+	if len(parts) >= 11 {
+		ttl, err := strconv.ParseInt(parts[10], 10, 64)
+		if err != nil {
+			return walReplayEntry{}, errWALTail
+		}
+		if ttl > 0 {
+			e.ttlExpiryUs = ttl
+		}
 	}
 
 	if !e.isTombstone && valueLen > 0 && e.vlogOffset == 0 {

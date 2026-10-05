@@ -163,6 +163,9 @@ func TestCrashRecovery_DirtyShutdownKeepsTransformMetadata(t *testing.T) {
 		}
 		want[k] = v
 	}
+	// A killed process's flock is dropped by the kernel; se1 is never used
+	// again, so release only its data-dir lock (dirlock_test.go).
+	abandonEngineForCrashTest(se1)
 
 	se2 := transformTestEngine(t, dir)
 	t.Cleanup(func() { se2.Close() })

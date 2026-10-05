@@ -159,6 +159,20 @@ func handleExtOp(cmd byte, keyLen, valLen int, br *bufio.Reader, bw *bufio.Write
 		return nil, true
 	}
 
+	// checkRead is checkPerm(PermRead) plus coordinator.readBarrier
+	// (invariant 58). Call it only after the whole frame is consumed: a barrier
+	// failure (MOVED / read-index timeout) is answered as an error frame and the
+	// connection stays open (nil error); an RBAC denial drops it as before.
+	checkRead := func() (error, bool) {
+		if err, ok := checkPerm(security.PermRead); !ok {
+			return err, false
+		}
+		if err := coord.readBarrier(); err != nil {
+			return sendErr(err.Error()), false
+		}
+		return nil, true
+	}
+
 	readStr := func(n int) (string, error) {
 		if n < 0 || n > maxExtStrLen {
 			return "", fmt.Errorf("string field too large: %d", n)
@@ -251,7 +265,7 @@ func handleExtOp(cmd byte, keyLen, valLen int, br *bufio.Reader, bw *bufio.Write
 		if err != nil {
 			return err
 		}
-		if err, ok := checkPerm(security.PermRead); !ok {
+		if err, ok := checkRead(); !ok {
 			return err
 		}
 		kvs, err := engine.RangeScan(start, end, int(int32(valLen)), reverse)
@@ -271,7 +285,7 @@ func handleExtOp(cmd byte, keyLen, valLen int, br *bufio.Reader, bw *bufio.Write
 		if err != nil {
 			return err
 		}
-		if err, ok := checkPerm(security.PermRead); !ok {
+		if err, ok := checkRead(); !ok {
 			return err
 		}
 		kvs, next, err := engine.ScanCursor(cursor, int(int32(valLen)))
@@ -402,7 +416,7 @@ func handleExtOp(cmd byte, keyLen, valLen int, br *bufio.Reader, bw *bufio.Write
 		if err != nil {
 			return err
 		}
-		if err, ok := checkPerm(security.PermRead); !ok {
+		if err, ok := checkRead(); !ok {
 			return err
 		}
 		keys, err := coord.IdxQuery(name, value, int(int32(valLen)))
@@ -466,7 +480,7 @@ func handleExtOp(cmd byte, keyLen, valLen int, br *bufio.Reader, bw *bufio.Write
 		if _, err := io.ReadFull(br, raw); err != nil {
 			return err
 		}
-		if err, ok := checkPerm(security.PermRead); !ok {
+		if err, ok := checkRead(); !ok {
 			return err
 		}
 		query := make([]float32, dim)
@@ -547,7 +561,7 @@ func handleExtOp(cmd byte, keyLen, valLen int, br *bufio.Reader, bw *bufio.Write
 		if err != nil {
 			return err
 		}
-		if err, ok := checkPerm(security.PermRead); !ok {
+		if err, ok := checkRead(); !ok {
 			return err
 		}
 		opts := storage.VectorSearchOptions{Ef: ef}
@@ -591,6 +605,11 @@ func handleExtOp(cmd byte, keyLen, valLen int, br *bufio.Reader, bw *bufio.Write
 		}
 		if err, ok := checkPerm(perm); !ok {
 			return err
+		}
+		if !write {
+			if err := coord.readBarrier(); err != nil {
+				return sendErr(err.Error())
+			}
 		}
 		switch keyLen {
 		case searchSubVCreate:
@@ -700,7 +719,7 @@ func handleExtOp(cmd byte, keyLen, valLen int, br *bufio.Reader, bw *bufio.Write
 		if err != nil {
 			return err
 		}
-		if err, ok := checkPerm(security.PermRead); !ok {
+		if err, ok := checkRead(); !ok {
 			return err
 		}
 		entries, err := coord.Query(ns, field, op, value, int(int32(valLen)))
@@ -725,7 +744,7 @@ func handleExtOp(cmd byte, keyLen, valLen int, br *bufio.Reader, bw *bufio.Write
 		if err != nil {
 			return err
 		}
-		if err, ok := checkPerm(security.PermRead); !ok {
+		if err, ok := checkRead(); !ok {
 			return err
 		}
 		var ver [8]byte

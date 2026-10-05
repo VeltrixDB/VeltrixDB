@@ -123,26 +123,52 @@ func (bc *BinaryConn) Auth(username, password string) error {
 	return nil
 }
 
-// Put sends a single binary PUT and waits for the response.
+// Put writes key=value. ttl is in seconds; ttl ≤ 0 means no expiry.
+//
+// The binary PUT frame (0x01) has no TTL field, so a ttl > 0 is sent as a
+// one-entry MPUT (0x06), whose per-entry header carries it. ttl ≤ 0 uses the
+// plain PUT frame (which the server can coalesce with neighbouring PUTs).
 func (bc *BinaryConn) Put(key string, value []byte, ttl int32) error {
+	if ttl > 0 {
+		errs, err := bc.MPut([]MPutEntry{{Key: key, Value: value, TTL: ttl}})
+		if err != nil {
+			return fmt.Errorf("put %s: %w", key, err)
+		}
+		if len(errs) != 1 {
+			return fmt.Errorf("put %s: mput answered %d entries, want 1", key, len(errs))
+		}
+		if errs[0] != nil {
+			return fmt.Errorf("put %s: %w", key, errs[0])
+		}
+		return nil
+	}
 	if err := bc.writeSingleFrame(binPut, key, value); err != nil {
 		return err
 	}
 	if err := bc.w.Flush(); err != nil {
 		return err
 	}
-	status, _, err := bc.readResp()
+	status, payload, err := bc.readResp()
 	if err != nil {
 		return err
 	}
 	if status != binOK {
-		return fmt.Errorf("put %s: server error", key)
+		return fmt.Errorf("put %s: %s", key, errMsg(payload))
 	}
 	return nil
 }
 
+// errMsg renders an error-frame payload ("server error" when empty).
+func errMsg(payload []byte) string {
+	if len(payload) == 0 {
+		return "server error"
+	}
+	return string(payload)
+}
+
 // Get sends a single binary GET and returns the value.
-// Returns (nil, nil) when the key is not found.
+// Returns (nil, nil) only when the key is not found; an error frame (e.g.
+// MOVED from the raft read barrier) is returned as an error.
 func (bc *BinaryConn) Get(key string) ([]byte, error) {
 	if err := bc.writeSingleFrame(binGet, key, nil); err != nil {
 		return nil, err
@@ -154,10 +180,14 @@ func (bc *BinaryConn) Get(key string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	if status == binNotFound {
+	switch status {
+	case binNotFound:
 		return nil, nil
+	case binOK:
+		return payload, nil
+	default:
+		return nil, fmt.Errorf("get %s: %s", key, errMsg(payload))
 	}
-	return payload, nil
 }
 
 // Delete sends a single binary DEL.
@@ -168,12 +198,12 @@ func (bc *BinaryConn) Delete(key string) error {
 	if err := bc.w.Flush(); err != nil {
 		return err
 	}
-	status, _, err := bc.readResp()
+	status, payload, err := bc.readResp()
 	if err != nil {
 		return err
 	}
 	if status != binOK {
-		return fmt.Errorf("del %s: server error", key)
+		return fmt.Errorf("del %s: %s", key, errMsg(payload))
 	}
 	return nil
 }
@@ -882,7 +912,8 @@ func NewPipeline(bc *BinaryConn) *Pipeline {
 	return &Pipeline{bc: bc, cmds: cmds}
 }
 
-// Put queues a write.
+// Put queues a write. ttl is in seconds (≤ 0 = no expiry); a ttl > 0 is sent
+// as a one-entry MPUT frame, since the binary PUT frame has no TTL field.
 func (p *Pipeline) Put(key string, value []byte, ttl int32) {
 	*p.cmds = append(*p.cmds, pipeCmd{op: binPut, key: key, val: value, ttl: ttl})
 }
@@ -908,7 +939,13 @@ func (p *Pipeline) Exec() ([]PipeResult, error) {
 
 	// Write all frames into the buffered writer without flushing.
 	for _, cmd := range cmds {
-		if err := p.bc.writeSingleFrame(cmd.op, cmd.key, cmd.val); err != nil {
+		var err error
+		if cmd.op == binPut && cmd.ttl > 0 {
+			err = p.bc.writeMPutFrame([]MPutEntry{{Key: cmd.key, Value: cmd.val, TTL: cmd.ttl}})
+		} else {
+			err = p.bc.writeSingleFrame(cmd.op, cmd.key, cmd.val)
+		}
+		if err != nil {
 			return nil, fmt.Errorf("pipeline write: %w", err)
 		}
 	}
@@ -919,7 +956,18 @@ func (p *Pipeline) Exec() ([]PipeResult, error) {
 
 	// Read all N responses in order.
 	results := make([]PipeResult, len(cmds))
-	for i := range cmds {
+	for i, cmd := range cmds {
+		if cmd.op == binPut && cmd.ttl > 0 {
+			errs, err := p.bc.readMPutResp()
+			if err != nil {
+				return nil, fmt.Errorf("pipeline recv[%d]: %w", i, err)
+			}
+			if len(errs) != 1 {
+				return nil, fmt.Errorf("pipeline recv[%d]: mput answered %d entries, want 1", i, len(errs))
+			}
+			results[i] = PipeResult{Err: errs[0]}
+			continue
+		}
 		status, payload, err := p.bc.readResp()
 		if err != nil {
 			return nil, fmt.Errorf("pipeline recv[%d]: %w", i, err)
@@ -973,12 +1021,23 @@ func (bc *BinaryConn) MPut(entries []MPutEntry) ([]error, error) {
 		return nil, nil
 	}
 
+	if err := bc.writeMPutFrame(entries); err != nil {
+		return nil, err
+	}
+	if err := bc.w.Flush(); err != nil {
+		return nil, err
+	}
+	return bc.readMPutResp()
+}
+
+// writeMPutFrame buffers one MPUT frame (no flush).
+func (bc *BinaryConn) writeMPutFrame(entries []MPutEntry) error {
 	// Batch frame header: [0x06][2B 0][4B count LE]
 	var batchHdr [7]byte
 	batchHdr[0] = binMPut
 	binary.LittleEndian.PutUint32(batchHdr[3:], uint32(len(entries)))
 	if _, err := bc.w.Write(batchHdr[:]); err != nil {
-		return nil, err
+		return err
 	}
 
 	// Per-entry: [2B keyLen LE][4B valLen LE][4B ttl LE][key][value]
@@ -988,28 +1047,34 @@ func (bc *BinaryConn) MPut(entries []MPutEntry) ([]error, error) {
 		binary.LittleEndian.PutUint32(entHdr[2:], uint32(len(e.Value)))
 		binary.LittleEndian.PutUint32(entHdr[6:], uint32(e.TTL))
 		if _, err := bc.w.Write(entHdr[:]); err != nil {
-			return nil, err
+			return err
 		}
 		if _, err := bc.w.WriteString(e.Key); err != nil {
-			return nil, err
+			return err
 		}
 		if len(e.Value) > 0 {
 			if _, err := bc.w.Write(e.Value); err != nil {
-				return nil, err
+				return err
 			}
 		}
 	}
-	if err := bc.w.Flush(); err != nil {
-		return nil, err
-	}
+	return nil
+}
 
-	// Read batch response: [1B status][4B count][N × 1B per-entry status]
+// readMPutResp reads [1B status][4B count][count × 1B per-entry status].
+func (bc *BinaryConn) readMPutResp() ([]error, error) {
 	var respHdr [5]byte
 	if _, err := io.ReadFull(bc.r, respHdr[:]); err != nil {
 		return nil, fmt.Errorf("mput resp header: %w", err)
 	}
 	if respHdr[0] != binOK {
-		return nil, fmt.Errorf("mput: server error")
+		// Whole-frame error: [1B 0x01][4B msgLen][msg] (msgLen is 0 for a
+		// bad entry count).
+		msg := make([]byte, binary.LittleEndian.Uint32(respHdr[1:]))
+		if _, err := io.ReadFull(bc.r, msg); err != nil {
+			return nil, fmt.Errorf("mput: server error")
+		}
+		return nil, fmt.Errorf("mput: %s", errMsg(msg))
 	}
 	count := int(binary.LittleEndian.Uint32(respHdr[1:]))
 	statuses := make([]byte, count)
@@ -1070,7 +1135,14 @@ func (bc *BinaryConn) MGet(keys []string) ([]PipeResult, error) {
 		return nil, fmt.Errorf("mget resp header: %w", err)
 	}
 	if respHdr[0] != binOK {
-		return nil, fmt.Errorf("mget: server error")
+		// Whole-batch error (e.g. MOVED from the read barrier):
+		// [1B 0x01][4B msgLen][msg]. Consume the message so the stream stays
+		// in sync and surface it.
+		msg := make([]byte, binary.LittleEndian.Uint32(respHdr[1:]))
+		if _, err := io.ReadFull(bc.r, msg); err != nil {
+			return nil, fmt.Errorf("mget: server error")
+		}
+		return nil, fmt.Errorf("mget: %s", msg)
 	}
 	count := int(binary.LittleEndian.Uint32(respHdr[1:]))
 

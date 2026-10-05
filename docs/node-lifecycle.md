@@ -54,7 +54,7 @@ T≈402 ms node-2's no-op entry ACKed by node-3 (quorum) — one round trip
 
 - **Writes to a non-leader**: answered `MOVED <leader-addr> <leader-id>`, or `MOVED - (leader unknown, retry)` while no leader is known (`cmd/server/coordinator.go`); writes to the dead old leader simply fail to connect. Clients retry with backoff until they reach the new leader.
 - **New writes to `node-2`**: Accepted and committed normally once it is elected (~400–800 ms after the last heartbeat) plus one round trip for the no-op.
-- **Reads from followers**: served from local state (whatever the follower has applied). Stale reads are possible if a follower hasn't received the latest commits yet. With `--linearizable-reads`, followers redirect GETs to the leader, which runs a ReadIndex fence.
+- **Reads from followers**: served from local state (whatever the follower has applied). Stale reads are possible if a follower hasn't received the latest commits yet. With `--linearizable-reads`, followers redirect every read (not only GET) to the leader, which runs a ReadIndex fence.
 - **Reads from the new leader**: held until the new leader has applied its term's no-op (typically one heartbeat round, bounded by 2 s), so they include every write the old leader acknowledged. Before this barrier a GET immediately after failover could return "not found" for an acknowledged write (`TestRaftClusterFailover`).
 - **Searches**: fail with `search incomplete: ... did not answer` naming the dead node until the failure detector marks it failed, then run on the remaining nodes (`--search-allow-partial` answers without it straight away).
 
@@ -241,7 +241,11 @@ func (fd *FailureDetector) attemptNodeRecovery(nodeID string) bool {
 }
 ```
 
-Up to `MaxRecoveryRetries` (3) attempts are made. A failed attempt re-queues the node immediately, so the attempts run back to back, each bounded by the 2 s ping timeout (`RecoveryInterval`, 5 s, only drives an idle ticker). If all fail, the node stays `FAILED` until a heartbeat arrives (see step 6 below) or an operator intervenes.
+Up to `MaxRecoveryRetries` (3) attempts are made. A failed attempt re-queues the node immediately, so the attempts run back to back, each bounded by the 2 s ping timeout. If all fail, the node stays `FAILED` until a heartbeat arrives (see step 6 below) or an operator intervenes.
+
+### RECOVERING → ACTIVE
+
+Every `RecoveryInterval` (5 s) the same worker pings each `RECOVERING` node (`promoteRecoveredNodes`, `cluster/failure_detection.go`). After `RecoveryConfirmations` (2) consecutive successful pings, with a heartbeat younger than `SuspectThreshold` (3 s), the node becomes `ACTIVE` (`veltrixdb_failure_detector_nodes_reactivated_total`); a failed ping resets the count. The transition triggers `Rebalance`, which assigns partitions to ACTIVE nodes only, so the node owns partitions again; in `cmd/server` the auto-rebalancer also sees the ACTIVE event and runs `Rebalance` + `MigrateToNewOwners` after its 3 s debounce. Search fan-out (`PartitionMap.SearchPeers`) skips only FAILED nodes, so a node is searched again as soon as it is RECOVERING. A RECOVERING node whose heartbeats stop is marked SUSPECT / FAILED by the heartbeat checker as usual.
 
 ### Crash Recovery on the Crashed Node
 
@@ -277,10 +281,19 @@ When `node-2` restarts:
 
 6. FailureDetector.RecordHeartbeat("node-2")   (gossip from node-2 again)
    └─ FAILED → UpdateNodeState("node-2", NodeStateRecovering)
-      Nothing moves a node from RECOVERING back to ACTIVE: it stays
-      RECOVERING (shown in /admin/cluster), and Rebalance, which assigns
-      partitions only to ACTIVE nodes, leaves it out of the partition
-      table. Key routing uses the ring, which still contains it.
+      (searched again from here on; key routing uses the ring, which
+       still contains it)
+
+7. Recovery worker, every RecoveryInterval (5 s): 2 consecutive successful
+   pings + fresh heartbeat → UpdateNodeState("node-2", NodeStateActive)
+   └─ Rebalance: node-2 owns partitions again (auto-rebalancer migrates
+      keys after its 3 s debounce)
+
+8. --mode=replicated only: each peer's ReplicationEngine had marked node-2
+   FAILED on its first failed send; its recovery worker probes node-2 with
+   backoff (1 s doubling to 30 s), moves it to SYNC_PENDING, replays the
+   writes node-2 missed and returns it to SYNC (docs/replication.md,
+   Replica Recovery)
 ```
 
 ### Force-Remove (Node Never Comes Back)
@@ -309,7 +322,9 @@ When a crashed node comes back online after repair:
    └─ Node is fully caught up
 6. Peers' failure detectors see its heartbeat again → RECOVERING
    (if it had been marked FAILED; a SUSPECT node goes straight back to ACTIVE)
-7. It never left the ring (only ForceRemoveNode / RemoveNode take it out),
+7. Two consecutive successful recovery pings → ACTIVE, rebalanced back into
+   the partition table
+8. It never left the ring (only ForceRemoveNode / RemoveNode take it out),
    so keys it owns route to it throughout
 ```
 
@@ -337,15 +352,15 @@ cgo builds keep the index off the Go heap, with one `mmap` per large shard array
 
 New builds write **binary WAL records** by default and replay both binary and text, so an upgraded node reads its existing text `wal.log` and appends binary records after it — a rolling upgrade needs no extra step.
 
-A pre-binary build cannot read binary records. To roll a node back:
+A pre-binary build cannot read binary records, and no build older than TTL-in-WAL can read the record of a key with a TTL (binary version 2 or the 11th text field) — it stops replay there and drops every later record. To roll a node back to any older build:
 
 ```
-1. Restart the current build once with --wal-format=text
-2. Stop it cleanly (the clean-shutdown checkpoint rewrites wal.log as text)
+1. Restart the current build once with --wal-format=text-legacy
+2. Stop it cleanly (the clean-shutdown checkpoint rewrites wal.log as text, without TTLs)
 3. Start the older build
 ```
 
-Rolling back a node that was not stopped cleanly after step 1 leaves binary records in `wal.log` that the old build cannot replay.
+Keys written with a TTL come back immortal on the older build. `--wal-format=text` keeps TTLs and is not a rollback mode. Rolling back a node that was not stopped cleanly after step 1 leaves records in `wal.log` that the old build cannot replay.
 
 ---
 
@@ -370,8 +385,9 @@ Rolling back a node that was not stopped cleanly after step 1 leaves binary reco
 | `veltrixdb_failure_detector_nodes_failed_total` | Counter: nodes marked FAILED by the heartbeat monitor |
 | `veltrixdb_failure_detector_nodes_recovered_total` | Counter: nodes that recovered after being marked FAILED. Failed minus recovered over a window = nodes still down |
 | `veltrixdb_failure_detector_false_positives_total` | Nodes suspected then recovered (flapping) |
+| `veltrixdb_failure_detector_nodes_reactivated_total` | RECOVERING nodes promoted back to ACTIVE |
 | `veltrixdb_cluster_nodes_total` | Gauge: registered cluster nodes |
-| `veltrixdb_cluster_partition_migrations_total` | Exported but never incremented (always 0): nothing in `cluster/` adds to `PartitionMigrations`. Use the `[transfer] migration done  moved=N` log line |
+| `veltrixdb_cluster_partition_migrations_total` | Key batches (≤ 500 keys) a new owner acknowledged during migration (`TransferAgent.sendBatches`); keys moved per run are in the `[transfer] migration done  moved=N` log line |
 | `veltrixdb_cluster_rebalances_total` | Partition map rebalances triggered |
 
 There is no gauge for nodes currently in SUSPECT state, and the Raft term and

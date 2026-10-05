@@ -133,6 +133,10 @@ type Defragmenter struct {
 	// device. Nil-safe: nil means "never failed" (tests construct
 	// Defragmenter directly).
 	diskFailed func(int) bool
+
+	// tombstones gates reaping on replica acknowledgement watermarks
+	// (tombstone_replicated.go).  Nil-safe: nil means grace period only.
+	tombstones *TombstoneCoordinator
 }
 
 // skipDisk is the nil-safe breaker check used inside run().
@@ -669,9 +673,10 @@ func (d *Defragmenter) compactVLog(diskIdx int, vl *VLog) {
 // reapExpiredTombstones walks all shards and physically deletes tombstone
 // entries that have outlived the GC grace period.
 //
-// Safety: grace period ≥ max replica lag.  Any replica that still holds a
-// live copy of a tombstoned key will receive the delete via anti-entropy or
-// Read Repair before the tombstone is reaped here.
+// A tombstone older than the grace period is reaped only once every replica
+// that reported a watermark has acknowledged it (canReapTombstone); a
+// replica that never catches up delays it by at most one more grace period.
+// Without replicas (single node, raft mode) the grace period alone applies.
 func (d *Defragmenter) reapExpiredTombstones() {
 	gracePeriodUs := d.config.GCGracePeriodSec * 1_000_000
 	expired := d.index.expiredTombstones(gracePeriodUs)
@@ -683,7 +688,7 @@ func (d *Defragmenter) reapExpiredTombstones() {
 	log.Printf("[gc] tombstones  found=%d expired  grace=%ds  reaping...",
 		len(expired), d.config.GCGracePeriodSec)
 
-	var reaped int
+	var reaped, held int
 	for _, key := range expired {
 		// Double-check under write lock: a concurrent write may have revived
 		// the key between the scan and now.
@@ -695,6 +700,12 @@ func (d *Defragmenter) reapExpiredTombstones() {
 		// Ensure the grace period still holds (clock may have skipped).
 		nowUs := time.Now().UnixMicro()
 		if nowUs-entry.WriteTimestampUs < gracePeriodUs {
+			continue
+		}
+		// A replica has not acknowledged this delete yet: keep the
+		// tombstone so the replica's catch-up still carries it.
+		if !canReapTombstone(d.tombstones, entry.WriteTimestampUs, nowUs, d.config.GCGracePeriodSec) {
+			held++
 			continue
 		}
 
@@ -709,8 +720,8 @@ func (d *Defragmenter) reapExpiredTombstones() {
 		runtime.Gosched()
 	}
 
-	log.Printf("[gc] tombstones  reaped=%d  skipped=%d (revived or grace not elapsed)",
-		reaped, len(expired)-reaped)
+	log.Printf("[gc] tombstones  reaped=%d  held_for_replicas=%d  skipped=%d (revived or grace not elapsed)",
+		reaped, held, len(expired)-reaped-held)
 }
 
 // ── Segment scoring (stubbed; wired when SegmentManager is ready) ─────────────

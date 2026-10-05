@@ -57,27 +57,51 @@ const (
 	// ext_ops.go) — the free slots below 0x29 are nearly used up.
 	binCmdSearch = 0x1C
 
-	// Namespace commands (0x0A–0x0F).
-	// All NS frames use a 9-byte header: [1B cmd][2B nsLen LE][2B keyLen LE][4B aux LE]
-	// NSPUT uses aux = TTL (signed int32); NSSCAN uses aux = limit; others aux = 0.
-	// NSPUT additionally has a 4-byte TTL prefix making its effective header 13 bytes:
-	// [1B cmd][2B nsLen LE][2B keyLen LE][4B valLen LE][4B ttl LE signed]
-	binCmdNSPut  = 0x0A // NSPUT:  13-byte header + ns + key + value
-	binCmdNSGet  = 0x0B // NSGET:   9-byte header + ns + key
-	binCmdNSDel  = 0x0C // NSDEL:   9-byte header + ns + key
-	binCmdNSDrop = 0x0D // NSDROP:  9-byte header + ns  (drops all keys in namespace)
-	binCmdNSScan = 0x0E // NSSCAN:  9-byte header + ns + prefix  (aux=limit)
-	binCmdNSList = 0x0F // NSLIST:  9-byte header (no body)
+	// Namespace commands (0x0A–0x0F). Every binary frame starts with the
+	// standard 7-byte header [1B cmd][2B A LE][4B B LE]; some ops then read a
+	// fixed "extra" block before the body. Layouts below are taken from the
+	// handlers in handleBinaryConn — the parser is the authority:
+	//
+	//   NSPUT  0x0A: [1B][2B nsLen][4B valLen] + [2B keyLen][4B ttl int32] + ns + key + value
+	//                (13 bytes before the body; ttl -1 = no expiry)
+	//   NSGET  0x0B: [1B][2B nsLen][4B keyLen] + ns + key            (7-byte header, no extra)
+	//   NSDEL  0x0C: [1B][2B nsLen][4B keyLen] + ns + key            (7-byte header, no extra)
+	//   NSDROP 0x0D: [1B][2B nsLen][4B 0] + ns                       → OK "deleted=N"
+	//   NSSCAN 0x0E: [1B][2B nsLen][4B limit] + [2B prefixLen] + ns + prefix
+	//                → [1B OK][4B count] + count × [2B keyLen][4B valLen][key][value]
+	//   NSLIST 0x0F: [1B][2B 0][4B 0]                                (no body)
+	//                → [1B OK][4B count] + count × [2B nsLen][4B keyCount][ns]
+	binCmdNSPut  = 0x0A
+	binCmdNSGet  = 0x0B
+	binCmdNSDel  = 0x0C
+	binCmdNSDrop = 0x0D
+	binCmdNSScan = 0x0E
+	binCmdNSList = 0x0F
 
-	// Hash field commands (per-field TTL, 0x10–0x17).
-	binCmdHSet    = 0x10 // HSET:    13-byte header + key + field + value
-	binCmdHGet    = 0x11 // HGET:     9-byte header + key + field
-	binCmdHDel    = 0x12 // HDEL:     9-byte header + key + field
-	binCmdHGetAll = 0x13 // HGETALL:  7-byte header + key
-	binCmdHKeys   = 0x14 // HKEYS:    7-byte header + key
-	binCmdHLen    = 0x15 // HLEN:     7-byte header + key
-	binCmdHExpire = 0x16 // HEXPIRE:  9-byte header + key + field
-	binCmdHTTL    = 0x17 // HTTL:     9-byte header + key + field
+	// Hash field commands (per-field TTL, 0x10–0x17):
+	//
+	//   HSET    0x10: [1B][2B keyLen][4B valLen] + [2B fieldLen][4B ttl int32] + key + field + value
+	//   HGET    0x11: [1B][2B keyLen][4B 0] + [2B fieldLen] + key + field   → OK value | NOT_FOUND
+	//   HDEL    0x12: [1B][2B keyLen][4B 0] + [2B fieldLen] + key + field
+	//   HGETALL 0x13: [1B][2B keyLen][4B 0] + key
+	//                 → [1B OK][4B count] + count × [2B fieldLen][4B valLen][field][value]
+	//   HKEYS   0x14: [1B][2B keyLen][4B 0] + key
+	//                 → [1B OK][4B count] + count × [2B fieldLen][field]
+	//   HLEN    0x15: [1B][2B keyLen][4B 0] + key   → [1B OK][4B count] (no payload follows)
+	//   HEXPIRE 0x16: [1B][2B keyLen][4B ttl int32] + [2B fieldLen] + key + field
+	//   HTTL    0x17: [1B][2B keyLen][4B 0] + [2B fieldLen] + key + field
+	//                 → [1B OK|NOT_FOUND][4B 4][4B ttl int32] (-1 immortal, -2 absent)
+	//
+	// Any op may instead answer [1B 0x01][4B msgLen][msg] — e.g. "MOVED …" from
+	// the raft read barrier (invariant 58) or an RBAC denial.
+	binCmdHSet    = 0x10
+	binCmdHGet    = 0x11
+	binCmdHDel    = 0x12
+	binCmdHGetAll = 0x13
+	binCmdHKeys   = 0x14
+	binCmdHLen    = 0x15
+	binCmdHExpire = 0x16
+	binCmdHTTL    = 0x17
 
 	// Atomic ops (0x18–0x1B).
 	// CAS:   [1B 0x18][2B keyLen][4B expectedLen] + [4B newLen][4B ttl] + key + expected + new
@@ -181,9 +205,11 @@ func main() {
 		"VLog fdatasync group-commit window in milliseconds.\n"+
 			"\tMust equal --wal-flush-window-ms. Concurrent WAL+VLog race; P99 = max(both).")
 	walFormat := flag.String("wal-format", "binary",
-		"Encoding for new WAL records: binary (default) or text.\n"+
-			"\tReplay reads both. text exists only to roll back to a pre-binary build:\n"+
-			"\trun once with it, stop cleanly (the checkpoint rewrites wal.log), then downgrade.")
+		"Encoding for new WAL records: binary (default), text or text-legacy.\n"+
+			"\tReplay reads all three. To roll back to an older build, run once with\n"+
+			"\ttext-legacy, stop cleanly (the checkpoint rewrites wal.log), then downgrade;\n"+
+			"\tit drops key TTLs (TTL'd keys come back immortal), which builds without\n"+
+			"\tTTL-in-WAL cannot read. text keeps TTLs and is readable only by builds that have it.")
 	walMaxBatch := flag.Int("wal-max-batch", 4096,
 		"Maximum WAL entries per group-commit flush before the timer fires early.\n"+
 			"\tRaise if write rate exceeds window×max_batch (e.g. 100K/s × 0.005s = 500 → 4096 is headroom).")
@@ -934,6 +960,17 @@ func handleTextConn(conn net.Conn, br *bufio.Reader, engine *storage.StorageEngi
 		w.Flush()
 	}
 
+	// checkRead gates every read command: RBAC, then coordinator.readBarrier
+	// (invariant 58) so a raft leader elected moments ago — or any node under
+	// --linearizable-reads — never answers from stale local state. GET is the
+	// one exception: coord.Get runs the barrier itself.
+	checkRead := func() error {
+		if err := ca.Check(security.PermRead); err != nil {
+			return err
+		}
+		return coord.readBarrier()
+	}
+
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" {
@@ -1003,8 +1040,9 @@ func handleTextConn(conn net.Conn, br *bufio.Reader, engine *storage.StorageEngi
 				writeLine("OK")
 			}
 
-		// PUTEX <key> <ttl-seconds> <value> — PUT with expiration (text-protocol
-		// counterpart of the binary PUT's TTL field).
+		// PUTEX <key> <ttl-seconds> <value> — PUT with expiration. The binary
+		// PUT frame (0x01) has no TTL field; binary clients send a TTL through
+		// a one-entry MPUT (0x06), whose per-entry header carries it.
 		case "PUTEX":
 			if err := ca.Check(security.PermWrite); err != nil {
 				writeLine("ERR " + err.Error())
@@ -1106,17 +1144,13 @@ func handleTextConn(conn net.Conn, br *bufio.Reader, engine *storage.StorageEngi
 
 		// MGET <key> [key ...] — one "<key> <value>" line per found key, END.
 		case "MGET":
-			if err := ca.Check(security.PermRead); err != nil {
+			if err := checkRead(); err != nil {
 				writeLine("ERR " + err.Error())
 				continue
 			}
 			keys := strings.Fields(line)[1:]
 			if len(keys) == 0 {
 				writeLine("ERR usage: MGET <key> [key ...]")
-				continue
-			}
-			if err := coord.readBarrier(); err != nil {
-				writeLine("ERR " + err.Error())
 				continue
 			}
 			for _, k := range keys {
@@ -1166,7 +1200,7 @@ func handleTextConn(conn net.Conn, br *bufio.Reader, engine *storage.StorageEngi
 
 		// LLEN <key>
 		case "LLEN":
-			if err := ca.Check(security.PermRead); err != nil {
+			if err := checkRead(); err != nil {
 				writeLine("ERR " + err.Error())
 				continue
 			}
@@ -1178,7 +1212,7 @@ func handleTextConn(conn net.Conn, br *bufio.Reader, engine *storage.StorageEngi
 
 		// LRANGE <key> <start> <stop>  (Redis semantics, stop inclusive, negatives from end)
 		case "LRANGE":
-			if err := ca.Check(security.PermRead); err != nil {
+			if err := checkRead(); err != nil {
 				writeLine("ERR " + err.Error())
 				continue
 			}
@@ -1232,7 +1266,7 @@ func handleTextConn(conn net.Conn, br *bufio.Reader, engine *storage.StorageEngi
 
 		// SISMEMBER <key> <member>
 		case "SISMEMBER":
-			if err := ca.Check(security.PermRead); err != nil {
+			if err := checkRead(); err != nil {
 				writeLine("ERR " + err.Error())
 				continue
 			}
@@ -1248,7 +1282,7 @@ func handleTextConn(conn net.Conn, br *bufio.Reader, engine *storage.StorageEngi
 
 		// SMEMBERS <key>
 		case "SMEMBERS":
-			if err := ca.Check(security.PermRead); err != nil {
+			if err := checkRead(); err != nil {
 				writeLine("ERR " + err.Error())
 				continue
 			}
@@ -1263,7 +1297,7 @@ func handleTextConn(conn net.Conn, br *bufio.Reader, engine *storage.StorageEngi
 
 		// SCARD <key>
 		case "SCARD":
-			if err := ca.Check(security.PermRead); err != nil {
+			if err := checkRead(); err != nil {
 				writeLine("ERR " + err.Error())
 				continue
 			}
@@ -1341,7 +1375,7 @@ func handleTextConn(conn net.Conn, br *bufio.Reader, engine *storage.StorageEngi
 
 		// NSGET <namespace> <key>
 		case "NSGET":
-			if err := ca.Check(security.PermRead); err != nil {
+			if err := checkRead(); err != nil {
 				writeLine("ERR " + err.Error())
 				continue
 			}
@@ -1394,7 +1428,7 @@ func handleTextConn(conn net.Conn, br *bufio.Reader, engine *storage.StorageEngi
 
 		// NSSCAN <namespace> [prefix] [limit]
 		case "NSSCAN":
-			if err := ca.Check(security.PermRead); err != nil {
+			if err := checkRead(); err != nil {
 				writeLine("ERR " + err.Error())
 				continue
 			}
@@ -1424,7 +1458,7 @@ func handleTextConn(conn net.Conn, br *bufio.Reader, engine *storage.StorageEngi
 
 		// NSLIST  — lists all namespaces with key counts
 		case "NSLIST":
-			if err := ca.Check(security.PermRead); err != nil {
+			if err := checkRead(); err != nil {
 				writeLine("ERR " + err.Error())
 				continue
 			}
@@ -1458,7 +1492,7 @@ func handleTextConn(conn net.Conn, br *bufio.Reader, engine *storage.StorageEngi
 
 		// HGET <key> <field>
 		case "HGET":
-			if err := ca.Check(security.PermRead); err != nil {
+			if err := checkRead(); err != nil {
 				writeLine("ERR " + err.Error())
 				continue
 			}
@@ -1493,7 +1527,7 @@ func handleTextConn(conn net.Conn, br *bufio.Reader, engine *storage.StorageEngi
 
 		// HGETALL <key>  → count\nfield\nvalue\n...
 		case "HGETALL":
-			if err := ca.Check(security.PermRead); err != nil {
+			if err := checkRead(); err != nil {
 				writeLine("ERR " + err.Error())
 				continue
 			}
@@ -1515,7 +1549,7 @@ func handleTextConn(conn net.Conn, br *bufio.Reader, engine *storage.StorageEngi
 
 		// HKEYS <key>  → count\nfield1\nfield2\n...
 		case "HKEYS":
-			if err := ca.Check(security.PermRead); err != nil {
+			if err := checkRead(); err != nil {
 				writeLine("ERR " + err.Error())
 				continue
 			}
@@ -1532,7 +1566,7 @@ func handleTextConn(conn net.Conn, br *bufio.Reader, engine *storage.StorageEngi
 
 		// HLEN <key>  → N
 		case "HLEN":
-			if err := ca.Check(security.PermRead); err != nil {
+			if err := checkRead(); err != nil {
 				writeLine("ERR " + err.Error())
 				continue
 			}
@@ -1563,7 +1597,7 @@ func handleTextConn(conn net.Conn, br *bufio.Reader, engine *storage.StorageEngi
 
 		// HTTL <key> <field>  → N  (-1=immortal, -2=not found)
 		case "HTTL":
-			if err := ca.Check(security.PermRead); err != nil {
+			if err := checkRead(); err != nil {
 				writeLine("ERR " + err.Error())
 				continue
 			}
@@ -1577,7 +1611,7 @@ func handleTextConn(conn net.Conn, br *bufio.Reader, engine *storage.StorageEngi
 		// ── Ordered range scans ────────────────────────────────────────────
 		// RANGE <start> <end> [LIMIT n] [REV]  →  "key value" lines + END
 		case "RANGE":
-			if err := ca.Check(security.PermRead); err != nil {
+			if err := checkRead(); err != nil {
 				writeLine("ERR " + err.Error())
 				continue
 			}
@@ -1605,7 +1639,7 @@ func handleTextConn(conn net.Conn, br *bufio.Reader, engine *storage.StorageEngi
 		// SCANCUR <cursor> <limit>  — cursor "-" starts from the beginning.
 		// Response: "key value" lines, then "CURSOR <next>" ("-" = exhausted).
 		case "SCANCUR":
-			if err := ca.Check(security.PermRead); err != nil {
+			if err := checkRead(); err != nil {
 				writeLine("ERR " + err.Error())
 				continue
 			}
@@ -1721,7 +1755,7 @@ func handleTextConn(conn net.Conn, br *bufio.Reader, engine *storage.StorageEngi
 
 		// VER <key>  →  optimistic version token (0 = absent). Pass to SETIF.
 		case "VER":
-			if err := ca.Check(security.PermRead); err != nil {
+			if err := checkRead(); err != nil {
 				writeLine("ERR " + err.Error())
 				continue
 			}
@@ -1769,7 +1803,7 @@ func handleTextConn(conn net.Conn, br *bufio.Reader, engine *storage.StorageEngi
 
 		// IDXQUERY <name> <value> [LIMIT n]  →  primary-key lines + END
 		case "IDXQUERY":
-			if err := ca.Check(security.PermRead); err != nil {
+			if err := checkRead(); err != nil {
 				writeLine("ERR " + err.Error())
 				continue
 			}
@@ -1833,7 +1867,7 @@ func handleTextConn(conn net.Conn, br *bufio.Reader, engine *storage.StorageEngi
 		//   →  "id score" lines + END
 		// FILTER is a QUERY predicate on the KV record whose key is the id.
 		case "VSEARCH":
-			if err := ca.Check(security.PermRead); err != nil {
+			if err := checkRead(); err != nil {
 				writeLine("ERR " + err.Error())
 				continue
 			}
@@ -1995,7 +2029,7 @@ func handleTextConn(conn net.Conn, br *bufio.Reader, engine *storage.StorageEngi
 		//         [VEC <f1> ... <fn>] QUERY <text>
 		//   →  "id score" lines + END (HSEARCH scores are RRF scores)
 		case "TSEARCH", "HSEARCH":
-			if err := ca.Check(security.PermRead); err != nil {
+			if err := checkRead(); err != nil {
 				writeLine("ERR " + err.Error())
 				continue
 			}
@@ -2025,7 +2059,7 @@ func handleTextConn(conn net.Conn, br *bufio.Reader, engine *storage.StorageEngi
 		// parsed as JSON objects or "k=v" pairs. Uses a secondary index for
 		// "=" on an indexed field, else scans the namespace.
 		case "QUERY":
-			if err := ca.Check(security.PermRead); err != nil {
+			if err := checkRead(); err != nil {
 				writeLine("ERR " + err.Error())
 				continue
 			}
@@ -2436,6 +2470,18 @@ func handleBinaryConn(conn net.Conn, br *bufio.Reader, engine *storage.StorageEn
 		return bw.Flush()
 	}
 
+	// readBlocked runs coordinator.readBarrier (invariant 58) for a read op
+	// whose frame has already been consumed. On failure (MOVED, read-index
+	// timeout) it answers [0x01][4B len][msg] and returns true; the connection
+	// stays usable.
+	readBlocked := func() bool {
+		if err := coord.readBarrier(); err != nil {
+			_ = sendResp(binStatusErr, []byte(err.Error()))
+			return true
+		}
+		return false
+	}
+
 	hdr := make([]byte, 7) // 1 cmd + 2 keyLen + 4 valLen — allocated once per conn
 
 	// Two scratch buffers for the readv pre-fill.  Each is half the bufio
@@ -2483,10 +2529,10 @@ func handleBinaryConn(conn net.Conn, br *bufio.Reader, engine *storage.StorageEn
 			continue
 		}
 
-		// ── NSPUT (0x0A) — 13-byte header ────────────────────────────────────
-		// Header: [1B cmd][2B nsLen LE][2B keyLen LE][4B valLen LE][4B ttl LE signed]
+		// ── NSPUT (0x0A) — 13 bytes before the body ──────────────────────────
+		// Header: [1B cmd][2B nsLen LE][4B valLen LE] + [2B keyLen LE][4B ttl LE signed]
 		// The standard 7-byte hdr read above gives us: keyLen=nsLen, valLen=valLen.
-		// We need to read 2 extra bytes for the actual keyLen + 4 bytes for TTL.
+		// Then 2 extra bytes for the actual keyLen + 4 bytes for TTL.
 		if cmd == binCmdNSPut {
 			if err := ca.Check(security.PermWrite); err != nil {
 				_ = sendResp(binStatusErr, []byte(err.Error()))
@@ -2615,6 +2661,9 @@ func handleBinaryConn(conn net.Conn, br *bufio.Reader, engine *storage.StorageEn
 			if totalNeed <= maxPooledPayload {
 				binPayloadPool.Put(payPtr)
 			}
+			if cmd != binCmdHDel && readBlocked() {
+				continue
+			}
 			switch cmd {
 			case binCmdHGet:
 				val, err := engine.HGet(hKey, hField)
@@ -2681,9 +2730,9 @@ func handleBinaryConn(conn net.Conn, br *bufio.Reader, engine *storage.StorageEn
 			continue
 		}
 
-		// ── NSSCAN (0x0E) — 9-byte header ────────────────────────────────────
-		// Header: [1B cmd][2B nsLen LE][2B prefixLen LE][4B limit LE]
-		// keyLen=nsLen, valLen=limit (reusing standard field positions)
+		// ── NSSCAN (0x0E) — 9 bytes before the body ──────────────────────────
+		// Header: [1B cmd][2B nsLen LE][4B limit LE] + [2B prefixLen LE]
+		// Body:   ns[nsLen] + prefix[prefixLen]
 		if cmd == binCmdNSScan {
 			if err := ca.Check(security.PermRead); err != nil {
 				_ = sendResp(binStatusErr, []byte(err.Error()))
@@ -2693,21 +2742,11 @@ func handleBinaryConn(conn net.Conn, br *bufio.Reader, engine *storage.StorageEn
 			limit := valLen
 			// Read ns + prefix payload
 			payPtr := binPayloadPool.Get().(*[]byte)
-			prefixLen := 0 // will be computed from remaining bytes after ns
-			// We must peek how many bytes remain for prefix; the frame doesn't encode prefixLen separately.
-			// Convention: payload = ns bytes + prefix bytes; prefix fills the rest.
-			// So we encoded the outer keyLen as nsLen, valLen as prefixLen-encoded-as-int.
-			// Actually: keyLen=nsLen, valLen=prefixLen (outer header), then the payload buffer.
-			// Here valLen was parsed as limit. We need prefixLen from somewhere.
-			// Simplest fix: encode ns and prefix together with limit in aux.
-			// Already read: hdr[1:3]=nsLen, hdr[3:7]=limit. But we lost prefixLen.
-			// Solution: read 2 more bytes for prefixLen, then ns + prefix.
-			// Extra 2 bytes:
 			var prefixLenBuf [2]byte
 			if _, err := io.ReadFull(br, prefixLenBuf[:]); err != nil {
 				return
 			}
-			prefixLen = int(binary.LittleEndian.Uint16(prefixLenBuf[:]))
+			prefixLen := int(binary.LittleEndian.Uint16(prefixLenBuf[:]))
 			totalNeed := nsLen + prefixLen
 			if cap(*payPtr) < totalNeed {
 				*payPtr = make([]byte, totalNeed)
@@ -2724,6 +2763,9 @@ func handleBinaryConn(conn net.Conn, br *bufio.Reader, engine *storage.StorageEn
 			prefix := string((*payPtr)[nsLen:])
 			if totalNeed <= maxPooledPayload {
 				binPayloadPool.Put(payPtr)
+			}
+			if readBlocked() {
+				continue
 			}
 			if err := handleNSScan(ns, prefix, limit, bw, engine); err != nil {
 				return
@@ -2976,7 +3018,7 @@ func handleBinaryConn(conn net.Conn, br *bufio.Reader, engine *storage.StorageEn
 					continue
 				}
 				for _, r := range engine.MultiGet(keys) {
-					if !r.Found || r.Value == nil {
+					if !r.Found {
 						_ = writeResp(binStatusNotFound, nil)
 					} else {
 						_ = writeResp(binStatusOK, r.Value)
@@ -3031,8 +3073,8 @@ func handleBinaryConn(conn net.Conn, br *bufio.Reader, engine *storage.StorageEn
 			_ = sendResp(binStatusOK, []byte(info))
 
 		// ── Namespace single-op commands ────────────────────────────────────
-		// NSGET (0x0B) and NSDEL (0x0C) share the same 9-byte header layout:
-		//   [1B cmd][2B nsLen LE][2B keyLen LE][4B 0]
+		// NSGET (0x0B) and NSDEL (0x0C) use the plain 7-byte header:
+		//   [1B cmd][2B nsLen LE][4B keyLen LE] + ns + key
 		// key field in the standard 7-byte hdr holds nsLen; val field holds keyLen.
 		// The actual key follows ns in the payload.
 		case binCmdNSGet:
@@ -3047,10 +3089,13 @@ func handleBinaryConn(conn net.Conn, br *bufio.Reader, engine *storage.StorageEn
 			// here: keyLen=nsLen, valLen=keyLen in the outer header
 			ns := string(payload[:keyLen])
 			k := string(payload[keyLen:])
-			val, err := engine.GetNS(ns, k)
 			if need <= maxPooledPayload {
 				binPayloadPool.Put(payPtr)
 			}
+			if readBlocked() {
+				continue
+			}
+			val, err := engine.GetNS(ns, k)
 			if err != nil {
 				_ = sendResp(binStatusNotFound, nil)
 			} else {
@@ -3078,7 +3123,7 @@ func handleBinaryConn(conn net.Conn, br *bufio.Reader, engine *storage.StorageEn
 			}
 			continue
 
-		// NSDROP (0x0D): [1B cmd][2B nsLen LE][2B 0][4B 0] + ns bytes
+		// NSDROP (0x0D): [1B cmd][2B nsLen LE][4B 0] + ns bytes
 		// keyLen=nsLen, valLen=0 in the outer header
 		case binCmdNSDrop:
 			if err := ca.Check(security.PermDelete); err != nil {
@@ -3112,6 +3157,9 @@ func handleBinaryConn(conn net.Conn, br *bufio.Reader, engine *storage.StorageEn
 			if need <= maxPooledPayload {
 				binPayloadPool.Put(payPtr)
 			}
+			if readBlocked() {
+				continue
+			}
 			if err := handleNSList(bw, engine); err != nil {
 				return
 			}
@@ -3131,6 +3179,9 @@ func handleBinaryConn(conn net.Conn, br *bufio.Reader, engine *storage.StorageEn
 			if need <= maxPooledPayload {
 				binPayloadPool.Put(payPtr)
 			}
+			if readBlocked() {
+				continue
+			}
 			if err := handleHGetAll(hKey, bw, engine); err != nil {
 				return
 			}
@@ -3148,6 +3199,9 @@ func handleBinaryConn(conn net.Conn, br *bufio.Reader, engine *storage.StorageEn
 			if need <= maxPooledPayload {
 				binPayloadPool.Put(payPtr)
 			}
+			if readBlocked() {
+				continue
+			}
 			if err := handleHKeys(hKey, bw, engine); err != nil {
 				return
 			}
@@ -3161,10 +3215,13 @@ func handleBinaryConn(conn net.Conn, br *bufio.Reader, engine *storage.StorageEn
 				}
 				continue
 			}
-			count := engine.HLen(key)
 			if need <= maxPooledPayload {
 				binPayloadPool.Put(payPtr)
 			}
+			if readBlocked() {
+				continue
+			}
+			count := engine.HLen(key)
 			var lenResp [5]byte
 			lenResp[0] = binStatusOK
 			binary.LittleEndian.PutUint32(lenResp[1:], uint32(count))
@@ -3338,7 +3395,7 @@ func handleMGet(count int, br *bufio.Reader, bw *bufio.Writer, engine *storage.S
 
 	var entHdr [5]byte
 	for _, r := range results {
-		if !r.Found || r.Value == nil {
+		if !r.Found {
 			entHdr[0] = binStatusNotFound
 			binary.LittleEndian.PutUint32(entHdr[1:], 0)
 			if _, err := bw.Write(entHdr[:]); err != nil {
@@ -3510,15 +3567,25 @@ func listenPort(addr string) int {
 	return port
 }
 
+// printBanner prints the startup banner. It names only what this build
+// actually runs: the index line comes from storage.IndexImpl() (native
+// off-heap C++ hash table or Go map). The ART index and io_uring scheduler
+// under cpp/ are compiled but not wired (cpp/README.md, invariant 9), so the
+// banner does not claim them.
 func printBanner(addr, nodeID, dataDir string, diskPaths []string) {
+	index := "Go map (VELTRIXDB_INDEX=map or no cgo)"
+	if storage.IndexImpl() == "native" {
+		index = "native off-heap C++ hash table"
+	}
 	fmt.Printf(`
 ╔══════════════════════════════════════════════════╗
 ║           VeltrixDB — shard-per-core KV          ║
-║  ART index · LIRS cache · io_uring scheduler     ║
+║        hash index · LIRS cache · WAL+VLog        ║
 ╚══════════════════════════════════════════════════╝
   node    : %s
   listen  : %s
-`, nodeID, addr)
+  index   : %s
+`, nodeID, addr, index)
 
 	if len(diskPaths) > 0 {
 		fmt.Printf("  disks   : %d NVMe  (%d shards each)\n", len(diskPaths), 256/len(diskPaths))

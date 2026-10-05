@@ -12,8 +12,9 @@ import (
 // TCPConn is a single persistent TCP connection to a VeltrixDB node.
 // It speaks the line-based protocol:
 //
-//	PUT <key> <value>\n  →  OK\n
-//	GET <key>\n          →  <value>\n  |  ERR …\n
+//	PUT <key> <value>\n               →  OK\n
+//	PUTEX <key> <ttl-sec> <value>\n   →  OK\n
+//	GET <key>\n                       →  <value>\n  |  ERR key not found\n  |  ERR …\n
 //	DEL <key>\n          →  OK\n
 //	PING\n               →  PONG\n
 //	INFO\n               →  <stats line>\n
@@ -58,8 +59,36 @@ func (tc *TCPConn) Put(key string, value []byte) error {
 	return nil
 }
 
+// PutEx sends PUTEX <key> <ttl> <value>: a PUT that expires after ttlSeconds
+// (must be ≥ 1; use Put for no expiry).
+func (tc *TCPConn) PutEx(key string, ttlSeconds int32, value []byte) error {
+	if ttlSeconds < 1 {
+		return fmt.Errorf("putex %s: ttl must be >= 1 second, got %d", key, ttlSeconds)
+	}
+	fmt.Fprintf(tc.w, "PUTEX %s %d %s\n", key, ttlSeconds, value)
+	if err := tc.w.Flush(); err != nil {
+		return err
+	}
+	line, err := tc.readLine()
+	if err != nil {
+		return err
+	}
+	if line != "OK" {
+		return fmt.Errorf("putex: %s", line)
+	}
+	return nil
+}
+
+// Text-protocol GET miss replies (storage.ErrKeyNotFound / ErrKeyExpired).
+const (
+	errLineNotFound = "ERR key not found"
+	errLineExpired  = "ERR key expired"
+)
+
 // Get sends GET <key> and returns the value.
-// Returns (nil, nil) when the key is not found (not counted as an error).
+// Returns (nil, nil) only for a genuine miss (absent or expired key). Any
+// other ERR reply — MOVED from a raft follower under --linearizable-reads, a
+// read-index timeout, an RBAC denial — is returned as an error.
 func (tc *TCPConn) Get(key string) ([]byte, error) {
 	fmt.Fprintf(tc.w, "GET %s\n", key)
 	if err := tc.w.Flush(); err != nil {
@@ -69,8 +98,11 @@ func (tc *TCPConn) Get(key string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	if line == errLineNotFound || line == errLineExpired {
+		return nil, nil
+	}
 	if strings.HasPrefix(line, "ERR") {
-		return nil, nil // key not found — caller decides whether this is an error
+		return nil, fmt.Errorf("get %s: %s", key, strings.TrimPrefix(line, "ERR "))
 	}
 	return []byte(line), nil
 }

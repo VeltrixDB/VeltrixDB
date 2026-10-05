@@ -154,7 +154,7 @@ New records are binary (`storage/wal_format.go`), all integers little-endian:
 ```
 Offset  Size  Field
   0      1    Magic 0xB1 (a text record always starts with an ASCII digit)
-  1      1    Format version (1)
+  1      1    Format version (1; 2 = record carries a TTL, see below)
   2      2    Flags: bit0 tombstone, bit1 packed, bit2 value inline
   4      4    Key length
   8      4    valueLen  (plaintext length)
@@ -171,6 +171,18 @@ Offset  Size  Field
  end     4    CRC32C of every byte above
 ```
 
+**TTL (version 2).** A key written with a TTL gets a version-2 record: the
+same 48-byte header with byte 1 = 2, then an 8-byte `int64` at offset 48 — the
+key's **absolute** expiry in Unix microseconds (`IndexEntry.TTLExpiryUs`, a
+deadline, not a duration) — then key, value and CRC as above. Records without
+a TTL are still version 1, byte for byte, so existing WAL files and the no-TTL
+write path are unchanged. Every write path that sets a TTL carries it: `Put` /
+`PUTEX`, `MultiPut` entries (MPUT, TXN, the WriteBatcher, coalesced PUTs),
+`PutNS`, `HSET` / `HEXPIRE` (hash fields are ordinary keys), and CAS / INCR /
+DECR / SETNX. Before this the WAL had no TTL field, so after any restart —
+crash replay or clean checkpoint — every TTL'd key came back immortal, and a
+key that had expired came back to life.
+
 Records are length-prefixed, so key bytes are never interpreted: keys
 containing `|` or `\n` are safe. (With the text format such a key made replay
 stop at that record and drop every later acknowledged write on crash restart.)
@@ -179,22 +191,36 @@ had no checksum.
 
 Replay also reads the legacy text records below, in any mix with binary ones
 (the first byte decides, per record), so an upgraded node keeps appending
-binary records after existing text ones. `--wal-format=text` writes text, and
-exists only to roll back to a pre-binary build: run once with it and stop
-cleanly (the checkpoint rewrites `wal.log` as text), then downgrade. The field
-meanings are the same in both.
+binary records after existing text ones. The field meanings are the same in
+both.
+
+**Rollback.** No build older than the TTL field can read a version-2 record or
+a text record with the 11th (TTL) field: its decoder treats either as a torn
+tail, stops replay there and drops that record **and every record after it**.
+So to roll back to *any* older build — pre-binary or not — run the new build
+once with `--wal-format=text-legacy` and stop cleanly: the checkpoint rewrites
+`wal.log` as 8/10-field text with no TTL field, which every build since the
+text format reads; then downgrade. The cost is that keys written with a TTL
+come back **immortal** on the older build — what that build did to them on
+every restart anyway. `--wal-format=text` writes text *with* the TTL field and
+is therefore readable only by builds that have it; it is not a rollback mode.
+A PITR archive written by this build is likewise unreadable by an older
+`restore-pitr` once it holds a TTL'd key (that restore fails with "truncated
+or malformed" rather than silently dropping records).
 
 Legacy text record:
 
 ```
-timestamp|isTombstone|key|valueLen|crc32hex|version|vlogOffset|packed|diskLen|xflags
+timestamp|isTombstone|key|valueLen|crc32hex|version|vlogOffset|packed|diskLen|xflags|ttlExpiryUs
 [value bytes]
 ```
 
 Fields 9–10 are emitted **only when they carry information** (a transform was
-applied, or the on-disk length differs from the plaintext length). An
-untransformed record still writes 8 fields, which is what keeps older binaries
-able to read newly-written data.
+applied, or the on-disk length differs from the plaintext length), and field
+11 only for a key with a TTL (which forces 9–10 out too, as the layout is
+positional; `text-legacy` never writes it). An untransformed, TTL-free record
+still writes 8 fields, which is what keeps older binaries able to read
+newly-written data.
 
 | Field | Type | Meaning |
 |-------|------|---------|
@@ -208,6 +234,7 @@ able to read newly-written data.
 | `packed` | "1"/"0" | VLog block packing flag |
 | `diskLen` | decimal | On-disk blob length **after** compression + encryption |
 | `xflags` | hex | Transform bits: `FlagCompressed` (0x02), `FlagEncrypted` (0x04) |
+| `ttlExpiryUs` | decimal | Absolute expiry, Unix µs (omitted = no TTL) |
 
 > `valueLen` is the **plaintext** length and `diskLen` is what actually sits
 > on disk. Conflating them — or dropping `xflags` — makes replay rebuild an
@@ -346,8 +373,9 @@ Every startup replays the WAL; after an unclean shutdown (crash, OOM kill, SIGKI
 2. For each record (binary or legacy text): decode it and check its CRC32C. Crash replay, the PITR archiver and PITR restore all use the same decoder (`walReader`). A torn or corrupt record ends replay: everything before it is applied, and the server logs `[wal] replay of <path> stopped at byte N of M after K records: <err>`.
 3. **`applyWALReplay()`** rebuilds the in-memory `shardedIndex` in the background. The engine accepts traffic immediately; replay uses `replayPut` / `replayMarkTombstone`, so a live write arriving during warm-up always wins over older replayed data. `ReplayDone` is closed when it finishes.
 4. For KV-sep records (`vlogOffset > 0`): the VLog already has the value bytes; the WAL entry re-establishes the index pointer (with its on-disk length, packed flag and transform flags) without re-reading the value. A legacy record with inline value bytes is re-appended to the VLog through the compress → encrypt pipeline.
-5. Legacy 6-, 7-, 8- and 10-field text entries are still parsed for backward compatibility. A record with fewer than 10 fields replays with no transform flags, which is correct — it was written untransformed.
+5. Legacy 6-, 7-, 8-, 10- and 11-field text entries are still parsed for backward compatibility. A record with fewer than 10 fields replays with no transform flags, which is correct — it was written untransformed.
+6. **TTL.** A record carrying a TTL (binary version 2, text field 11) restores `FlagHasTTL` + `TTLExpiryUs` on the rebuilt entry. One whose expiry has already passed at replay is applied as an expiry — the key is tombstoned exactly as the TTL scanner would have done, superseding any older record for it — so an expired key is never resurrected (neither its TTL'd value nor an older immortal one). Records without a TTL (everything written before the field existed) replay as immortal keys, as they always did.
 
 **Search indexes** are not in the WAL or the checkpoint as such: vectors, text documents and vector-namespace settings are ordinary reserved keys (`@vec/<ns>/<id>`, `@txt/<ns>/<id>`, `@vecns/<ns>`), replayed like any key. After replay the server runs `RebuildSearchIndexes` in the background and refuses searches until it finishes, unless `--search-allow-partial` (`INFO` → `search_ready`). Secondary-index entries (`@idx/...`) are durable keys too; their definitions are re-registered at startup from `index_defs.json` (and, in `--mode=replicated`, travel between nodes as `@idxdef/<name>` keys). See [vector-search.md](vector-search.md#durability-and-restarts).
 
-On clean shutdown (`SIGTERM`): the engine writes a compacted checkpoint WAL (one record per live key, tombstones dropped) to `wal.log.ckpt` and atomically renames it over `wal.log`, so a crash mid-checkpoint leaves the old WAL intact. Next startup replays O(numLiveKeys) records instead of the full write history. The checkpoint uses the current `--wal-format`.
+On clean shutdown (`SIGTERM`): the engine writes a compacted checkpoint WAL (one record per live key, each with its absolute TTL expiry; tombstones and already-expired keys dropped) to `wal.log.ckpt` and atomically renames it over `wal.log`, so a crash mid-checkpoint leaves the old WAL intact. Next startup replays O(numLiveKeys) records instead of the full write history. The checkpoint uses the current `--wal-format`.

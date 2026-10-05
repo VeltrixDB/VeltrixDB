@@ -17,7 +17,7 @@ VeltrixDB stores data across two files per disk:
 
 The in-memory index is **not** backed up — it is fully rebuilt from the WAL on startup (see Crash Recovery in `storage.md`). Backing up the WAL + VLog is sufficient.
 
-**WAL encoding.** The backed-up `wal.log` and PITR archive segments are written in the engine's `--wal-format` — binary by default; the `veltrixdb-backup` CLI, which opens the engine itself, always writes binary, and `restore-pitr` always appends binary records. Any build that reads binary WAL also reads legacy text, so restoring into the same or a newer build always works. A pre-binary build cannot read binary records: to restore into one, restore with the current build, start the server once with `--wal-format=text` and stop it cleanly (the shutdown checkpoint rewrites `wal.log` as text), then start the older build. Keys containing `|` or a newline are not crash-safe in the text format.
+**WAL encoding.** The backed-up `wal.log` and PITR archive segments are written in the engine's `--wal-format` — binary by default; the `veltrixdb-backup` CLI, which opens the engine itself, always writes binary, and `restore-pitr` always appends binary records. Any build that reads binary WAL also reads legacy text, so restoring into the same or a newer build always works. An older build cannot read binary records (pre-binary builds) or records of keys with a TTL (builds before TTL-in-WAL): to restore into one, restore with the current build, start the server once with `--wal-format=text-legacy` and stop it cleanly (the shutdown checkpoint rewrites `wal.log` as text without TTLs — TTL'd keys become immortal there), then start the older build. Keys containing `|` or a newline are not crash-safe in the text format. Backups, checkpoints and PITR archive records carry each key's absolute TTL expiry, so a restored key expires when the original would have, and one that expired before the restore stays gone.
 
 ---
 
@@ -95,7 +95,8 @@ manifest, err := be.FullBackup("/backups/full-20260523")
 Against a **running** server, use the admin API (`POST /admin/backup`, loopback-only unless `--admin-token` is set). The backup is written by the server process, so `dest_dir` is a path on the server's filesystem:
 
 ```bash
-# Full backup (what `veltrix backup DEST_DIR` sends; the veltrix CLI sends no admin token)
+# Full backup (what `veltrix backup DEST_DIR` sends). With --admin-token on the server,
+# add -H "Authorization: Bearer $TOKEN" to curl and --admin-token "$TOKEN" (or VELTRIX_ADMIN_TOKEN) to veltrix
 curl -s -X POST localhost:2112/admin/backup -d '{"type":"full","dest_dir":"/backups/full-20260523"}'
 veltrix --addr 127.0.0.1:2112 backup /backups/full-20260523
 
@@ -106,7 +107,7 @@ curl -s -X POST localhost:2112/admin/backup \
 
 The response is JSON with `status`, `type`, `backup_id`, `dest_dir`, `num_disks`, `duration_ms` and the full `manifest`.
 
-`veltrixdb-backup` (`cmd/backup`) opens the data directories with **its own engine instance** and backs that up. Run it only against the data dirs of a **stopped** server: pointed at a live server's directories it runs a second engine on the same files (no lock prevents it), and in testing this produced an empty backup and truncated the live `wal.log` and `vlog_active.dat`.
+`veltrixdb-backup` (`cmd/backup`) opens the data directories with **its own engine instance** and backs that up, so it works only on the data dirs of a **stopped** server. Every engine holds an exclusive lock on `<data-dir>/LOCK` while it runs, so pointed at a live server's directories the tool refuses to start — `data directory is locked by another VeltrixDB engine: <dir> (… held by pid N since …)` — and tells you to use `POST /admin/backup` or `veltrix backup` instead; the live files are not touched. (Builds before this lock opened a second engine on the same files, which produced an empty backup and truncated the live `wal.log` and `vlog_active.dat`.) `restore` and `restore-pitr` take the same lock on their destination dirs and refuse a dir a running engine has open.
 
 ```bash
 # Full backup of a stopped node's data dirs

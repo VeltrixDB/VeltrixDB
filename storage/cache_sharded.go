@@ -108,13 +108,21 @@ func (c *shardedLIRSCache) Get(key string) ([]byte, bool) { return c.shardFor(ke
 
 // getHashed is Get for callers that already hold fnv64a(key), so the read
 // path hashes once rather than once per subsystem.
-func (c *shardedLIRSCache) getHashed(key string, h uint64) ([]byte, bool) {
-	return c.shards[h>>c.shift].Get(key)
+func (c *shardedLIRSCache) getHashed(key string, h uint64) ([]byte, int64, bool) {
+	return c.shards[h>>c.shift].getHashed(key, h)
 }
 func (c *shardedLIRSCache) Put(key string, value []byte) { c.shardFor(key).Put(key, value) }
 
+func (c *shardedLIRSCache) PutWithExpiry(key string, value []byte, expiresUs int64) {
+	c.shardFor(key).PutWithExpiry(key, value, expiresUs)
+}
+
 func (c *shardedLIRSCache) PutIfPresent(key string, value []byte) bool {
 	return c.shardFor(key).PutIfPresent(key, value)
+}
+
+func (c *shardedLIRSCache) PutIfPresentWithExpiry(key string, value []byte, expiresUs int64) bool {
+	return c.shardFor(key).PutIfPresentWithExpiry(key, value, expiresUs)
 }
 func (c *shardedLIRSCache) Evict(key string) { c.shardFor(key).Evict(key) }
 
@@ -159,6 +167,8 @@ func cacheShardCount(c Cache) int {
 
 // compile-time guarantee that both cache types satisfy the interface.
 var (
-	_ Cache = (*shardedLIRSCache)(nil)
-	_ Cache = (*LIRSCache)(nil)
+	_ Cache        = (*shardedLIRSCache)(nil)
+	_ Cache        = (*LIRSCache)(nil)
+	_ hashedGetter = (*shardedLIRSCache)(nil)
+	_ hashedGetter = (*LIRSCache)(nil)
 )

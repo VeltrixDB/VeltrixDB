@@ -223,6 +223,14 @@ func buildReplicatedCoordinator(p clusterParams) (*coordinator, func(), *replica
 		return nil, nil, nil, fmt.Errorf("replication server: %w", err)
 	}
 
+	// Recovery of a FAILED replica replays retained ops; if some were dropped
+	// from the retention buffer it first reads this node's durable change
+	// feed (index-backed, tombstones included).
+	re.SetCatchUpSource(engineCatchUp(pCurrentEngine, p.nodeID))
+	// Tombstone GC waits for every replica to acknowledge a delete (bounded
+	// by 2 × the grace period — storage/tombstone_replicated.go).
+	re.SetWatermarkObserver(pCurrentEngine.SetReplicaWatermark)
+
 	for _, pr := range p.peers {
 		if err := re.AddReplica(pr.id, pr.host, pr.clientPort); err != nil {
 			log.Printf("[repl] add replica %s: %v", pr.id, err)
@@ -273,5 +281,61 @@ func parseConsistency(s string) (replication.ConsistencyLevel, error) {
 		return replication.StrongConsistency, nil
 	default:
 		return replication.EventualConsistency, fmt.Errorf("unknown --consistency %q (want eventual|quorum|strong)", s)
+	}
+}
+
+// catchUpPageSize is the number of change-feed events per catch-up page.
+const catchUpPageSize = 1000
+
+// changeFeed is the subset of *storage.StorageEngine engineCatchUp needs.
+type changeFeed interface {
+	ChangesSince(sinceUs int64, limit int) storage.ChangesSinceResult
+	GetTTLForKey(key string) int32
+}
+
+// engineCatchUp adapts StorageEngine.ChangesSince to replication.CatchUpFunc:
+// the current value (or tombstone) of every key written since the cursor, in
+// timestamp order, one page per emit.  Values carry their remaining TTL; a
+// key with under a second left is skipped (it expires on the replica anyway).
+func engineCatchUp(se changeFeed, nodeID string) replication.CatchUpFunc {
+	return func(sinceNs int64, emit func([]*replication.WriteOperation) error) error {
+		cursor := sinceNs / 1000
+		limit := catchUpPageSize
+		for {
+			page := se.ChangesSince(cursor, limit)
+			ops := make([]*replication.WriteOperation, 0, len(page.Events))
+			for _, ev := range page.Events {
+				op := &replication.WriteOperation{
+					Key:       ev.Key,
+					Timestamp: ev.Timestamp * 1000,
+					NodeID:    nodeID,
+				}
+				if ev.Op == "DEL" {
+					op.IsTombstone = true
+				} else {
+					ttl := se.GetTTLForKey(ev.Key)
+					if ttl == 0 {
+						continue // expired or about to
+					}
+					op.Value, op.TTL = ev.Value, ttl
+				}
+				ops = append(ops, op)
+			}
+			if len(ops) > 0 {
+				if err := emit(ops); err != nil {
+					return err
+				}
+			}
+			if !page.More {
+				return nil
+			}
+			// The cursor is inclusive; if a whole page shares one timestamp
+			// it would not advance, so widen the page instead.
+			if page.Cursor == cursor {
+				limit *= 2
+				continue
+			}
+			cursor, limit = page.Cursor, catchUpPageSize
+		}
 	}
 }

@@ -126,7 +126,7 @@ Each cluster node cycles through these states:
 | `ACTIVE` | Fully operational, accepting reads and writes |
 | `SUSPECT` | No heartbeat for 3 s — health uncertain; back to ACTIVE on the next heartbeat |
 | `FAILED` | No heartbeat for 10 s — left out of `Rebalance`'s partition table and of search fan-out (it stays on the ring) |
-| `RECOVERING` | A FAILED node heartbeated again, or answered the recovery ping. Like FAILED it is left out of `Rebalance`; nothing in `cluster/` moves it back to ACTIVE |
+| `RECOVERING` | A FAILED node heartbeated again, or answered the recovery ping. Left out of `Rebalance` but included in search fan-out. After 2 consecutive successful recovery pings (one per `RecoveryInterval`, 5 s) with a fresh heartbeat it returns to ACTIVE and `Rebalance` runs |
 | `DRAINING` | Set by `RemoveNodeAndRebalance` just before the node is removed from the ring |
 
 States are derived locally: each node's `FailureDetector` checks heartbeat ages every second. Heartbeats arrive through **gossip** — every second a node exchanges digests with 3 random peers, and a node whose heartbeat counter advanced in a digest counts as alive (so liveness spreads transitively). Receivers do not adopt the sender's view of node states. With `--auto-rebalance` (default on), joins, removals, and transitions to FAILED / ACTIVE / RECOVERING trigger `Rebalance` + `MigrateToNewOwners` after a 3 s debounce (`cmd/server/rebalancer.go`).
@@ -197,7 +197,7 @@ Fan out to destination nodes in parallel:
 
 **Pinned keys**: `@vecns/<ns>` (vector namespace settings) and `@idxdef/<name>` (secondary-index definitions) are needed on every node, so they are *copied* to each destination — placed at the head of its key list, ahead of the migrated keys — and never deleted locally.
 
-**Search indexes follow the keys**: the destination's `Put` and the source's `Delete` run the engine's search hooks, so migrated vectors and documents become searchable on the new owner and disappear from the old one. (Before these hooks, migrated vectors stayed searchable on the source and were unsearchable on the destination.)
+**Search indexes follow the keys**: the destination's `Put` and the source's `Delete` run the engine's search hooks, so migrated vectors and documents become searchable on the new owner and disappear from the old one. (Before these hooks, migrated vectors stayed searchable on the source and were unsearchable on the destination.) Within each destination's list, vectors, text documents and index entries are sent before records: deleting a record also deletes its vectors and documents, so a record is only deleted locally once all of its derived keys were delivered.
 
 **Authentication**: with `--cluster-secret-file` (or `VELTRIXDB_CLUSTER_SECRET`; at least 16 bytes, whitespace trimmed) every request on the transfer listener — `/transfer/keys` and the distributed-search endpoint `/internal/search` — carries `X-Veltrix-Cluster-Time` (unix seconds) and `X-Veltrix-Cluster-Auth` (hex HMAC-SHA256 over time, method, path and body), and is refused (HTTP 401) if it does not verify or is more than 5 minutes off the receiver's clock. `/transfer/health` stays open. Without a secret or mTLS (`--cluster-mtls`) the server logs `[transfer] WARNING: listener <addr> is unauthenticated (no --cluster-secret-file and no mTLS) ...`.
 
@@ -275,7 +275,7 @@ pm.ForceRemoveNode(nodeID, 256)
     (no data migration — surviving replicas are the source of truth)
 ```
 
-Nothing re-creates the lost copies afterwards: the Replication Engine's anti-entropy only re-sends un-acked writes to lagging replicas and never copies existing data, so the replication factor stays reduced for keys the dead node held.
+Nothing re-creates the lost copies afterwards: the Replication Engine's anti-entropy and replica recovery only re-send writes a replica missed (from the retention buffer or the change feed) and never copy existing data to a new node, so the replication factor stays reduced for keys the dead node held.
 
 ---
 
@@ -321,6 +321,7 @@ pm.Rebalance(...)    → Version++
 | `HeartbeatInterval` | 1 s | Failure-detector check interval |
 | `SuspectThreshold` | 3 s | Heartbeat age before SUSPECT |
 | `FailureThreshold` | 10 s | Heartbeat age before FAILED |
+| `RecoveryInterval` / `RecoveryConfirmations` | 5 s / 2 | Recovery-ping cadence, and consecutive successful pings before RECOVERING → ACTIVE |
 | `rebalanceDebounce` | 3 s | Auto-rebalance debounce (`--auto-rebalance`, default true) |
 | `transferBatchSize` | 500 keys | Keys per HTTP migration batch |
 | `transferHTTPTimeout` | 60 s | Timeout per migration HTTP call |

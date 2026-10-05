@@ -133,11 +133,26 @@ func (ts *textServer) handle(conn net.Conn) {
 			ts.storeMu.Lock()
 			v, ok := ts.store[parts[1]]
 			ts.storeMu.Unlock()
-			if !ok {
-				flush("ERR not found")
-			} else {
+			switch {
+			case parts[1] == "moved-key":
+				flush("ERR MOVED 10.0.0.2:9000 node-2")
+			case !ok:
+				flush("ERR key not found") // the real server's miss reply
+			default:
 				flush(v)
 			}
+
+		case "PUTEX":
+			full := strings.SplitN(line, " ", 4)
+			if len(full) < 4 {
+				flush("ERR usage: PUTEX <key> <ttl-seconds> <value>")
+				continue
+			}
+			ts.storeMu.Lock()
+			ts.store[full[1]] = full[3]
+			ts.store["ttl:"+full[1]] = full[2]
+			ts.storeMu.Unlock()
+			flush("OK")
 
 		case "DEL":
 			if !authed {
@@ -338,5 +353,48 @@ func TestPut_Overwrite(t *testing.T) {
 	val, _ := conn.Get("k")
 	if string(val) != "v2" {
 		t.Fatalf("expected overwritten value v2, got %q", val)
+	}
+}
+
+// TestGet_ServerError_ReturnsError: an ERR reply other than a miss (here a
+// MOVED redirect) must surface as an error, not as (nil, nil).
+func TestGet_ServerError_ReturnsError(t *testing.T) {
+	ts := newTextServer(t)
+	conn, err := DialTCP(ts.addr(), time.Second)
+	if err != nil {
+		t.Fatalf("DialTCP: %v", err)
+	}
+	defer conn.Close()
+
+	val, err := conn.Get("moved-key")
+	if err == nil || !strings.Contains(err.Error(), "MOVED 10.0.0.2:9000") {
+		t.Fatalf("Get: val=%q err=%v, want MOVED error", val, err)
+	}
+	if target, ok := parseMoved(err.Error()); !ok || target != "10.0.0.2:9000" {
+		t.Fatalf("parseMoved(%q) = %q, %v", err.Error(), target, ok)
+	}
+}
+
+// TestPutEx_SendsTTL: PutEx sends PUTEX with the TTL; ttl < 1 is refused
+// client-side (the server would reject it).
+func TestPutEx_SendsTTL(t *testing.T) {
+	ts := newTextServer(t)
+	conn, err := DialTCP(ts.addr(), time.Second)
+	if err != nil {
+		t.Fatalf("DialTCP: %v", err)
+	}
+	defer conn.Close()
+
+	if err := conn.PutEx("k", 42, []byte("v w")); err != nil {
+		t.Fatalf("PutEx: %v", err)
+	}
+	ts.storeMu.Lock()
+	v, ttl := ts.store["k"], ts.store["ttl:k"]
+	ts.storeMu.Unlock()
+	if v != "v w" || ttl != "42" {
+		t.Fatalf("server saw value=%q ttl=%q, want \"v w\" / 42", v, ttl)
+	}
+	if err := conn.PutEx("k", 0, []byte("v")); err == nil {
+		t.Fatal("PutEx with ttl 0 should fail client-side")
 	}
 }

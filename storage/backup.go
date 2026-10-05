@@ -254,6 +254,15 @@ func Restore(chain []*BackupManifest, backupRoots []string, destDirs []string) e
 		}
 	}
 
+	// Hold the data-dir lock for the whole restore: writing wal.log /
+	// vlog_active.dat under a running engine corrupts it. Fails with
+	// ErrDataDirLocked when an engine has the dir open.
+	locks, err := lockDataDirs(destDirs)
+	if err != nil {
+		return fmt.Errorf("restore: %w", err)
+	}
+	defer releaseDirLocks(locks)
+
 	for diskIdx := 0; diskIdx < numDisks; diskIdx++ {
 		destVLog := filepath.Join(destDirs[diskIdx], "vlog_active.dat")
 

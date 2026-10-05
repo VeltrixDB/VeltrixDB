@@ -41,8 +41,13 @@ const virtualNodesPerNode = 64
 // maxRedirects bounds how many MOVED hops a single request will follow.
 const maxRedirects = 3
 
-// ConsistencyLevel defines read/write consistency (advisory; the server
-// enforces the actual guarantee per its --mode / --consistency configuration).
+// ConsistencyLevel names a read/write consistency level.
+//
+// It is NOT sent to the server: the wire protocol has no per-request
+// consistency field. The guarantee is fixed server-side by --mode
+// (raft: quorum-committed writes; replicated: --consistency) and, for reads in
+// raft mode, --linearizable-reads. ClientConfig.ConsistencyLevel and
+// WithConsistency are kept only for source compatibility and have no effect.
 type ConsistencyLevel int
 
 const (
@@ -55,7 +60,7 @@ const (
 type ClientConfig struct {
 	ConnectionTimeoutMs int32
 	RequestTimeoutMs    int32
-	ConsistencyLevel    ConsistencyLevel
+	ConsistencyLevel    ConsistencyLevel // no effect — see ConsistencyLevel
 	RetryCount          int
 	BackoffBaseMs       int32
 	RefreshIntervalMs   int32
@@ -271,17 +276,22 @@ type putOptions struct {
 // PutOption customizes a Put.
 type PutOption func(*putOptions)
 
-// WithTTL sets a per-key TTL in seconds (-1 = immortal).
+// WithTTL sets a per-key TTL in seconds (≤ 0 = immortal). A TTL ≥ 1 is sent
+// as PUTEX <key> <ttl> <value>.
 func WithTTL(ttlSeconds int32) PutOption { return func(o *putOptions) { o.TTL = ttlSeconds } }
 
-// WithConsistency requests a consistency level (advisory).
+// WithConsistency has no effect: the protocol carries no per-request
+// consistency level (see ConsistencyLevel).
+//
+// Deprecated: configure consistency on the server (--mode, --consistency,
+// --linearizable-reads).
 func WithConsistency(level ConsistencyLevel) PutOption {
 	return func(o *putOptions) { o.ConsistencyLevel = level }
 }
 
 type getOptions struct{ ConsistencyLevel ConsistencyLevel }
 
-// GetOption customizes a Get.
+// GetOption customizes a Get. No option currently changes what is sent.
 type GetOption func(*getOptions)
 
 // ── Public API ──────────────────────────────────────────────────────────────
@@ -293,47 +303,42 @@ func (c *Client) Put(ctx context.Context, key string, value []byte, opts ...PutO
 	for _, fn := range opts {
 		fn(o)
 	}
-	return c.writeWithRedirect(key, func(tc *TCPConn) error {
+	return c.withRedirect("write", key, func(tc *TCPConn) error {
+		if o.TTL > 0 {
+			return tc.PutEx(key, o.TTL, value)
+		}
 		return tc.Put(key, value)
 	})
 }
 
 // Delete removes key, with the same routing/redirect behaviour as Put.
 func (c *Client) Delete(ctx context.Context, key string) error {
-	return c.writeWithRedirect(key, func(tc *TCPConn) error {
+	return c.withRedirect("write", key, func(tc *TCPConn) error {
 		return tc.Delete(key)
 	})
 }
 
 // Get retrieves key.  Reads are served from the contacted node's local state
-// (fast, possibly stale in raft/replicated modes — see the server consistency
-// notes).  Returns (nil, nil) when the key is absent.
+// after its read barrier (raft mode: a freshly elected leader first applies
+// its term's no-op; with --linearizable-reads the ReadIndex fence runs and
+// followers answer MOVED, which Get follows like Put does). Returns (nil, nil)
+// only when the key is absent; any other server error is returned.
 func (c *Client) Get(ctx context.Context, key string, opts ...GetOption) ([]byte, error) {
-	addr := c.addrForKey(key)
-	var lastErr error
-	for attempt := 0; attempt < c.retries(); attempt++ {
-		tc, err := c.getConn(addr)
-		if err != nil {
-			lastErr = err
-			c.backoff(attempt)
-			_ = c.refreshTopology()
-			addr = c.addrForKey(key)
-			continue
-		}
-		val, err := tc.Get(key)
-		if err != nil {
-			c.dropConn(addr)
-			lastErr = err
-			c.backoff(attempt)
-			continue
-		}
-		return val, nil
+	var val []byte
+	err := c.withRedirect("get", key, func(tc *TCPConn) error {
+		v, err := tc.Get(key)
+		val = v
+		return err
+	})
+	if err != nil {
+		return nil, err
 	}
-	return nil, fmt.Errorf("get %q failed: %w", key, lastErr)
+	return val, nil
 }
 
-// writeWithRedirect runs op against the key's owner, following MOVED redirects.
-func (c *Client) writeWithRedirect(key string, op func(*TCPConn) error) error {
+// withRedirect runs op against the key's owner, following MOVED redirects.
+// what ("write" / "get") only labels the final error.
+func (c *Client) withRedirect(what, key string, op func(*TCPConn) error) error {
 	addr := c.addrForKey(key)
 	var lastErr error
 	for attempt := 0; attempt < c.retries(); attempt++ {
@@ -388,7 +393,7 @@ func (c *Client) writeWithRedirect(key string, op func(*TCPConn) error) error {
 		_ = c.refreshTopology()
 		addr = c.addrForKey(key)
 	}
-	return fmt.Errorf("write %q failed: %w", key, lastErr)
+	return fmt.Errorf("%s %q failed: %w", what, key, lastErr)
 }
 
 func (c *Client) retries() int {

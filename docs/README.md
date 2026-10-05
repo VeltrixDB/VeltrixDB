@@ -8,7 +8,7 @@ Technical documentation for VeltrixDB internals.
 |----------|---------------|
 | [../ARCHITECTURE.md](../ARCHITECTURE.md) | **Start here** — system diagram, write/read path sequences, shard routing, durability, admission control, GC tiers, the real C++ boundary |
 | [storage.md](storage.md) | How data is stored: sharding, WAL, VLog, Index Vault, LIRS cache, defragmentation, crash recovery |
-| [replication.md](replication.md) | Raft consensus replication + async Replication Engine; consistency levels; anti-entropy; version vectors |
+| [replication.md](replication.md) | Raft consensus replication + async Replication Engine; consistency levels; replica recovery; anti-entropy; tombstone watermarks |
 | [partitioning.md](partitioning.md) | Consistent hash ring; virtual nodes; partition assignment; rebalancing; data migration via TransferAgent |
 | [node-lifecycle.md](node-lifecycle.md) | Node failover (leader election timeline); node addition; graceful removal; crash detection and recovery |
 | [backup-restore.md](backup-restore.md) | Full and incremental backup (`POST /admin/backup`, `veltrixdb-backup`); cloud backup (S3/GCS/Azure); restore procedure; point-in-time recovery (WAL archiving, `restore-pitr`); backup safety guarantees |

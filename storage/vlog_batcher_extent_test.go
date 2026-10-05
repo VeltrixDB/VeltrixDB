@@ -97,6 +97,8 @@ func TestMultiPut_ConcurrentBatchExtentsSurviveDirtyRestart(t *testing.T) {
 	}
 	<-se1.ReplayDone
 	want := writeConcurrentBatches(t, se1, 8, 256)
+	// Simulated kill: drop se1's data-dir lock without Close (dirlock_test.go).
+	abandonEngineForCrashTest(se1)
 
 	se2, err := NewStorageEngine(testStorageConfig(dir))
 	if err != nil {

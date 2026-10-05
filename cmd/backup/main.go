@@ -55,11 +55,18 @@
 //	GCS:   GOOGLE_APPLICATION_CREDENTIALS (service account file) or GCS_ACCESS_TOKEN
 //	Azure: AZURE_STORAGE_ACCOUNT, AZURE_STORAGE_KEY, AZURE_STORAGE_CONTAINER
 //
-// The engine must be STOPPED before running restore.
-// Full and incremental backups are safe to run against a live engine.
+// Every command that reads or writes data dirs (full, incremental, full-cloud,
+// restore, restore-pitr) opens them itself, so the server must be STOPPED.
+// To back up a RUNNING server use its online backup instead:
+// `POST /admin/backup` on the metrics port, or `veltrix backup DEST_DIR`.
+// The engine holds an exclusive lock on <data-dir>/LOCK while it runs, so
+// pointing this tool at a live server's dirs fails with a clear error instead
+// of opening a second engine over the live WAL / VLog (which used to truncate
+// wal.log and vlog_active.dat).
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -107,9 +114,11 @@ func usage() {
 	fmt.Fprintln(os.Stderr, `veltrixdb-backup <command> [flags]
 
 Local commands:
-  full            Create a full backup (engine can be running)
-  incremental     Create an incremental backup relative to a base (engine can be running)
+  full            Create a full backup of a STOPPED server's data dirs
+  incremental     Create an incremental backup relative to a base (server stopped)
   restore         Restore from a backup chain (engine must be stopped)
+
+  For a RUNNING server use POST /admin/backup or 'veltrix backup' instead.
 
 Point-in-time recovery:
   archive-status  Show WAL-archive segments, version and time coverage
@@ -220,7 +229,7 @@ func cmdRestore(args []string) {
 
 	start := time.Now()
 	if err := storage.Restore(manifests, chainDirs, destDirs); err != nil {
-		log.Fatalf("restore: %v", err)
+		log.Fatalf("restore: %v", explainLocked(err))
 	}
 	fmt.Printf("restore complete\n  chain:   %d steps\n  dest:    %s\n  elapsed: %s\n",
 		len(chainDirs), *dataDirs, time.Since(start).Round(time.Millisecond))
@@ -522,7 +531,28 @@ func openEngine(dataDirsFlag string, cacheMB int) (*storage.StorageEngine, error
 	// Use very short flush windows so we don't block during backup.
 	cfg.WALFlushWindowMs = 1
 	cfg.VLogFlushWindowMs = 1
-	return storage.NewStorageEngine(cfg)
+	se, err := storage.NewStorageEngine(cfg)
+	if err != nil {
+		return nil, explainLocked(err)
+	}
+	return se, nil
+}
+
+// liveServerHint is appended when the data dirs belong to a running engine.
+const liveServerHint = `these data dirs are in use by a running VeltrixDB server (or another tool).
+veltrixdb-backup opens the data dirs with its own engine and only works on a STOPPED server.
+To back up a running server, use its online backup instead:
+  curl -X POST http://<host>:<metrics-port>/admin/backup -d '{"type":"full","dest_dir":"/backup/DIR"}'
+  veltrix --addr <host>:<metrics-port> backup /backup/DIR
+(dest_dir / DIR is a path on the server's host), or stop the server and re-run this command.`
+
+// explainLocked turns storage.ErrDataDirLocked into an actionable message;
+// other errors pass through unchanged.
+func explainLocked(err error) error {
+	if errors.Is(err, storage.ErrDataDirLocked) {
+		return fmt.Errorf("%w\n%s", err, liveServerHint)
+	}
+	return err
 }
 
 func splitTrim(s string) []string {

@@ -288,7 +288,7 @@ func vxnfExec(h C.uintptr_t, reqs *C.vxnf_req, n C.int, tCall C.uint64_t) {
 				ch.jobs = append(ch.jobs, func(respond func([]byte)) {
 					for _, i := range pending {
 						v, err := probe.GetAfterNoIO(keys[i])
-						results[i] = storage.MultiGetResult{Key: keys[i], Value: v, Found: err == nil && v != nil, Err: err}
+						results[i] = storage.MultiGetResult{Key: keys[i], Value: v, Found: err == nil, Err: err}
 					}
 					respond(appendMGetResponse(nil, results))
 				})
@@ -445,7 +445,7 @@ func mgetNoIO(p noIOGetter, keys []string) (results []storage.MultiGetResult, pe
 			pending = append(pending, i)
 			continue
 		}
-		results[i] = storage.MultiGetResult{Key: k, Value: v, Found: err == nil && v != nil, Err: err}
+		results[i] = storage.MultiGetResult{Key: k, Value: v, Found: err == nil, Err: err}
 	}
 	return results, pending
 }
@@ -498,7 +498,7 @@ func appendMGetResponse(b []byte, results []storage.MultiGetResult) []byte {
 	b = append(b, statusOK)
 	b = binary.LittleEndian.AppendUint32(b, uint32(len(results)))
 	for _, r := range results {
-		if !r.Found || r.Value == nil {
+		if !r.Found {
 			b = append(b, statusNotFound, 0, 0, 0, 0)
 			continue
 		}

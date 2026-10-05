@@ -10,21 +10,36 @@ import (
 // hash the caller already computed. shardedLIRSCache implements it; plain
 // LIRSCache does not need to (it has no shard to select). The read path type-
 // asserts once at engine construction rather than per operation.
+//
+// It also returns the entry's absolute TTL deadline (UnixMicro, 0 = immortal)
+// so the engine can refuse an expired hit without consulting the index: a
+// cache hit returns before the index is ever read, so without the deadline a
+// TTL'd key stayed readable from cache until the background TTL scanner
+// tombstoned it (30 s by default). Both cache types implement it.
 type hashedGetter interface {
-	getHashed(key string, h uint64) ([]byte, bool)
+	getHashed(key string, h uint64) (value []byte, expiresUs int64, ok bool)
 }
 
 // Cache is the pluggable data-block cache interface.  Eviction applies only to
 // this layer; the Index Vault (shardedIndex) is never evicted.
 type Cache interface {
 	Get(key string) ([]byte, bool)
+	// Put is PutWithExpiry with no deadline.
 	Put(key string, value []byte)
+	// PutWithExpiry inserts or updates key and records expiresUs, the key's
+	// absolute TTL deadline in UnixMicro (0 = immortal), which getHashed
+	// returns so the engine can treat an expired hit as a miss. Every engine
+	// write and read-fill path must use it with the IndexEntry's deadline.
+	PutWithExpiry(key string, value []byte, expiresUs int64)
 	// PutIfPresent refreshes an already-resident key and reports whether it
 	// did. It is the write-around counterpart to Put: a caller that must not
 	// serve a stale value, but has no reason to believe the key will be read
 	// soon, uses it so bulk writes neither insert into the cache nor evict
 	// what is already there. See its use in multiPutKVSep.
 	PutIfPresent(key string, value []byte) bool
+	// PutIfPresentWithExpiry is PutIfPresent that also replaces the resident
+	// node's TTL deadline (see PutWithExpiry).
+	PutIfPresentWithExpiry(key string, value []byte, expiresUs int64) bool
 	Evict(key string)
 	Size() uint64
 	Stats() CacheStats
@@ -57,6 +72,9 @@ type lirsNode struct {
 	size     uint64
 	isLIR    bool
 	resident bool // false = ghost: key tracked in S but value evicted
+	// expiresUs is the key's absolute TTL deadline (UnixMicro), 0 = immortal.
+	// Fits in the struct's existing padding-free layout as one int64.
+	expiresUs int64
 	// priority encodes value-awareness: 2 = small (≤ smallValueThreshold),
 	// 1 = large.  Used by the eviction scan to prefer large cold victims.
 	priority uint8
@@ -134,8 +152,30 @@ func (c *LIRSCache) Get(key string) ([]byte, bool) {
 	return node.value, true
 }
 
-// Put inserts or updates a value.  New entries always enter as HIR resident.
-func (c *LIRSCache) Put(key string, value []byte) {
+// getHashed is Get that also returns the node's TTL deadline. h is unused —
+// a single LIRSCache has no shard to select — but the signature matches the
+// sharded cache so the engine read path needs no type switch.
+func (c *LIRSCache) getHashed(key string, _ uint64) ([]byte, int64, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	node, ok := c.index[key]
+	if !ok || !node.resident {
+		c.missCount.Add(1)
+		return nil, 0, false
+	}
+
+	c.access(node)
+	c.hitCount.Add(1)
+	return node.value, node.expiresUs, true
+}
+
+// Put inserts or updates a value with no TTL deadline.
+func (c *LIRSCache) Put(key string, value []byte) { c.PutWithExpiry(key, value, 0) }
+
+// PutWithExpiry inserts or updates a value.  New entries always enter as HIR
+// resident.
+func (c *LIRSCache) PutWithExpiry(key string, value []byte, expiresUs int64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -145,6 +185,7 @@ func (c *LIRSCache) Put(key string, value []byte) {
 		oldSize := node.size
 		node.value = value
 		node.size = size
+		node.expiresUs = expiresUs
 
 		if node.resident {
 			delta := int64(size) - int64(oldSize)
@@ -180,12 +221,13 @@ func (c *LIRSCache) Put(key string, value []byte) {
 			p = 2
 		}
 		node := &lirsNode{
-			key:      key,
-			value:    value,
-			size:     size,
-			isLIR:    false,
-			resident: true,
-			priority: p,
+			key:       key,
+			value:     value,
+			size:      size,
+			isLIR:     false,
+			resident:  true,
+			priority:  p,
+			expiresUs: expiresUs,
 		}
 		node.sElem = c.S.PushFront(node)
 		node.qElem = c.Q.PushFront(node)
@@ -214,6 +256,13 @@ func (c *LIRSCache) Put(key string, value []byte) {
 // A non-resident node that exists only as LIRS history is left non-resident:
 // it carries no value, so it cannot go stale.
 func (c *LIRSCache) PutIfPresent(key string, value []byte) bool {
+	return c.PutIfPresentWithExpiry(key, value, 0)
+}
+
+// PutIfPresentWithExpiry is PutIfPresent that also replaces the node's TTL
+// deadline, so a batch overwrite that adds, changes or removes a TTL is seen
+// by the next cache hit.
+func (c *LIRSCache) PutIfPresentWithExpiry(key string, value []byte, expiresUs int64) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -226,6 +275,7 @@ func (c *LIRSCache) PutIfPresent(key string, value []byte) bool {
 	delta := int64(size) - int64(node.size)
 	node.value = value
 	node.size = size
+	node.expiresUs = expiresUs
 	if node.isLIR {
 		c.lirBytes = addDelta(c.lirBytes, delta)
 	} else {

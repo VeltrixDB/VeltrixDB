@@ -20,7 +20,8 @@
 //   repl-ship --src http://primary:2112 \
 //             --dst-tcp replica.us-east:9000 \
 //             --batch 64 \
-//             --checkpoint /var/lib/repl-ship/ckpt
+//             --checkpoint /var/lib/repl-ship/ckpt \
+//             --admin-token "$VELTRIX_ADMIN_TOKEN"   # when the source uses --admin-token
 //
 // REMAINING GAPS:
 //   - No conflict resolution beyond last-write-wins (relies on remote's
@@ -40,6 +41,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"strconv"
@@ -77,8 +79,10 @@ func main() {
 	srcTokenFlag := flag.String("src-token", os.Getenv("VELTRIX_ADMIN_TOKEN"),
 		"admin token for the source's /admin/* endpoints (env VELTRIX_ADMIN_TOKEN);\n"+
 			"required when the source runs with --admin-token")
+	adminTokenFlag := flag.String("admin-token", "",
+		"alias for --src-token (same name as the veltrix / kubectl-veltrix flag); wins when both are set")
 	flag.Parse()
-	srcToken = *srcTokenFlag
+	srcToken = resolveToken(*srcTokenFlag, *adminTokenFlag)
 	if *dstTCP == "" {
 		log.Fatal("--dst-tcp is required")
 	}
@@ -122,14 +126,14 @@ func main() {
 	}
 
 	// Subscribe to local CDC.
-	url := fmt.Sprintf("%s/admin/cdc?prefix=%s", *src, *prefix)
-	resp, err := adminGet(url)
+	resp, err := adminGet(cdcURL(*src, *prefix))
 	if err != nil {
 		log.Fatalf("CDC subscribe: %v", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
-		log.Fatalf("CDC subscribe: HTTP %d", resp.StatusCode)
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		log.Fatalf("CDC subscribe: HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 	log.Printf("[repl-ship] subscribed src=%s dst=%s prefix=%q",
 		*src, *dstTCP, *prefix)
@@ -340,7 +344,25 @@ func (ck *checkpointFile) save() {
 	}
 }
 
-// srcToken is the --src-token value; adminGet attaches it to every request
+// resolveToken picks the admin token: --admin-token beats --src-token (whose
+// default is $VELTRIX_ADMIN_TOKEN).
+func resolveToken(srcTok, adminTok string) string {
+	if adminTok != "" {
+		return adminTok
+	}
+	return srcTok
+}
+
+// cdcURL builds the live-stream URL with the prefix query-escaped.
+func cdcURL(src, prefix string) string {
+	u := strings.TrimRight(src, "/") + "/admin/cdc"
+	if prefix != "" {
+		u += "?prefix=" + url.QueryEscape(prefix)
+	}
+	return u
+}
+
+// srcToken is the resolved --admin-token / --src-token value; adminGet attaches it to every request
 // against the source's /admin/* endpoints.
 var srcToken string
 
@@ -361,14 +383,15 @@ func catchUp(src, prefix string, dst *dstConn, dlEnc *json.Encoder, maxRetries i
 	total := 0
 	cursor := ck.cursor
 	for {
-		url := fmt.Sprintf("%s/admin/changes?since=%d&limit=10000", src, cursor)
-		resp, err := adminGet(url)
+		u := fmt.Sprintf("%s/admin/changes?since=%d&limit=10000", src, cursor)
+		resp, err := adminGet(u)
 		if err != nil {
 			return fmt.Errorf("changes fetch: %w", err)
 		}
 		if resp.StatusCode != 200 {
+			body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
 			resp.Body.Close()
-			return fmt.Errorf("changes fetch: HTTP %d", resp.StatusCode)
+			return fmt.Errorf("changes fetch: HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 		}
 
 		dec := json.NewDecoder(bufio.NewReaderSize(resp.Body, 64*1024))

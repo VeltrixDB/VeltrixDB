@@ -120,6 +120,10 @@ func (a *AuditLog) Log(rec AuditRecord) {
 	}
 }
 
+// isEnabled reports whether records are being written. Lets batch producers
+// skip building records nobody will keep.
+func (a *AuditLog) isEnabled() bool { return a != nil && a.enabled }
+
 // Close drains pending records and closes the file. Safe to call multiple times.
 func (a *AuditLog) Close() error {
 	if a == nil || !a.enabled {

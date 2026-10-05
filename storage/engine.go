@@ -57,6 +57,11 @@ type StorageEngine struct {
 	done     chan struct{}
 	version  atomic.Uint64
 
+	// dirLocks holds the exclusive LOCK-file lock on every data dir for the
+	// engine's lifetime (dirlock.go). Taken first in NewStorageEngine, before
+	// any WAL / VLog file is opened; released last in Close.
+	dirLocks []*dirLock
+
 	// Per-disk compaction queues: compactionQueues[diskIdx] feeds the
 	// compaction goroutine that owns diskIdx.
 	compactionQueues []chan CompactionRequest
@@ -173,6 +178,23 @@ func NewStorageEngine(cfg *StorageConfig) (*StorageEngine, error) {
 		}
 	}
 
+	// One engine per data dir: lock every dir BEFORE anything below opens,
+	// punches or truncates a file in it. A second engine on a live server's
+	// dirs (veltrixdb-backup, veltrix-repair, a second NewStorageEngine in
+	// this process) used to open its own WAL / VLog over the live files and
+	// truncated wal.log and vlog_active.dat to 0 bytes. Released by Close —
+	// or here, on any error return below.
+	dirLocks, err := lockDataDirs(dirs)
+	if err != nil {
+		return nil, err
+	}
+	engineOpened := false
+	defer func() {
+		if !engineOpened {
+			releaseDirLocks(dirLocks)
+		}
+	}()
+
 	lirRatio := cfg.LIRRatio
 	if lirRatio <= 0 {
 		lirRatio = 0.95
@@ -236,15 +258,21 @@ func NewStorageEngine(cfg *StorageConfig) (*StorageEngine, error) {
 	}
 
 	// One WAL per disk — parallel fdatasyncs, no shared serialisation point.
-	var legacyTextWAL bool
+	var legacyTextWAL, dropTTLWAL bool
 	switch strings.ToLower(cfg.WALFormat) {
 	case "", "binary":
 	case "text":
 		legacyTextWAL = true
-		log.Printf("[wal] WARNING: --wal-format=text — writing the legacy text WAL for rollback. " +
-			"Keys containing '|' or newline are NOT crash-safe in this format.")
+		log.Printf("[wal] WARNING: --wal-format=text — writing the legacy text WAL. " +
+			"Keys containing '|' or newline are NOT crash-safe in this format. Records of keys " +
+			"with a TTL carry an 11th field no build older than it can read — to roll back, use text-legacy.")
+	case "text-legacy":
+		legacyTextWAL, dropTTLWAL = true, true
+		log.Printf("[wal] WARNING: --wal-format=text-legacy — writing the legacy text WAL WITHOUT TTLs, " +
+			"for rollback to an older build. Keys written with a TTL come back immortal after a restart, " +
+			"and keys containing '|' or newline are NOT crash-safe in this format.")
 	default:
-		return nil, fmt.Errorf("invalid WALFormat %q: want \"binary\" or \"text\"", cfg.WALFormat)
+		return nil, fmt.Errorf("invalid WALFormat %q: want \"binary\", \"text\" or \"text-legacy\"", cfg.WALFormat)
 	}
 	flushWindow := time.Duration(cfg.WALFlushWindowMs) * time.Millisecond
 	maxBatch := cfg.WALMaxBatchEntries
@@ -259,6 +287,7 @@ func NewStorageEngine(cfg *StorageConfig) (*StorageEngine, error) {
 			return nil, fmt.Errorf("disk %d WAL: %w", i, err)
 		}
 		w.legacyText = legacyTextWAL
+		w.dropTTL = dropTTLWAL
 		wals[i] = w
 	}
 
@@ -540,6 +569,7 @@ func NewStorageEngine(cfg *StorageConfig) (*StorageEngine, error) {
 	se.cdc = NewCDCBroker()
 	se.quotas = NewQuotaManager()
 	se.tombstones = NewTombstoneCoordinator()
+	defrag.tombstones = se.tombstones // before defrag.start() below
 
 	// Start the async write batcher after se is fully initialised so the
 	// batcher goroutine can safely call se.MultiPut and se.cgoBatch.
@@ -567,6 +597,8 @@ func NewStorageEngine(cfg *StorageConfig) (*StorageEngine, error) {
 		log.Printf("[index] loading persisted index definitions failed: %v (continuing without)", err)
 	}
 
+	se.dirLocks = dirLocks
+	engineOpened = true
 	return se, nil
 }
 
@@ -612,6 +644,37 @@ func untransformStored(blob []byte, xflags uint8, plainLen uint32) ([]byte, erro
 		blob = out
 	}
 	return blob, nil
+}
+
+// decodeStoredValue is the read-side inverse of transformForWrite for a blob
+// pulled off the VLog with entry's pointer: decrypt → decompress →
+// migrate-on-read, driven by entry's per-record flags (invariant 29). Shared
+// by Get and the atomic ops' under-lock read so the two cannot drift.
+func decodeStoredValue(entry *IndexEntry, value []byte) ([]byte, error) {
+	if entry.IsEncrypted() {
+		pt, err := Decrypt(value)
+		if err != nil {
+			return nil, fmt.Errorf("vlog decrypt: %w", err)
+		}
+		value = pt
+	}
+	if entry.IsCompressed() {
+		decoded, err := Decompress(value, entry.UncompressedSize)
+		if err != nil {
+			return nil, fmt.Errorf("vlog decompress: %w", err)
+		}
+		value = decoded
+	}
+	// Schema migration: lazily upgrade old-version values on read so callers
+	// always see CurrentSchemaVersion. No-op when the entry is already current.
+	if entry.SchemaVersion < CurrentSchemaVersion {
+		migrated, _, err := MigrateOnRead(entry.SchemaVersion, value)
+		if err != nil {
+			return nil, fmt.Errorf("schema migrate: %w", err)
+		}
+		value = migrated
+	}
+	return value, nil
 }
 
 func (se *StorageEngine) transformForWrite(value []byte) ([]byte, uint8, error) {
@@ -706,16 +769,22 @@ func (se *StorageEngine) Put(key string, value []byte, ttl int32) error {
 		return degradedError(diskIdx)
 	}
 
+	// The absolute expiry goes into the WAL record as well as the IndexEntry:
+	// without it replay rebuilt every TTL'd key as immortal. Every field is
+	// (re)set — pooled entries keep whatever the previous user left, and a
+	// stale TTLExpiryUs would give an immortal key someone else's deadline.
+	ttlExpiryUs := walTTLExpiryUs(nowUs, ttl)
 	walEntry := walEntryPool.Get().(*WALEntry)
-	walEntry.Timestamp = start.UnixNano()
-	walEntry.KeyLen = uint32(len(key))
-	walEntry.Key = key
-	walEntry.ValueLen = uint32(len(value))
-	walEntry.Value = value
-	walEntry.Checksum = crc
-	walEntry.Version = version
-	walEntry.IsTombstone = false
-	walEntry.ReplicationID = 0
+	*walEntry = WALEntry{
+		Timestamp:   start.UnixNano(),
+		KeyLen:      uint32(len(key)),
+		Key:         key,
+		ValueLen:    uint32(len(value)),
+		Value:       value,
+		Checksum:    crc,
+		Version:     version,
+		TTLExpiryUs: ttlExpiryUs,
+	}
 
 	entry := &IndexEntry{
 		KeyHash:          fnv64a(key),
@@ -729,9 +798,9 @@ func (se *StorageEngine) Put(key string, value []byte, ttl int32) error {
 		SchemaVersion:    CurrentSchemaVersion,
 		ShardID:          shardID,
 	}
-	if ttl > 0 {
+	if ttlExpiryUs > 0 {
 		entry.Flags |= FlagHasTTL
-		entry.TTLExpiryUs = nowUs + int64(ttl)*1_000_000
+		entry.TTLExpiryUs = ttlExpiryUs
 	}
 
 	if se.config.KeyValueSeparation && len(se.vlogs) > 0 {
@@ -790,7 +859,7 @@ func (se *StorageEngine) Put(key string, value []byte, ttl int32) error {
 		entry.DiskOffset = uint64(vlogOffset)
 		entry.SegmentID = uint32(diskIdx)
 		se.index.put(key, entry, nil)
-		se.cache.Put(key, value)
+		se.cache.PutWithExpiry(key, value, entry.CacheExpiryUs())
 		se.metrics.VLogWrites.Add(1)
 	} else {
 		err := se.wals[diskIdx].append(walEntry)
@@ -801,7 +870,7 @@ func (se *StorageEngine) Put(key string, value []byte, ttl int32) error {
 		}
 		se.noteDiskOK(diskIdx)
 		se.index.put(key, entry, value)
-		se.cache.Put(key, value)
+		se.cache.PutWithExpiry(key, value, entry.CacheExpiryUs())
 
 		if se.shouldCompact() {
 			se.triggerCompaction()
@@ -851,8 +920,20 @@ var ErrKeyExpired = errors.New("key expired")
 //  4. Segment file read via DiskOffset + SegmentID — CRC32C verified.
 func (se *StorageEngine) Get(key string) ([]byte, error) {
 	v, _, err := se.get(key, getFull)
+	if err == nil && v == nil {
+		v = emptyValue
+	}
 	return v, err
 }
+
+// emptyValue is what a successful read of a zero-length value returns. A
+// stored empty value can come back from the VLog, a dirty slot or the cache as
+// a nil slice, and nil is what several callers (MultiGet, the server's MGET
+// writers, HGetAll, HExpire) used to read as "not found" — so an empty value
+// written by MultiPut read back as missing from MGET while GET returned it.
+// A successful read therefore never returns nil. Zero length and capacity, so
+// sharing one instance is safe: an append always reallocates.
+var emptyValue = []byte{}
 
 // GetNoIO is Get without step 4: it answers from the cache, the index (absent,
 // tombstoned, expired) or a dirty in-RAM value, and when the value can only
@@ -863,7 +944,11 @@ func (se *StorageEngine) Get(key string) ([]byte, error) {
 // reads inline on its event-loop thread, and one VLog read there stalls every
 // other connection on that loop.
 func (se *StorageEngine) GetNoIO(key string) (value []byte, needIO bool, err error) {
-	return se.get(key, getNoIO)
+	value, needIO, err = se.get(key, getNoIO)
+	if err == nil && !needIO && value == nil {
+		value = emptyValue
+	}
+	return value, needIO, err
 }
 
 // GetAfterNoIO completes a key GetNoIO reported as needIO. Same result as
@@ -871,6 +956,9 @@ func (se *StorageEngine) GetNoIO(key string) (value []byte, needIO bool, err err
 // recorded here, once.
 func (se *StorageEngine) GetAfterNoIO(key string) ([]byte, error) {
 	v, _, err := se.get(key, getAfterNoIO)
+	if err == nil && v == nil {
+		v = emptyValue
+	}
 	return v, err
 }
 
@@ -954,9 +1042,24 @@ func (se *StorageEngine) get(key string, mode getMode) (_ []byte, needIO bool, _
 		hit   bool
 	)
 	if se.cacheHashed != nil {
-		value, hit = se.cacheHashed.getHashed(key, h)
+		var expiresUs int64
+		value, expiresUs, hit = se.cacheHashed.getHashed(key, h)
+		// A TTL'd value is refused once its deadline passes and the read falls
+		// through to the index, which tombstones the key, evicts it and
+		// returns ErrKeyExpired exactly as an uncached read does. Immortal
+		// keys (expiresUs == 0) pay one compare and no clock read.
+		if hit && expiresUs != 0 && time.Now().UnixMicro() >= expiresUs {
+			hit = false
+		}
 	} else {
 		value, hit = se.cache.Get(key)
+		// A Cache without getHashed carries no deadline: confirm against
+		// the index. No shipped cache takes this path.
+		if hit {
+			if e, _, ok := se.index.getHashed(key, h); !ok || e.IsTombstone() || e.IsExpired(time.Now().UnixMicro()) {
+				hit = false
+			}
+		}
 	}
 	if hit {
 		if mode != getAfterNoIO { // GetNoIO already counted this key's cache miss
@@ -994,7 +1097,7 @@ func (se *StorageEngine) get(key string, mode getMode) (_ []byte, needIO bool, _
 
 	// Step 3: Dirty value in RAM (pre-flush).
 	if dirtyValue != nil {
-		se.cache.Put(key, dirtyValue)
+		se.cache.PutWithExpiry(key, dirtyValue, entry.CacheExpiryUs())
 		return dirtyValue, false, nil
 	}
 
@@ -1010,32 +1113,12 @@ func (se *StorageEngine) get(key string, mode getMode) (_ []byte, needIO bool, _
 				se.noteDiskError(vlogIdx, "vlog read", err)
 				return nil, false, fmt.Errorf("vlog read: %w", err)
 			}
-			if entry.IsEncrypted() {
-				pt, derr := Decrypt(value)
-				if derr != nil {
-					return nil, false, fmt.Errorf("vlog decrypt: %w", derr)
-				}
-				value = pt
-			}
-			if entry.IsCompressed() {
-				decoded, derr := Decompress(value, entry.UncompressedSize)
-				if derr != nil {
-					return nil, false, fmt.Errorf("vlog decompress: %w", derr)
-				}
-				value = decoded
-			}
-			// Schema migration: lazily upgrade old-version values on read so
-			// callers always see CurrentSchemaVersion. No-op when the entry is
-			// already current.
-			if entry.SchemaVersion < CurrentSchemaVersion {
-				migrated, _, merr := MigrateOnRead(entry.SchemaVersion, value)
-				if merr != nil {
-					return nil, false, fmt.Errorf("schema migrate: %w", merr)
-				}
-				value = migrated
+			value, err = decodeStoredValue(&entry, value)
+			if err != nil {
+				return nil, false, err
 			}
 			se.metrics.VLogReads.Add(1)
-			se.cache.Put(key, value)
+			se.cache.PutWithExpiry(key, value, entry.CacheExpiryUs())
 			return value, false, nil
 		}
 		if int(entry.SegmentID) < len(se.segments) {
@@ -1050,7 +1133,7 @@ func (se *StorageEngine) get(key string, mode getMode) (_ []byte, needIO bool, _
 			if entry.Flags&FlagReadRepairNeeded != 0 {
 				entry.Flags &^= FlagReadRepairNeeded
 			}
-			se.cache.Put(key, value)
+			se.cache.PutWithExpiry(key, value, entry.CacheExpiryUs())
 			return value, false, nil
 		}
 	}
@@ -1088,6 +1171,7 @@ func (se *StorageEngine) Delete(key string) error {
 	walEntry.Value = nil
 	walEntry.Checksum = 0
 	walEntry.ReplicationID = 0
+	walEntry.TTLExpiryUs = 0 // pooled: never carry a previous put's TTL
 	delShardID := uint16(fnv64a(key) & (numShards - 1))
 	delDiskIdx := diskForShard(delShardID, len(se.wals))
 	err := se.wals[delDiskIdx].append(walEntry)
@@ -1102,7 +1186,9 @@ func (se *StorageEngine) Delete(key string) error {
 		}
 	}
 
-	se.index.markTombstone(key, nowUs)
+	// existed: the key had an index entry (live, or a tombstone not yet
+	// reaped) — the condition for the search cascade below.
+	existed := se.index.markTombstone(key, nowUs)
 	se.cache.Evict(key)
 
 	se.metrics.Deletes.Add(1)
@@ -1118,6 +1204,10 @@ func (se *StorageEngine) Delete(key string) error {
 	}
 	if isSearchKey(key) {
 		se.onSearchKeyDelete(key)
+	} else if existed && !isInternalIndexKey(key) {
+		// A record's vectors and text documents go with it (invariant 60).
+		// Two atomic loads when no search namespace exists.
+		se.deleteDerivedSearchKeys(key)
 	}
 	return nil
 }
@@ -1680,6 +1770,15 @@ func (se *StorageEngine) Close() error {
 	// Last: the checkpoint above is the final reader. The native index lives
 	// off the Go heap, so nothing else would ever return its memory.
 	se.index.close()
+	// Drain and fsync the audit log; without this the records still queued
+	// at shutdown were lost and the file was never synced on a clean stop.
+	if err := se.audit.Close(); err != nil && firstErr == nil {
+		firstErr = err
+	}
+	// Very last: every file in the data dirs is closed and the checkpoint is
+	// written, so another engine may now open them.
+	releaseDirLocks(se.dirLocks)
+	se.dirLocks = nil
 	return firstErr
 }
 

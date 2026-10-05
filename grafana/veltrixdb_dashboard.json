@@ -1135,10 +1135,9 @@
       "options": { "legend": { "calcs": ["mean", "sum"], "displayMode": "table", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
       "targets": [
         { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "rate(veltrixdb_replication_anti_entropy_runs_total{node=~\"$node\"}[5m])", "legendFormat": "Anti-Entropy Runs/s — {{node}}", "refId": "A" },
-        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "rate(veltrixdb_replication_conflict_resolutions_total{node=~\"$node\"}[5m])", "legendFormat": "Conflict Resolutions/s — {{node}}", "refId": "B" },
-        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "rate(veltrixdb_replication_vector_clock_updates_total{node=~\"$node\"}[5m])", "legendFormat": "Vector Clock Updates/s — {{node}}", "refId": "C" }
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "rate(veltrixdb_replication_replica_recoveries_total{node=~\"$node\"}[5m])", "legendFormat": "Replica Recoveries/s — {{node}}", "refId": "B" }
       ],
-      "title": "Anti-Entropy, Conflict Resolution & Vector Clock Updates / s",
+      "title": "Anti-Entropy Runs & Replica Recoveries / s",
       "type": "timeseries"
     },
 
@@ -1660,7 +1659,7 @@
         "defaults": {
           "color": { "mode": "palette-classic" },
           "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 2, "showPoints": "never" },
-          "unit": "reqps"
+          "unit": "short"
         },
         "overrides": []
       },
@@ -1668,10 +1667,10 @@
       "id": 203,
       "options": { "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
       "targets": [
-        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "sum by (node) (rate(veltrixdb_replication_vector_clock_updates_total{node=~\"$node\"}[5m]))", "legendFormat": "Vector Clock Updates/s — {{node}}", "refId": "A" },
-        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "sum by (node) (rate(veltrixdb_replication_conflict_resolutions_total{node=~\"$node\"}[5m]))", "legendFormat": "Conflict Resolutions/s — {{node}}", "refId": "B" }
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "sum by (node) (veltrixdb_replication_replicas_failed{node=~\"$node\"})", "legendFormat": "FAILED replicas — {{node}}", "refId": "A" },
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "sum by (node) (veltrixdb_replication_replicas_sync_pending{node=~\"$node\"})", "legendFormat": "SYNC_PENDING replicas — {{node}}", "refId": "B" }
       ],
-      "title": "Replication — Vector Clock Updates & Conflict Resolutions / s",
+      "title": "Replication — FAILED / SYNC_PENDING replicas",
       "type": "timeseries"
     },
 

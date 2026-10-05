@@ -4,8 +4,10 @@ package main
 // distributed search across a rebalanced two-node cluster.
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"math"
 	"math/rand"
 	"strings"
 	"testing"
@@ -140,6 +142,121 @@ func TestTextHybridWire(t *testing.T) {
 			t.Fatalf("kb lost its int8 setting across restart: %+v", st)
 		}
 	}
+}
+
+// TestSearchWire_DelRemovesVectorAndText: DEL of a record over the binary
+// and the text protocol removes its vector and text document from VSEARCH,
+// TSEARCH and HSEARCH, also after a restart; an id with a vector and text but
+// no record is unaffected.
+func TestSearchWire_DelRemovesVectorAndText(t *testing.T) {
+	dir := t.TempDir()
+	ts := startTestServer(t, dir, nil)
+	bc := dialBinary(t, ts.addr)
+	tc := dialText(t, ts.addr)
+
+	for _, ns := range []string{"f", "q"} {
+		quant := ""
+		if ns == "q" {
+			quant = "int8"
+		}
+		if err := bc.VCreate(ns, 2, quant); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ids := map[string][]float32{"del-bin": {1, 0}, "del-txt": {0.9, 0.1}, "keep": {0.8, 0.2}, "pure": {0.7, 0.3}}
+	for id, v := range ids {
+		for _, ns := range []string{"f", "q"} {
+			if err := bc.VSetNS(ns, id, v); err != nil {
+				t.Fatal(err)
+			}
+			if err := bc.TSet(ns, id, "shared words for "+id); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if id != "pure" {
+			if err := bc.Put(id, []byte(`{"k":"v"}`), 0); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if err := bc.Delete("del-bin"); err != nil {
+		t.Fatal(err)
+	}
+	if err := tc.Delete("del-txt"); err != nil {
+		t.Fatal(err)
+	}
+
+	check := func(stage string, bc *client.BinaryConn) {
+		t.Helper()
+		for _, ns := range []string{"f", "q"} {
+			v, err := bc.VSearchWithOptions(0, []float32{1, 0}, client.VectorSearchOptions{NS: ns})
+			if err != nil {
+				t.Fatal(err)
+			}
+			tx, err := bc.TSearch(0, "shared", client.TextSearchOptions{NS: ns})
+			if err != nil {
+				t.Fatal(err)
+			}
+			hy, err := bc.HSearch(10, []float32{1, 0}, "shared", client.HybridSearchOptions{NS: ns})
+			if err != nil {
+				t.Fatal(err)
+			}
+			for name, res := range map[string][]client.VectorResult{"vsearch": v, "tsearch": tx, "hsearch": hy} {
+				got := map[string]bool{}
+				for _, r := range res {
+					got[r.ID] = true
+				}
+				if got["del-bin"] || got["del-txt"] || !got["keep"] || !got["pure"] || len(got) != 2 {
+					t.Fatalf("%s %s ns=%s: %v, want keep + pure", stage, name, ns, got)
+				}
+			}
+		}
+	}
+	check("after DEL", bc)
+	bc.Close()
+	tc.Close()
+
+	ts.stop(t)
+	ts = startTestServer(t, dir, nil)
+	defer ts.stop(t)
+	bc = dialBinary(t, ts.addr)
+	defer bc.Close()
+	check("after restart", bc)
+}
+
+// TestRaftFSM_DeleteRemovesSearchKeys: a replica applying a record's raft
+// delete removes the record's vector and document itself.
+func TestRaftFSM_DeleteRemovesSearchKeys(t *testing.T) {
+	f := newRaftFSM(newFSMTestEngine(t))
+	if err := f.engine.RegisterVectorNamespace("v", 2); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []fsmCmd{
+		{Op: opPut, Key: "r1", Value: []byte("{}"), TTL: -1},
+		{Op: opPut, Key: storage.VectorPersistKey("v", "r1"), Value: vecBlob(1, 0), TTL: -1},
+		{Op: opPut, Key: storage.TextPersistKey("v", "r1"), Value: []byte("hello"), TTL: -1},
+		{Op: opPut, Key: storage.VectorPersistKey("v", "pure"), Value: vecBlob(1, 0), TTL: -1},
+		{Op: opDelete, Key: "r1"},
+	} {
+		if err := f.Apply(mustEncodeCmd(t, c)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := f.engine.SearchVector("v", []float32{1, 0}, 0)
+	if err != nil || len(got) != 1 || got[0].ID != "pure" {
+		t.Fatalf("vector search after raft delete: %+v err=%v, want only pure", got, err)
+	}
+	if tx, _ := f.engine.SearchText("v", "hello", 0, nil); len(tx) != 0 {
+		t.Fatalf("text search after raft delete: %+v", tx)
+	}
+}
+
+func vecBlob(fs ...float32) []byte {
+	b := make([]byte, 4*len(fs))
+	for i, f := range fs {
+		binary.LittleEndian.PutUint32(b[4*i:], math.Float32bits(f))
+	}
+	return b
 }
 
 // TestDistributedSearch_AfterRebalance: once a join has moved part of the
@@ -321,6 +438,26 @@ func TestDistributedSearch_AfterRebalance(t *testing.T) {
 	// A namespace no node has is still an error.
 	if _, err := coord.VSearch("nope", vecs["doc000"], 1, storage.VectorSearchOptions{}); err == nil {
 		t.Fatal("unknown namespace must fail cluster-wide")
+	}
+
+	// Deleting a record on its owner (what raft / replication apply runs)
+	// removes its vector and document there; the fanned-out search no
+	// longer returns it.
+	var moved string
+	for _, k := range eng2.ScanKeys() {
+		if storage.IsVectorKey(k) {
+			moved = k[len("@vec/dv/"):]
+			break
+		}
+	}
+	if err := eng2.Delete(moved); err != nil {
+		t.Fatal(err)
+	}
+	if all, err := coord.VSearch("dv", vecs["doc000"], 0, storage.VectorSearchOptions{}); err != nil || len(all) != n-1 {
+		t.Fatalf("after deleting %s: %d vector hits err=%v, want %d", moved, len(all), err, n-1)
+	}
+	if txt, err := coord.TSearch("dv", "unique"+moved[3:], 0, nil); err != nil || len(txt) != 0 {
+		t.Fatalf("after deleting %s: text hits %+v err=%v", moved, txt, err)
 	}
 
 	// node-1 alone sees only its share: that is the gap fan-out closes.

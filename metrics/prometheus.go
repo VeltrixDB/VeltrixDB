@@ -60,7 +60,7 @@ type VeltrixCollector struct {
 	nodeRemovals        *prometheus.Desc
 	failureDetections   *prometheus.Desc
 	rebalances          *prometheus.Desc // resharding operations
-	partitionMigrations *prometheus.Desc // partitions moved during reshard
+	partitionMigrations *prometheus.Desc // key batches migrated to a new owner
 	metaUpdateTs        *prometheus.Desc
 	nodeCount           *prometheus.Desc
 	clusterVersion      *prometheus.Desc
@@ -72,6 +72,7 @@ type VeltrixCollector struct {
 	fdRecoveryAttempts *prometheus.Desc
 	fdRecoverySuccess  *prometheus.Desc
 	fdRecoveryFailures *prometheus.Desc
+	fdNodesReactivated *prometheus.Desc
 
 	// ── VLog (WiscKey KV separation) ──────────────────────────────────────────
 	vlogWrites       *prometheus.Desc // counter, per-node
@@ -91,13 +92,15 @@ type VeltrixCollector struct {
 	vlogBlkDiscardErrors *prometheus.Desc // counter: BLKDISCARD ioctl failures (missing SYS_RAWIO cap)
 
 	// ── Replication ───────────────────────────────────────────────────────────
-	replWrites             *prometheus.Desc
-	replFailures           *prometheus.Desc
-	replLagBytes           *prometheus.Desc
-	replLagNs              *prometheus.Desc
-	replConflicts          *prometheus.Desc
-	replVectorClockUpdates *prometheus.Desc
-	replAntiEntropyRuns    *prometheus.Desc
+	replWrites           *prometheus.Desc
+	replFailures         *prometheus.Desc
+	replLagBytes         *prometheus.Desc
+	replLagNs            *prometheus.Desc
+	replAntiEntropyRuns  *prometheus.Desc
+	replReplicasFailed   *prometheus.Desc
+	replReplicasSyncPend *prometheus.Desc
+	replRecoveryProbes   *prometheus.Desc
+	replRecoveries       *prometheus.Desc
 
 	// ── WAL I/O ───────────────────────────────────────────────────────────────
 	walWriteBytes   *prometheus.Desc // counter: bytes written to WAL across all disks
@@ -263,7 +266,7 @@ func NewVeltrixCollector(
 		nodeRemovals:        desc("cluster", "node_removals_total", "Nodes removed from the cluster."),
 		failureDetections:   desc("cluster", "failure_detections_total", "Nodes marked FAILED by the partition map."),
 		rebalances:          desc("cluster", "rebalances_total", "Partition rebalance (reshard) operations executed."),
-		partitionMigrations: desc("cluster", "partition_migrations_total", "Partitions reassigned across nodes during resharding."),
+		partitionMigrations: desc("cluster", "partition_migrations_total", "Key batches (up to 500 keys each) delivered to a new owner by partition migration (rebalance / evacuation)."),
 		metaUpdateTs:        desc("cluster", "metadata_last_update_timestamp_seconds", "Unix timestamp of the last partition-map metadata update."),
 		nodeCount:           desc("cluster", "nodes_total", "Current number of registered cluster nodes."),
 		clusterVersion:      desc("cluster", "partition_map_version", "Monotonically increasing partition map version."),
@@ -275,6 +278,7 @@ func NewVeltrixCollector(
 		fdRecoveryAttempts: desc("failure_detector", "recovery_attempts_total", "Ping attempts made toward failed nodes."),
 		fdRecoverySuccess:  desc("failure_detector", "recovery_success_total", "Recovery pings that succeeded."),
 		fdRecoveryFailures: desc("failure_detector", "recovery_failures_total", "Recovery pings that permanently failed."),
+		fdNodesReactivated: desc("failure_detector", "nodes_reactivated_total", "RECOVERING nodes promoted back to ACTIVE after consecutive successful recovery pings."),
 
 		// vlog
 		vlogWrites:           desc("vlog", "writes_total", "Total values appended to VLog files (KV-separation enabled)."),
@@ -293,13 +297,15 @@ func NewVeltrixCollector(
 		vlogBlkDiscardErrors: desc("vlog", "blkdiscard_errors_total", "BLKDISCARD ioctl failures in punchDeadHead. Non-zero means the container lacks CAP_SYS_RAWIO — NVMe TRIM is silently skipped and the raw VLog head will grow without reclaim. Fix: add SYS_RAWIO to securityContext.capabilities.add."),
 
 		// replication
-		replWrites:             desc("replication", "writes_total", "Write operations dispatched to replicas."),
-		replFailures:           desc("replication", "failures_total", "Replication attempts that failed."),
-		replLagBytes:           desc("replication", "lag_bytes", "Total replication lag across all replicas in bytes."),
-		replLagNs:              desc("replication", "lag_nanoseconds", "Maximum replication lag across all replicas in nanoseconds."),
-		replConflicts:          desc("replication", "conflict_resolutions_total", "Write conflicts resolved via vector-clock comparison."),
-		replVectorClockUpdates: desc("replication", "vector_clock_updates_total", "Vector clock increments (causal ordering events)."),
-		replAntiEntropyRuns:    desc("replication", "anti_entropy_runs_total", "Anti-entropy full-state sync rounds completed."),
+		replWrites:           desc("replication", "writes_total", "Write operations dispatched to replicas."),
+		replFailures:         desc("replication", "failures_total", "Replication attempts that failed."),
+		replLagBytes:         desc("replication", "lag_bytes", "Total replication lag across all replicas in bytes."),
+		replLagNs:            desc("replication", "lag_nanoseconds", "Maximum replication lag across replicas: age in ns of the oldest write a replica has not acknowledged (0 when caught up)."),
+		replAntiEntropyRuns:  desc("replication", "anti_entropy_runs_total", "Anti-entropy rounds (re-send of retained un-acked writes to LAG replicas)."),
+		replReplicasFailed:   desc("replication", "replicas_failed", "Replicas currently in FAILED state (re-probed with backoff)."),
+		replReplicasSyncPend: desc("replication", "replicas_sync_pending", "Replicas currently in SYNC_PENDING state (reachable again, catching up)."),
+		replRecoveryProbes:   desc("replication", "recovery_probes_total", "Reconnect probes sent to FAILED replicas."),
+		replRecoveries:       desc("replication", "replica_recoveries_total", "Replicas that completed FAILED → SYNC_PENDING → SYNC."),
 
 		// wal i/o
 		walWriteBytes:   desc("storage", "wal_write_bytes_total", "Bytes written to WAL files across all disks (includes WAL framing overhead)."),
@@ -381,10 +387,11 @@ func (c *VeltrixCollector) Describe(ch chan<- *prometheus.Desc) {
 		c.rebalances, c.partitionMigrations, c.metaUpdateTs, c.nodeCount, c.clusterVersion,
 		// failure detector
 		c.fdNodesDetected, c.fdNodesRecovered, c.fdFalsePositives,
-		c.fdRecoveryAttempts, c.fdRecoverySuccess, c.fdRecoveryFailures,
+		c.fdRecoveryAttempts, c.fdRecoverySuccess, c.fdRecoveryFailures, c.fdNodesReactivated,
 		// replication
 		c.replWrites, c.replFailures, c.replLagBytes, c.replLagNs,
-		c.replConflicts, c.replVectorClockUpdates, c.replAntiEntropyRuns,
+		c.replAntiEntropyRuns, c.replReplicasFailed, c.replReplicasSyncPend,
+		c.replRecoveryProbes, c.replRecoveries,
 		// wal i/o
 		c.walWriteBytes, c.walBatchEntries,
 		// vlog i/o per disk
@@ -512,6 +519,7 @@ func (c *VeltrixCollector) Collect(ch chan<- prometheus.Metric) {
 	counter(c.fdRecoveryAttempts, fdm.RecoveryAttempts.Load())
 	counter(c.fdRecoverySuccess, fdm.RecoverySuccess.Load())
 	counter(c.fdRecoveryFailures, fdm.RecoveryFailures.Load())
+	counter(c.fdNodesReactivated, fdm.NodesReactivated.Load())
 
 	// ── Replication ───────────────────────────────────────────────────────────
 	if c.replMetrics != nil {
@@ -519,9 +527,11 @@ func (c *VeltrixCollector) Collect(ch chan<- prometheus.Metric) {
 		counter(c.replFailures, c.replMetrics.FailedReplications.Load())
 		gauge(c.replLagBytes, float64(c.replMetrics.ReplicaLagBytes.Load()))
 		gauge(c.replLagNs, float64(c.replMetrics.ReplicaLagNs.Load()))
-		counter(c.replConflicts, c.replMetrics.ConflictResolutions.Load())
-		counter(c.replVectorClockUpdates, c.replMetrics.VectorClockUpdates.Load())
 		counter(c.replAntiEntropyRuns, c.replMetrics.AntiEntropyRuns.Load())
+		gauge(c.replReplicasFailed, float64(c.replMetrics.ReplicasFailed.Load()))
+		gauge(c.replReplicasSyncPend, float64(c.replMetrics.ReplicasSyncPending.Load()))
+		counter(c.replRecoveryProbes, c.replMetrics.RecoveryProbes.Load())
+		counter(c.replRecoveries, c.replMetrics.ReplicaRecoveries.Load())
 	}
 
 	// ── WAL I/O ───────────────────────────────────────────────────────────────

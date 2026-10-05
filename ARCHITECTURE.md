@@ -218,15 +218,18 @@ unreferenced garbage that the next GC pass reclaims, and the client never got
 an OK. Safe.
 
 **What the WAL record must carry.** Records are binary (`storage/wal_format.go`):
-a 48-byte little-endian header — magic `0xB1`, format version (1), flags (tombstone / packed / inline value),
+a 48-byte little-endian header — magic `0xB1`, format version (1, or 2 when an 8-byte absolute TTL expiry in µs follows the header), flags (tombstone / packed / inline value),
 key length, `valueLen`, `diskLen`, plaintext CRC32C, `xflags`, timestamp,
 version, `vlogOffset` — then the key, the value if inline, and a CRC32C over
-the whole record. The legacy text form is still read (and written by the
-server under `--wal-format=text`, for rollback only; the engine logs a warning
-that keys containing `|` or `\n` are not crash-safe in that format):
+the whole record. TTL-free records stay version 1, unchanged; replay restores
+each key's TTL and tombstones a key already expired. The legacy text form is
+still read (and written by the server under `--wal-format=text`, which keeps
+TTLs in an optional 11th field, or `--wal-format=text-legacy`, which drops them
+and is the rollback mode; the engine logs a warning that keys containing `|`
+or `\n` are not crash-safe in either):
 
 ```
-timestamp|tombstone|key|valueLen|crc32hex|version|vlogOffset|packed|diskLen|xflags
+timestamp|tombstone|key|valueLen|crc32hex|version|vlogOffset|packed|diskLen|xflags|ttlExpiryUs
 ```
 
 The text form was replaced because keys are arbitrary bytes: one key
@@ -442,13 +445,15 @@ PUT / Delete / MultiPut of a reserved key
 ```
 cluster/   partition_map.go    consistent-hash ring (FNV-1a + fmix64, 64 vnodes/node), 256 partitions, RoutingKey
            epoch.go             epoch fencing (stale-epoch updates / transfers rejected)
-           failure_detection.go heartbeat Active → Suspect (3 s) → Failed (10 s) → Recovering
+           failure_detection.go heartbeat Active → Suspect (3 s) → Failed (10 s) → Recovering → Active (2 pings)
            gossip.go            TCP gossip listener + JSON digest exchange
            partition_transfer.go TransferAgent: key migration over HTTP (/transfer/keys)
 
 replication/ async / quorum / strong replication modes
-             vector clocks, anti-entropy
-             (tombstone watermarks live in storage/tombstone_replicated.go; nothing sets them yet)
+             per-op ack retention, FAILED-replica recovery (probe + backoff →
+             SYNC_PENDING catch-up → SYNC), anti-entropy for LAG replicas
+             replica ack watermarks gate tombstone GC (storage/tombstone_replicated.go)
+             version vectors are reserved (never set or compared)
 
 consensus/  Raft — leader election, log replication, snapshots, single-server
             membership changes, ReadIndex; Submit group-commits one fsync per batch
@@ -464,7 +469,7 @@ INCR / DECR / SETNX / TXN, text and binary protocols) goes through it.
 | `--mode` | How writes are handled | Consistency guarantee |
 |----------|------------------------|-----------------------|
 | `standalone` (default) | Straight to the local engine — byte-for-byte the pre-existing single-node path. No Raft, no replication, no redirects. | Single-node linearizable (one writer, one copy). |
-| `raft` | Ops are gob-encoded and submitted to a Raft log (`consensus`), committed by quorum, and applied on every node via a storage-backed FSM (`cmd/server/raft_fsm.go`). Non-leaders reject writes with a `MOVED <leader-addr> <leader-id>` redirect. | **Linearizable writes** (single Raft group, quorum commit). Reads default to local applied state (fast, possibly stale; a freshly elected leader first waits for its term's no-op to apply — `WaitLeaderApplied`); with `--linearizable-reads`, GET runs the **ReadIndex** fence (`consensus/read_index.go`) — quorum-confirmed, never stale, one heartbeat round-trip per read. |
+| `raft` | Ops are gob-encoded and submitted to a Raft log (`consensus`), committed by quorum, and applied on every node via a storage-backed FSM (`cmd/server/raft_fsm.go`). Non-leaders reject writes with a `MOVED <leader-addr> <leader-id>` redirect. | **Linearizable writes** (single Raft group, quorum commit). Reads default to local applied state (fast, possibly stale; a freshly elected leader first waits for its term's no-op to apply — `WaitLeaderApplied`); with `--linearizable-reads`, every read (GET, MGET, namespace / hash / list / set reads, range scans, index / query / search) runs the **ReadIndex** fence (`consensus/read_index.go`) — quorum-confirmed, never stale, one heartbeat round-trip per read. |
 | `replicated` | The write is applied to the local engine, then handed to the replication engine. The `--consistency` flag decides when the client is ACKed. | Primary-copy durability across N copies; **NOT** linearizable under concurrent writers (no single-writer ordering). Reads are local. |
 
 **`--consistency` (replicated mode):**

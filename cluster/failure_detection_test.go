@@ -2,6 +2,7 @@ package cluster
 
 import (
 	"fmt"
+	"net"
 	"sync"
 	"testing"
 	"time"
@@ -329,4 +330,132 @@ func TestFD_ConcurrentHeartbeats(t *testing.T) {
 	}
 	wg.Wait()
 	// If we reach here without a race the test passes.
+}
+
+// pongServer answers every connection's first read with "PONG\n" (the text
+// protocol liveness probe) and returns its port.
+func pongServer(t *testing.T) int {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { l.Close() })
+	go func() {
+		for {
+			c, err := l.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				buf := make([]byte, 64)
+				if _, err := c.Read(buf); err == nil {
+					_, _ = c.Write([]byte("PONG\n"))
+				}
+			}(c)
+		}
+	}()
+	return l.Addr().(*net.TCPAddr).Port
+}
+
+// TestFD_RecoveringPromotedToActive: a FAILED node that heartbeats again goes
+// to RECOVERING and, after consecutive successful recovery pings with fresh
+// heartbeats, back to ACTIVE — and is assigned partitions again (Rebalance
+// only uses ACTIVE nodes) and stays in the search fan-out.  Before, nothing
+// moved RECOVERING back to ACTIVE.
+func TestFD_RecoveringPromotedToActive(t *testing.T) {
+	cfg := DefaultClusterConfig()
+	cfg.ReplicationFactor = 1
+	pm := NewPartitionMap(cfg)
+	if err := pm.AddNode("self", "127.0.0.1", 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := pm.AddNode("peer", "127.0.0.1", pongServer(t)); err != nil {
+		t.Fatal(err)
+	}
+
+	fd := NewFailureDetector(pm, fastFDConfig())
+	fd.SetLocalNode("self")
+	fd.Start()
+	defer fd.Close()
+
+	if !waitForState(pm, "peer", NodeStateFailed, 2*time.Second) {
+		s, _ := nodeState(pm, "peer")
+		t.Fatalf("peer never FAILED (state %s)", s)
+	}
+	if err := pm.Rebalance(pm.PartitionCount()); err != nil {
+		t.Fatal(err)
+	}
+
+	// The peer comes back: keep heartbeating it.
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() {
+		tk := time.NewTicker(10 * time.Millisecond)
+		defer tk.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-tk.C:
+				fd.RecordHeartbeat("peer")
+			}
+		}
+	}()
+
+	if !waitForState(pm, "peer", NodeStateActive, 3*time.Second) {
+		s, _ := nodeState(pm, "peer")
+		t.Fatalf("recovered peer never returned to ACTIVE (state %s)", s)
+	}
+	owns := false
+	for deadline := time.Now().Add(time.Second); !owns && time.Now().Before(deadline); {
+		pm.mu.RLock()
+		for _, p := range pm.Partitions {
+			if p.PrimaryNode == "peer" {
+				owns = true
+				break
+			}
+		}
+		pm.mu.RUnlock()
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !owns {
+		t.Error("ACTIVE peer owns no partition after the recovery rebalance")
+	}
+	if peers := pm.SearchPeers("self"); len(peers) != 1 || peers[0] != "peer" {
+		t.Errorf("SearchPeers = %v, want [peer]", peers)
+	}
+	if fd.GetMetrics().NodesReactivated.Load() == 0 {
+		t.Error("NodesReactivated not incremented")
+	}
+}
+
+// TestFD_RecoveringNeedsSuccessfulPings: a RECOVERING node whose pings fail
+// is not promoted, however fresh its heartbeats.
+func TestFD_RecoveringNeedsSuccessfulPings(t *testing.T) {
+	pm := newTestPM(t, "self", "peer")
+	fd := NewFailureDetector(pm, fastFDConfig())
+	fd.SetLocalNode("self")
+	fd.ping = func(string, int) bool { return false }
+	if err := pm.UpdateNodeState("peer", NodeStateRecovering); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 5; i++ {
+		fd.RecordHeartbeat("peer")
+		fd.promoteRecoveredNodes()
+	}
+	if s, _ := nodeState(pm, "peer"); s != NodeStateRecovering {
+		t.Fatalf("state %s with failing pings, want RECOVERING", s)
+	}
+	fd.ping = func(string, int) bool { return true }
+	fd.RecordHeartbeat("peer")
+	fd.promoteRecoveredNodes()
+	if s, _ := nodeState(pm, "peer"); s != NodeStateRecovering {
+		t.Fatalf("promoted after 1 ping, want %d confirmations", defaultRecoveryConfirmations)
+	}
+	fd.promoteRecoveredNodes()
+	if s, _ := nodeState(pm, "peer"); s != NodeStateActive {
+		t.Fatalf("state %s after 2 successful pings, want ACTIVE", s)
+	}
 }

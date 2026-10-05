@@ -27,6 +27,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"unicode"
 )
 
@@ -82,6 +83,16 @@ func newTextIndex() *TextIndex {
 type textRegistry struct {
 	mu sync.RWMutex
 	m  map[string]*TextIndex
+	// names: copy-on-write snapshot of m's keys, as vectorRegistry.names.
+	names atomic.Pointer[[]string]
+}
+
+// namespaces returns the namespaces with a text index (nil when none).
+func (r *textRegistry) namespaces() []string {
+	if p := r.names.Load(); p != nil {
+		return *p
+	}
+	return nil
 }
 
 func (r *textRegistry) get(ns string) (*TextIndex, bool) {
@@ -105,6 +116,11 @@ func (r *textRegistry) getOrCreate(ns string) *TextIndex {
 	}
 	ti := newTextIndex()
 	r.m[ns] = ti
+	names := make([]string, 0, len(r.m))
+	for n := range r.m {
+		names = append(names, n)
+	}
+	r.names.Store(&names)
 	return ti
 }
 
