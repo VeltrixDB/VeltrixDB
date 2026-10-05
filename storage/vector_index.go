@@ -48,6 +48,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 )
 
 // vectorKeyPrefix is the reserved keyspace where vectors are persisted:
@@ -246,6 +247,27 @@ type VectorSearchOptions struct {
 type vectorRegistry struct {
 	mu sync.RWMutex
 	m  map[string]*VectorIndex
+	// names is a copy-on-write snapshot of m's keys (nil until the first
+	// namespace), read lock-free by the DEL cascade (search_hooks.go) so a
+	// Delete on an engine without vector namespaces pays one atomic load.
+	names atomic.Pointer[[]string]
+}
+
+// publishNamesLocked refreshes names; r.mu must be held for writing.
+func (r *vectorRegistry) publishNamesLocked() {
+	names := make([]string, 0, len(r.m))
+	for ns := range r.m {
+		names = append(names, ns)
+	}
+	r.names.Store(&names)
+}
+
+// namespaces returns the registered namespaces (nil when there are none).
+func (r *vectorRegistry) namespaces() []string {
+	if p := r.names.Load(); p != nil {
+		return *p
+	}
+	return nil
 }
 
 func (r *vectorRegistry) get(ns string) (*VectorIndex, bool) {
@@ -277,6 +299,7 @@ func (se *StorageEngine) RegisterVectorNamespace(ns string, dim int) error {
 		r.m = map[string]*VectorIndex{}
 	}
 	r.m[ns] = &VectorIndex{dim: dim, byID: map[string]int32{}}
+	r.publishNamesLocked()
 	return nil
 }
 
@@ -363,6 +386,7 @@ func (se *StorageEngine) applyVectorNSConfig(ns string, val []byte) error {
 	existing, ok := r.m[ns]
 	if !ok {
 		r.m[ns] = cfg.newIndex(se.vectorScratchDir())
+		r.publishNamesLocked()
 		return nil
 	}
 	if err := checkDim(ns, existing, cfg.Dim); err != nil {

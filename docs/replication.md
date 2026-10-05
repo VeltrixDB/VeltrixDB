@@ -130,7 +130,7 @@ if e.Type == EntryNormal && len(e.Command) > 0 {
 
 The new leader persists the no-op and broadcasts it immediately, so it normally commits within one round trip. Writes submitted meanwhile are accepted; they commit after the no-op.
 
-**Reads on a new leader wait for the no-op too.** Until the no-op is applied, the new leader's state machine may not yet contain entries its predecessor committed and acknowledged. Serving a local GET in that window returned "not found" for an acknowledged write (`TestRaftClusterFailover` failed intermittently this way; nothing was lost). `RaftNode.WaitLeaderApplied` blocks reads on a leader until `lastApplied ≥` its no-op index (≤ `readIndexTimeout`, 2 s); after that it is one atomic load. Followers never wait — their local reads are stale by design; use `--linearizable-reads` for the ReadIndex fence. GET and every MGET path go through the same barrier (`coordinator.readBarrier`). Without it, a unit test missed the acknowledged write in 20 of 20 failovers; with it, 0 of 20.
+**Reads on a new leader wait for the no-op too.** Until the no-op is applied, the new leader's state machine may not yet contain entries its predecessor committed and acknowledged. Serving a local GET in that window returned "not found" for an acknowledged write (`TestRaftClusterFailover` failed intermittently this way; nothing was lost). `RaftNode.WaitLeaderApplied` blocks reads on a leader until `lastApplied ≥` its no-op index (≤ `readIndexTimeout`, 2 s); after that it is one atomic load. Followers never wait — their local reads are stale by design; use `--linearizable-reads` for the ReadIndex fence. Every read path — GET, MGET, namespace, hash, list / set, `RANGE` / `SCANCUR`, `VER` / `GETVER`, `IDXQUERY`, `QUERY` and search, text and binary — goes through the same barrier (`coordinator.readBarrier`, invariant 58); with `--linearizable-reads` that barrier is the ReadIndex fence, so all of them redirect on followers (`cmd/server/read_barrier_test.go`). Without it, a unit test missed the acknowledged write in 20 of 20 failovers; with it, 0 of 20.
 
 ### Persistence
 
@@ -182,8 +182,10 @@ coordinator.Put(key, value)            (cmd/server/coordinator.go)
     ├─ StorageEngine.Put(key, value)    ← local write first
     ▼
 ReplicationEngine.OnLocalWrite(op)
-    │ (registered in pendingWrites, enqueued to writeQueue, cap 10000;
-    │  never blocks — a full queue returns "write queue full")
+    │ (registered in the retention buffer, enqueued to writeQueue, cap 10000;
+    │  never blocks — on a full queue the op stays retained, healthy replicas
+    │  go LAG and anti-entropy is kicked at once to deliver it;
+    │  counted in WriteQueueOverflows)
     ▼
 backgroundReplicationWorker()
     │ batches up to BatchSize (100) entries or FlushIntervalMs (10 ms)
@@ -191,13 +193,16 @@ backgroundReplicationWorker()
 replicateBatch(ops)
     ├─ goroutine → replica 1: sendReplicationRPC(ops) → TCP
     ├─ goroutine → replica 2: sendReplicationRPC(ops) → TCP
-    └─ … (every replica not in FAILED state)
+    └─ … (every replica in SYNC or LAG; FAILED / SYNC_PENDING replicas
+          are caught up by the recovery worker instead)
 
 coordinator, for quorum/strong:
     WaitForReplication(seq, target, 10000 ms)
-       polls every 1 ms until 1 + #replicas with LastAckSeqNum ≥ seq ≥ target
+       polls every 1 ms until 1 + #replicas that acked this exact op ≥ target
        (target = RF/2+1 for quorum, RF for strong)
 ```
+
+The **retention buffer** (`pendingWrites`) holds every op until every registered replica, live or not, has acked it; acks are tracked per op and per replica. It is bounded by `MaxRetainedOps` (100 000): on overflow the oldest 10 % are dropped and every replica that had not acked them is flagged for a change-feed catch-up (see Replica Recovery). `WaitForReplication` counts the replicas that acked that op, so an ack of a later sequence number never satisfies a wait for an earlier one (concurrent writers can enqueue seq N+1 before N); once the op has left the buffer it falls back to `LastAckSeqNum`. The buffer is in memory: a primary restart forgets what its replicas had not acked.
 
 Deletes replicate the same way as tombstone ops. `MultiPut` is replicated entry by entry. Each replica runs a `ReplicationServer` (default port client+1) that receives the batch — a `RELP` magic header plus a gob-encoded `[]*WriteOperation` — and calls `applyFn` for each operation: `StorageEngine.Delete` for a tombstone, otherwise `StorageEngine.Put`. Vector, text and index-definition writes replicate as plain keys on their reserved prefixes; the engine's search hooks update the replica's RAM indexes.
 
@@ -213,56 +218,79 @@ func (vv *VersionVector) HappenedBefore(other *VersionVector) bool
 func (vv *VersionVector) Concurrent(other *VersionVector) bool
 ```
 
-They are not wired in: the server does not set `VersionVector` on its writes, nothing compares them, and no conflict resolution runs. A replica simply applies each received op with `Put`/`Delete`, in arrival order. The `ConflictResolutions` counter (`veltrixdb_replication_conflict_resolutions_total`) is never incremented.
+They are reserved, not wired in: the server does not set `VersionVector` on its writes, nothing compares them, and no conflict resolution runs. A replica simply applies each received op with `Put`/`Delete`, in arrival order, so concurrent writes to one key on different nodes can leave replicas with different values. The type and the `WriteOperation` field stay for wire-format and API stability. The metrics that implied otherwise — `veltrixdb_replication_conflict_resolutions_total` and `veltrixdb_replication_vector_clock_updates_total`, both always 0 — were removed, along with the engine's unused per-replica version-vector map.
 
 ### Anti-Entropy
 
-The `backgroundAntiEntropyWorker` runs every 30 seconds (`AntiEntropyInterval`). For each replica in state `LAG` or `SYNC_PENDING` it re-sends every op in `pendingWrites` whose sequence number is above that replica's `LastAckSeqNum`:
-
-```
-Anti-entropy check (every 30 s)
-    │
-    ▼
-For each replica in LAG / SYNC_PENDING:
-    find ops where seqNum > replica.LastAckSeqNum
-    sendToReplica(pendingOps)
-    │
-    ▼
-Success → state SYNC, LastAckSeqNum advanced
-```
-
-`pendingWrites` only holds ops not yet acked by every replica. Anti-entropy is not a full-state sync: it never compares keyspaces, and it does not touch replicas in `FAILED` state.
+The `backgroundAntiEntropyWorker` runs every 30 seconds (`AntiEntropyInterval`). For each replica in state `LAG` it re-sends every retained op that replica has not acked; success returns it to `SYNC`. Anti-entropy is not a full-state sync: it never compares keyspaces. `FAILED` and `SYNC_PENDING` replicas are handled by the recovery worker.
 
 ### Replica States
 
 | State | Meaning |
 |-------|---------|
-| `SYNC` | Last send to the replica succeeded |
-| `SYNC_PENDING` | Defined, but never set by the current code |
-| `LAG` | Set only by backpressure: lag above `BackpressureLagBytes` (0 = disabled, the server default). Anti-entropy retries it |
-| `FAILED` | Set on any failed send. FAILED replicas are skipped by `replicateBatch` and by anti-entropy, and nothing in `replication/` moves them back to `SYNC` — in practice a replica stays failed until the primary restarts |
+| `SYNC` | Healthy: receives live batches |
+| `LAG` | Set only by backpressure: lag above `BackpressureLagBytes` (0 = disabled, the server default). Still receives live batches; anti-entropy retries it; the next successful send returns it to `SYNC` |
+| `FAILED` | Set on any failed send. Receives no live batches (the ops it misses stay in the retention buffer); re-probed by the recovery worker with backoff |
+| `SYNC_PENDING` | The replica answered a probe and is being caught up; still no live batches. Ends in `SYNC` (caught up) or back in `FAILED` (a catch-up send failed) |
+
+### Replica Recovery
+
+`backgroundRecoveryWorker` (`replication/engine.go`, `recoverFailedReplicas` / `recoverReplica`) re-probes each `FAILED` replica once its backoff has elapsed. The first probe is `RecoveryProbeInterval` (1 s) after the failure; each failed attempt doubles the delay, up to `RecoveryMaxBackoff` (30 s); recovery resets it.
+
+```
+FAILED ──(backoff elapsed)──► Ping (empty batch, acked without applying; ReplicationClient.Ping)
+   ▲                             │ ok
+   │                             ▼
+   │                        SYNC_PENDING
+   │                             │ 1. if retained ops it never acked were dropped (buffer overflow):
+   │                             │    stream the primary's change feed (StorageEngine.ChangesSince,
+   │                             │    current value or tombstone of every key written since the
+   │                             │    oldest dropped op − 10 s, pages of 1000, TTLs preserved)
+   │                             │ 2. replay every retained op it has not acked, in SeqNum order,
+   │                             │    in BatchSize chunks; repeat until none is left
+   └──── any send fails ─────────┤
+                                 ▼ (checked under the engine lock — later writes reach it live)
+                               SYNC
+```
+
+`cmd/server` installs the change-feed source (`engineCatchUp`, `cmd/server/cluster_setup.go`). A library user without `SetCatchUpSource` gets the replay of retained ops only; if ops were dropped the replica is returned to `SYNC` anyway, a warning is logged and `CatchUpGaps` is incremented. The change-feed catch-up ships the primary's current state, not every intermediate version, and like all replication it is applied in arrival order (no conflict resolution).
+
+Limits: retention and replica state are in memory, so a replica that was down when the primary restarted is not caught up for writes made before that restart; a replica only learns writes the primary originated (each node replicates its own writes).
+
+Replica state is visible in `GET /admin/cluster` (`replication[].state`, `lag_ns`, `last_ack_unix_nano`, `next_probe_unix_nano` while FAILED) and in Prometheus (below).
 
 ### Lag Monitoring
 
-The `backgroundLagMonitor` runs every second and sums each replica's `LagBytes` (un-acked bytes since its last successful send) into `ReplicationMetrics.ReplicaLagBytes`. Exposed via Prometheus as:
-- `veltrixdb_replication_lag_bytes`
-- `veltrixdb_replication_lag_nanoseconds` — reads `ReplicaLagNs`, which nothing writes, so it is always 0 (per-replica `LagNs` holds the last send's duration and is visible only via `GetReplicaLag`)
+The `backgroundLagMonitor` runs every second. For each replica it computes the age of the oldest write that replica has not acked (0 when caught up) — `LagNs`, shown per replica as `lag_ns` in `/admin/cluster` — and publishes:
+- `veltrixdb_replication_lag_nanoseconds` — the maximum `LagNs` across replicas
+- `veltrixdb_replication_lag_bytes` — sum of each replica's `LagBytes` (bytes of failed sends since its last successful one)
+- `veltrixdb_replication_replicas_failed`, `veltrixdb_replication_replicas_sync_pending` — gauges of replicas in each state
+- `veltrixdb_replication_recovery_probes_total`, `veltrixdb_replication_replica_recoveries_total` — reconnect probes sent, and recoveries completed (FAILED → SYNC_PENDING → SYNC)
 
-Other replication metrics: `veltrixdb_replication_writes_total`, `veltrixdb_replication_failures_total`, `veltrixdb_replication_anti_entropy_runs_total`, `veltrixdb_replication_vector_clock_updates_total`.
+Other replication metrics: `veltrixdb_replication_writes_total`, `veltrixdb_replication_failures_total`, `veltrixdb_replication_anti_entropy_runs_total`.
 
 ### Tombstone Coordination
 
-The `TombstoneCoordinator` (`storage/tombstone_replicated.go`) is meant to keep the GC from reaping tombstones before every replica has acknowledged them:
+The `TombstoneCoordinator` (`storage/tombstone_replicated.go`) keeps the GC from reaping a tombstone before every replica has acknowledged it. In `--mode=replicated` the lag monitor reports each replica's watermark every second (`SetWatermarkObserver` → `StorageEngine.SetReplicaWatermark`): the timestamp of the oldest write the replica has not acked, or now when it is caught up, minus a 10 s margin. The defragmenter's `reapExpiredTombstones` then applies:
 
 ```
-CanReapTombstone(tombstoneTsUs, nowUs, gracePeriodSec) → false
-    if the tombstone is younger than the grace period, or
-    if any replica's acked watermark < tombstoneTsUs
+canReapTombstone(ts, now, grace):
+    age < grace                     → keep   (unchanged floor; also protects repl-ship's catch-up feed)
+    age ≥ 2 × grace                 → reap   (upper bound: a replica that never catches up
+                                              delays reaping by at most one more grace period)
+    min replica watermark < ts      → keep   (a replica has not acknowledged the delete)
+    otherwise                       → reap
 ```
 
-It is not wired in yet: the replication engine never calls `SetReplicaWatermark`, and the defragmenter's `reapExpiredTombstones` uses only `GCGracePeriodSec` (86400 s) and never calls `CanReapTombstone`. A replica that misses a delete for longer than the grace period is not protected.
+With no replica watermark (single node, `--mode=raft`) the grace period (`GCGracePeriodSec`, 86400 s) alone applies, as before. Held tombstones are logged per pass (`[gc] tombstones reaped=… held_for_replicas=…`). Watermarks are in memory and are re-reported within a second of a restart. A replica that stays down longer than 2 × the grace period can still miss a delete whose tombstone was reaped: its change-feed catch-up no longer contains it.
 
 ---
+
+## CDC and `repl-ship` (cross-process)
+
+The engine's in-process CDC broker (`storage/cdc.go`) is the feed `cmd/repl-ship` ships from: it long-polls `/admin/cdc` and forwards each event over the binary protocol. Every engine write path emits one event per key, `PUT` (with the value) or `DEL`, after that key's index entry is installed: `Put`, `Delete`, `MultiPut` — which carries MPUT, server-coalesced pipelined PUTs, TXN commit, Raft `ApplyBatch` and the WriteBatcher — and the atomic ops (CAS / INCR / DECR / SETNX, emitted as `PUT` while the shard lock is held). A CAS mismatch or a SETNX on an existing key writes nothing and emits nothing. TTL expiry emits nothing.
+
+Delivery never blocks a writer: a subscriber whose buffer is full loses that event (`cdc_dropped_total` in `/admin/stats`) and is disconnected after 3 consecutive drops; a successful send resets the count. While repl-ship is down it catches up from the durable `/admin/changes` feed on restart (last-write-wins).
 
 ## Raft vs. the Replication Engine
 

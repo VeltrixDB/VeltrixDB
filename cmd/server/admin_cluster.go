@@ -40,6 +40,8 @@ type replicaStatus struct {
 	LastAckSeqNum uint64 `json:"last_ack_seq"`
 	LagBytes      uint64 `json:"lag_bytes"`
 	LagNs         int64  `json:"lag_ns"`
+	LastAckAt     int64  `json:"last_ack_unix_nano"`
+	NextProbeAt   int64  `json:"next_probe_unix_nano,omitempty"`
 }
 
 type nodeEntry struct {
@@ -104,6 +106,8 @@ func buildTopology(coord *coordinator, pm *cluster.PartitionMap) topologyRespons
 					LastAckSeqNum: lag.LastAckSeqNum,
 					LagBytes:      lag.LagBytes,
 					LagNs:         lag.LagNs,
+					LastAckAt:     lag.LastAckAt,
+					NextProbeAt:   lag.NextProbeAt,
 				})
 			}
 		}

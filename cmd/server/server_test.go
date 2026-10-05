@@ -35,6 +35,13 @@ type testServer struct {
 // vector indexes from persisted "@vec/..." keys.
 func startTestServer(t *testing.T, dataDir string, ae *security.AuthEnforcer) *testServer {
 	t.Helper()
+	return startTestServerCoord(t, dataDir, ae, newStandaloneCoordinator)
+}
+
+// startTestServerCoord is startTestServer with the coordinator built by mk
+// (e.g. a raft-mode coordinator for the read-barrier tests).
+func startTestServerCoord(t *testing.T, dataDir string, ae *security.AuthEnforcer, mk func(*storage.StorageEngine) *coordinator) *testServer {
+	t.Helper()
 	cfg := storage.DefaultStorageConfig()
 	// Background scrubber does real disk I/O per VLog; tests do not need it.
 	cfg.ScrubEnabled = false
@@ -64,13 +71,14 @@ func startTestServer(t *testing.T, dataDir string, ae *security.AuthEnforcer) *t
 	if ae == nil {
 		ae = security.NewAuthEnforcer()
 	}
+	coord := mk(engine)
 	go func() {
 		for {
 			conn, err := ln.Accept()
 			if err != nil {
 				return
 			}
-			go handleConn(conn, engine, ae, newStandaloneCoordinator(engine))
+			go handleConn(conn, engine, ae, coord)
 		}
 	}()
 	return &testServer{engine: engine, ln: ln, addr: ln.Addr().String()}

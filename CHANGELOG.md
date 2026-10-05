@@ -11,6 +11,38 @@ Releases are cut automatically on every merge to `main` (GitHub release +
 
 ## [Unreleased]
 
+### Fixed
+
+- **Key TTLs survive restarts.** The WAL carried no TTL, so after any restart
+  (crash replay or clean-shutdown checkpoint) every TTL'd key — `PUTEX`, MPUT
+  entries, TXN, NS puts, hash fields (`HSET` / `HEXPIRE`), CAS / INCR / DECR /
+  SETNX — came back immortal, and a key that had expired came back to life. A
+  TTL'd record is now binary version 2 (8-byte absolute expiry after the
+  header) or carries an 11th text field; TTL-free records are unchanged.
+  Replay restores the TTL and tombstones keys already expired; checkpoints,
+  backups and PITR archives carry it. **Rollback:** builds without this change
+  stop replay at the first TTL'd record and drop everything after it — before
+  downgrading, run once with the new `--wal-format=text-legacy` and stop
+  cleanly (TTL'd keys become immortal on the older build). See
+  docs/DR_RUNBOOK.md §8.
+- **`veltrix` CLI**: `status` reports readiness from the `/readyz` status code.
+  Before, it searched the body for `ok` while `/readyz` answers `ready`, so it
+  always printed NOT READY. `cdc-tail` now decodes the server's
+  `Op`/`Key`/`Value` (base64)/`Timestamp` fields and shows a value preview.
+  Before, every field printed blank. `cache`, `compaction`, `status` and `top`
+  now read the untagged `CacheStats`/`VLogStats` fields, `quotas` reads
+  `QuotaSnapshot`, `replication` reads `/admin/cluster` (not `/admin/stats`),
+  `traces` reads `start_unix_ns`, and a text-protocol `ERR …` from `get` is
+  shown as-is. Flags now work after the command (`veltrix top --watch 2`).
+  New flags: `--admin-token` (env `VELTRIX_ADMIN_TOKEN`) and `--duration`
+  (cdc-tail).
+- **`kubectl-veltrix`**: `--admin-token` / `VELTRIX_ADMIN_TOKEN`, flags after
+  the command, and `--admin-url` to skip the port-forward. `quota-set` takes
+  `--burst N` (default: the writes/s rate), form-encodes its values and checks
+  that they are numbers. HTTP errors now exit 1.
+- **`repl-ship`**: `--admin-token` is an alias for `--src-token`. The CDC
+  prefix is URL-escaped, and HTTP error bodies are logged.
+
 ### Documentation
 
 - New [docs/vector-search.md](docs/vector-search.md): commands, memory
@@ -112,6 +144,17 @@ Releases are cut automatically on every merge to `main` (GitHub release +
 
 ### Fixed
 
+- **Data-dir lock**: `NewStorageEngine` now takes an exclusive `flock` on
+  `<data-dir>/LOCK` (released by `Close`) and fails with `ErrDataDirLocked` when
+  another engine holds it. `veltrixdb-backup` pointed at a live server's
+  `--data-dirs` used to open a second engine over the live files and truncate
+  `wal.log` / `vlog_active.dat`; it now refuses and points at `POST /admin/backup`
+  / `veltrix backup`. `Restore` / `restore-pitr` take the same lock.
+- **Atomic ops honour the value transform**: CAS / INCR / DECR / SETNX now
+  compress → encrypt like `PUT` (flags, on-disk length and WAL xflags included)
+  and decrypt → decompress on a cache-miss read. They used to store plaintext
+  under `--encrypt-at-rest` and misread transformed values (INCR parse error,
+  spurious CAS mismatch).
 - Raft: a freshly elected leader served local reads before applying the
   entries its predecessor had committed, so a GET right after failover could
   miss a write the old leader had acknowledged (`TestRaftClusterFailover`

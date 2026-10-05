@@ -173,7 +173,7 @@ print(db.get("user:1001"))  # alice
 | **Data types** | Keys with TTL, hash fields with per-field TTL, lists, sets, namespaces, secondary indexes (`IDXCREATE` / `IDXQUERY`), ordered range scans (`RANGE` / `SCANCUR`) |
 | **Vector search** | HNSW (cosine), multiple namespaces, optional int8 or product quantization with exact re-rank from disk, optional on-disk layer-0 graph, metadata filters, background tombstone compaction |
 | **Full-text / hybrid** | BM25 inverted index (Unicode tokenizer), hybrid vector + text search fused by Reciprocal Rank Fusion; searches fan out across cluster nodes |
-| **Replication** | Raft consensus (with log snapshots), replicated mode with eventual / quorum / strong consistency, anti-entropy |
+| **Replication** | Raft consensus (with log snapshots), replicated mode with eventual / quorum / strong consistency, automatic recovery of failed replicas (reconnect with backoff, catch-up from retained writes or the change feed), anti-entropy; tombstone GC waits for replica acks |
 | **Transactions** | One-shot optimistic transactions (`TXN`): per-key version check at commit, committed through `MultiPut`; read-committed, not MVCC |
 | **Security** | AES-256-GCM at-rest encryption, RBAC, mTLS, append-only audit log |
 | **Quotas** | Per-namespace rate limiting (token bucket) + key-count caps |
@@ -219,22 +219,35 @@ The Operator handles rolling upgrades, auto-reshard on replica count changes, an
 ```bash
 go build -o veltrix ./cmd/veltrix
 
-veltrix status          # cluster health, ops/s, GC state
+veltrix status          # health (/healthz) + readiness (/readyz), ops, GC state
 veltrix compaction      # per-disk VLog GC: ratio, runs, emergency state
 veltrix nodes           # topology — role, Raft term, replication lag
-veltrix --watch 5 top   # live refreshing dashboard (top defaults to 2 s)
+veltrix top --watch 5   # live refreshing dashboard (top defaults to 2 s)
+veltrix cdc-tail --prefix orders/   # live PUT/DEL stream with decoded values
 veltrix put mykey val   # write a key
 veltrix get mykey       # read a key
 veltrix backup /dest    # trigger a full backup via POST /admin/backup
 veltrix --help
 ```
 
-Global flags (`--addr` admin HTTP address, default `127.0.0.1:2112`; `--tcp`
-data address, default `127.0.0.1:9000`; `--watch N`; `--json`; `--no-color`)
-must come **before** the command: the CLI uses Go's `flag` package, which
-stops parsing at the first positional argument. Other commands: `replication`,
-`cache`, `wal`, `quotas`, `cdc`, `cdc-tail`, `scrubber`, `metrics [filter]`,
-`traces`, `ping`, `del`, `checkpoint`, `version`.
+Flags: `--addr` admin HTTP address (default `127.0.0.1:2112`), `--tcp` data
+address (default `127.0.0.1:9000`), `--admin-token` (env
+`VELTRIX_ADMIN_TOKEN`), `--watch N`, `--json`, `--prefix` and `--duration N`
+(for `cdc-tail`), `--no-color`. They can go before or after the command
+(`veltrix --watch 5 top` and `veltrix top --watch 5` are the same). Put `--`
+before an argument that starts with `-` (`veltrix put k -- -1`).
+
+Against a server started with `--admin-token`, pass the same token with
+`--admin-token` or `VELTRIX_ADMIN_TOKEN`. The CLI sends it as
+`Authorization: Bearer`. Without it, `/admin/*` answers 401 and the CLI prints
+a hint. A server without a token serves `/admin/*` to loopback clients only,
+and non-loopback callers get 403. `kubectl-veltrix` (`--admin-token`,
+`--admin-url`, `quota-set NS WPS MAX [--burst N]`) and `repl-ship`
+(`--admin-token` / `--src-token`) follow the same rules.
+
+Other commands: `replication` (from `/admin/cluster`), `cache`, `wal`,
+`quotas`, `cdc`, `scrubber`, `metrics [filter]`, `traces`, `ping`, `del`,
+`checkpoint`, `version`.
 
 ---
 
@@ -253,7 +266,7 @@ stops parsing at the first positional argument. Other commands: `replication`,
 | `-group-commit` | `adaptive` | `adaptive`: flush windows are upper bounds (lone writer synced at once); `fixed`: every batch waits the full window |
 | `-wal-flush-window-ms` | `15` | WAL group-commit window (upper bound in adaptive mode) |
 | `-vlog-flush-window-ms` | `15` | VLog flush window (keep equal to WAL) |
-| `-wal-format` | `binary` | WAL record encoding; `text` only to roll back to a pre-binary build (run once, stop cleanly) |
+| `-wal-format` | `binary` | WAL record encoding: `binary`, `text`, or `text-legacy` — the rollback mode (run once, stop cleanly, then downgrade; it drops key TTLs, which older builds cannot read) |
 | `-net` | `go` | Network front-end: `go` \| `cpp` \| `uring` \| `poll` (C++ front-ends are opt-in, experimental, binary subset only, standalone without `-auth-config`) |
 | `-net-threads` | NumCPU | Event loops for the C++ front-end |
 | `-pprof-addr` | — (off) | CPU/heap/trace profiles on a separate listener |
@@ -294,7 +307,7 @@ PUT/DELETE/MultiPut/atomic/TXN goes through a write coordinator):
 | Mode | Writes | Consistency guarantee |
 |------|--------|-----------------------|
 | `standalone` (default) | Local engine only. Identical to the historical single-node behaviour. | Single-node linearizable. |
-| `raft` | Quorum-committed through a Raft log, applied on all nodes via a storage-backed state machine. Non-leaders return an `ERR MOVED <leader-addr> <leader-id>` redirect. | **Linearizable writes.** Reads are local by default (possibly stale on followers); `-linearizable-reads` sends GET through the ReadIndex fence. |
+| `raft` | Quorum-committed through a Raft log, applied on all nodes via a storage-backed state machine. Non-leaders return an `ERR MOVED <leader-addr> <leader-id>` redirect. | **Linearizable writes.** Reads are local by default (possibly stale on followers); `-linearizable-reads` sends every read (GET, MGET, namespace, hash, list/set, RANGE / SCANCUR, VER, index / query / search) through the ReadIndex fence. |
 | `replicated` | Local write + primary-copy replication; `-consistency` sets the ACK point. | Durability across N copies; **not** linearizable under concurrent writers. Reads local. |
 
 `-consistency` (replicated mode): `eventual` ACKs after the local write;
@@ -375,7 +388,9 @@ graph is rebuilt from the persisted vectors at startup (it is not saved).
 **Text.** `TSET` indexes a document for BM25 (lowercased letter/digit runs, no
 stemming or stop words). One id names one record across all of these: `PUT
 doc-42 {"lang":"en"}`, `VSET doc-42 ...` and `TSET doc-42 ...` describe the
-same thing, and `HSEARCH` fuses the vector and text rankings of a namespace by
+same thing — `DEL doc-42` also deletes its vectors and text documents in
+every namespace (a vector or document whose id never had a record is left
+alone; `VDEL` / `TDEL` remove it) — and `HSEARCH` fuses the vector and text rankings of a namespace by
 reciprocal rank (`ALPHA` = vector weight, default 0.5; `CAND` = candidates per
 list, default max(50, 4k)). Either half may be omitted.
 
@@ -431,7 +446,11 @@ read as a text line.
 ```bash
 go build -o veltrixdb-backup ./cmd/backup
 
-# Full local backup
+# Full backup of a RUNNING server (online, via the admin port)
+veltrix --addr 127.0.0.1:2112 backup /backup/2026-05-26
+
+# Offline full backup of a STOPPED server's dirs (refuses a live server's
+# dirs: every engine holds an exclusive <data-dir>/LOCK)
 veltrixdb-backup full --data-dirs=/data --dest=/backup/2026-05-26
 
 # Upload to S3
@@ -484,9 +503,9 @@ These are real gaps. We'd rather you know them upfront:
 - **No Redis protocol (RESP).** You can't point a Redis client at VeltrixDB yet. RESP compatibility is on the roadmap — once it ships, migration requires only a connection-string change.
 - **No managed cloud offering.** Self-hosted only today. Managed service is planned.
 - **Range scans cost memory on every write.** `RANGE` and `SCANCUR` are served by an ordered skiplist of all live keys (~90 B/key resident). `--disable-ordered-index` gives that memory back, and then both commands return an error.
-- **CDC's live stream is in-process and lossy under back-pressure.** `/admin/cdc` subscribers that fall behind are dropped. `repl-ship` survives its own downtime by replaying from the durable `/admin/changes` feed (index-backed, includes tombstones) on restart, but that is last-write-wins: intermediate versions of a key are not replayed, and the source gets no back-pressure.
-- **Raft reads are local by default (possibly stale on followers).** `raft` mode gives linearizable *writes* (quorum commit); reads are served from local applied state. A newly elected leader first applies everything its predecessor committed, so reads on the leader include every acknowledged write. For linearizable reads use `--linearizable-reads` (ReadIndex fence; followers redirect to the leader). The barrier covers GET and MGET only; namespace, hash and `RANGE` / `SCANCUR` reads stay local.
-- **Replicated mode is not linearizable.** `replicated` mode is primary-copy replication for durability across copies; it has no single-writer ordering, so concurrent writers to the same key are not linearizable. Use `raft` mode when you need write linearizability.
+- **CDC's live stream is in-process and lossy under back-pressure.** Every write path emits (PUT, DEL, MPUT, pipelined PUTs, TXN, Raft batch apply, CAS / INCR / DECR / SETNX), one event per key, but `/admin/cdc` subscribers whose buffer is full lose events and are dropped after 3 consecutive misses. `repl-ship` survives its own downtime by replaying from the durable `/admin/changes` feed (index-backed, includes tombstones) on restart, but that is last-write-wins: intermediate versions of a key are not replayed, and the source gets no back-pressure.
+- **Raft reads are local by default (possibly stale on followers).** `raft` mode gives linearizable *writes* (quorum commit); reads are served from local applied state. A newly elected leader first applies everything its predecessor committed, so reads on the leader include every acknowledged write. For linearizable reads use `--linearizable-reads` (ReadIndex fence; followers redirect to the leader). The barrier covers every read command on both protocols — GET / MGET, namespace (`NSGET` / `NSSCAN` / `NSLIST`), hash, list and set reads, `RANGE` / `SCANCUR`, `VER` / `GETVER`, `IDXQUERY`, `QUERY` and vector / text / hybrid search.
+- **Replicated mode is not linearizable.** `replicated` mode is primary-copy replication for durability across copies; it has no single-writer ordering, so concurrent writers to the same key are not linearizable. Use `raft` mode when you need write linearizability. There is no conflict resolution either (version vectors are not used): replicas apply writes in arrival order. Replica catch-up state (the retention buffer) is in memory, so a replica that was down when its primary restarted does not get the writes it missed before that restart.
 - **Distributed searches ask every node.** Each vector / text / hybrid search, `QUERY` and `IDXQUERY` runs on all non-failed nodes, so its cost grows with the cluster. If a peer does not answer within `--search-timeout-ms`, the request fails and names it — until the failure detector marks it failed — unless `--search-allow-partial` is set.
 - **Search indexes live in RAM and are rebuilt at every start.** Vector codes (float32 / int8 / PQ), graph nodes and the BM25 inverted index are in memory (layer-0 graph edges can go to a mapped file with `GRAPH disk`); the full-precision vectors and document text stay on NVMe. Searches are refused until the rebuild finishes. Tested to 100K real vectors; 10M+ is untested.
 - **No same-hardware comparison yet** with Aerospike, ScyllaDB or other vector databases. `bench/compare` is the harness; its Aerospike / ScyllaDB paths are compile-checked only.

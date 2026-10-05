@@ -85,6 +85,17 @@ func (e *IndexEntry) IsEncrypted() bool  { return e.Flags&FlagEncrypted != 0 }
 func (e *IndexEntry) HasTTL() bool       { return e.Flags&FlagHasTTL != 0 }
 func (e *IndexEntry) IsPacked() bool     { return e.Flags&FlagPacked != 0 }
 
+// CacheExpiryUs is the deadline the LIRS cache records for this entry's value:
+// TTLExpiryUs when the entry has a TTL, 0 (immortal) otherwise. Every cache
+// fill must pass it so a cache hit can refuse an expired key (see
+// hashedGetter).
+func (e *IndexEntry) CacheExpiryUs() int64 {
+	if e.HasTTL() && e.TTLExpiryUs > 0 {
+		return e.TTLExpiryUs
+	}
+	return 0
+}
+
 func (e *IndexEntry) IsExpired(nowUs int64) bool {
 	return e.HasTTL() && e.TTLExpiryUs > 0 && nowUs >= e.TTLExpiryUs
 }
@@ -134,6 +145,23 @@ type WALEntry struct {
 	// serves ciphertext as if it were plaintext.
 	// Stored as the 10th pipe-delimited WAL field (hex).
 	XformFlags uint8
+	// TTLExpiryUs is the key's absolute expiry in Unix microseconds — the
+	// same value as IndexEntry.TTLExpiryUs — or 0 for an immortal key. Replay
+	// restores FlagHasTTL + TTLExpiryUs from it, and treats a record already
+	// past its expiry as expired. Binary: a version-2 record (header bytes
+	// 48–55, wal_format.go); text: the optional 11th field. Records with 0
+	// are encoded exactly as before this field existed.
+	TTLExpiryUs int64
+}
+
+// walTTLExpiryUs is the absolute expiry (µs) a write with ttl seconds made
+// at nowUs gets — the IndexEntry.TTLExpiryUs rule shared by every write path,
+// so the WAL record and the in-memory entry can never disagree. 0 = immortal.
+func walTTLExpiryUs(nowUs int64, ttl int32) int64 {
+	if ttl <= 0 {
+		return 0
+	}
+	return nowUs + int64(ttl)*1_000_000
 }
 
 // ── SSTable metadata ─────────────────────────────────────────────────────────
@@ -569,11 +597,14 @@ type StorageConfig struct {
 	WALMaxBatchEntries int // default 1024
 
 	// WALFormat is the encoding for NEW WAL records and clean-shutdown
-	// checkpoints: "binary" (default, also "") or "text". Replay reads both,
-	// in any mix, regardless of this setting. "text" exists only to roll back
-	// to a pre-binary build: run once with it, shut down cleanly (the
-	// checkpoint rewrites wal.log as text), then downgrade. Text records
-	// cannot represent keys containing '|' or '\n' — see wal_format.go.
+	// checkpoints: "binary" (default, also ""), "text" or "text-legacy".
+	// Replay reads all of them, in any mix, regardless of this setting.
+	// "text-legacy" is the rollback mode: run once with it, shut down cleanly
+	// (the checkpoint rewrites wal.log as text without the TTL field), then
+	// downgrade to any older build — keys written with a TTL come back
+	// immortal there. "text" keeps the TTL field (11th), which builds older
+	// than it cannot parse. Text records cannot represent keys containing
+	// '|' or '\n' — see wal_format.go.
 	WALFormat string
 
 	// Write stall / back-pressure

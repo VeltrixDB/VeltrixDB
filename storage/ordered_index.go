@@ -340,9 +340,9 @@ var ErrOrderedIndexDisabled = errors.New("ordered index disabled (StorageConfig.
 
 // scanLive returns the value for key if it is live right now, or ok=false
 // when it is tombstoned, TTL-expired, or was reaped between the skiplist step
-// and this check.  Liveness comes from the primary index entry — NOT from
-// Get's cache-first path, which can serve a cached value for a key whose TTL
-// has since elapsed.  The tombstone/TTL flags are read while the shard RLock
+// and this check.  Liveness comes from the primary index entry (Get's cache
+// hit also refuses an expired key now, but the index is authoritative and the
+// check here is what lazily tombstones it).  The tombstone/TTL flags are read while the shard RLock
 // is held (they are mutated in place under the shard write lock), and the
 // RLock is released before any other lock or I/O — consistent with the LOCK
 // ORDER note in the file header.  An expired key is lazily tombstoned here

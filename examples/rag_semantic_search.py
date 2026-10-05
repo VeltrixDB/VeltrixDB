@@ -8,9 +8,10 @@ The pattern:
      assemble the prompt for your LLM.
 
 One database holds both sides: the record (PUT / DEL) and its vector
-(VSET / VDEL) share one write path, one WAL, one backup. They are separate
-keys, though — DEL removes only the record, so delete a chunk with DEL and
-VDEL (the vector otherwise stays searchable).
+(VSET / VDEL) share one write path, one WAL, one backup. Deleting a chunk's
+record with DEL also deletes its vector (and any TSET text) in every
+namespace, so the chunk stops showing up in VSEARCH / HSEARCH. A vector with
+no record under its key is removed only by VDEL.
 
 This demo uses a deterministic hashing bag-of-words embedder so it runs with
 no dependencies. In production, swap `embed()` for a real model

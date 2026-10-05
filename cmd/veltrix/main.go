@@ -14,7 +14,7 @@
 //	veltrix wal               WAL bytes, entries, flush rate
 //	veltrix quotas            Per-namespace quota usage
 //	veltrix cdc               CDC broker stats
-//	veltrix top               Live dashboard — refreshes every 2 s (or -w N)
+//	veltrix top               Live dashboard — refreshes every 2 s (or --watch N)
 //	veltrix metrics [filter]  Raw Prometheus metrics, optional grep filter
 //	veltrix traces            Recent OTel spans from the in-process ring buffer
 //	veltrix ping              Round-trip latency check
@@ -25,13 +25,16 @@
 //	veltrix backup DEST_DIR   Trigger a full backup to DEST_DIR
 //	veltrix version           Engine version + schema version
 //
-// Global flags:
+// Flags (accepted before or after the command; see parseArgs):
 //
-//	--addr    Admin/metrics address  (default 127.0.0.1:2112)
-//	--tcp     TCP data address       (default 127.0.0.1:9000)
-//	--watch N Repeat command every N seconds (0 = run once)
-//	--json    Print raw JSON instead of formatted tables
-//	--no-color  Disable ANSI colours (auto-disabled when not a TTY)
+//	--addr         Admin/metrics address  (default 127.0.0.1:2112)
+//	--tcp          TCP data address       (default 127.0.0.1:9000)
+//	--admin-token  /admin/* token, sent as Authorization: Bearer (env VELTRIX_ADMIN_TOKEN)
+//	--watch N      Repeat command every N seconds (0 = run once)
+//	--json         Print raw JSON instead of formatted tables
+//	--prefix P     cdc-tail key-prefix filter
+//	--duration N   cdc-tail: stop after N seconds
+//	--no-color     Disable ANSI colours (auto-disabled when not a TTY)
 
 package main
 
@@ -45,6 +48,7 @@ import (
 	"math"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"sort"
 	"strconv"
@@ -257,9 +261,57 @@ func gcRatioColor(ratio float64) string {
 
 var httpClient = &http.Client{Timeout: 10 * time.Second}
 
+// out is where every command writes its output (tests swap it for a buffer).
+var out io.Writer = os.Stdout
+
+// adminToken is the --admin-token / VELTRIX_ADMIN_TOKEN value. When set it is
+// sent as "Authorization: Bearer <token>" on every HTTP request — the header
+// adminapi.Guard checks for /admin/* (/metrics, /healthz, /readyz ignore it).
+var adminToken string
+
+// baseURL turns --addr into a URL prefix; a bare host:port gets http://.
+func baseURL(adminAddr string) string {
+	if strings.HasPrefix(adminAddr, "http://") || strings.HasPrefix(adminAddr, "https://") {
+		return strings.TrimRight(adminAddr, "/")
+	}
+	return "http://" + adminAddr
+}
+
+func newRequest(method, url string, body io.Reader) (*http.Request, error) {
+	req, err := http.NewRequest(method, url, body)
+	if err != nil {
+		return nil, err
+	}
+	if adminToken != "" {
+		req.Header.Set("Authorization", "Bearer "+adminToken)
+	}
+	return req, nil
+}
+
+// httpError formats a non-2xx admin response, adding a hint for the two
+// adminapi.Guard rejections (401 bad/missing token, 403 loopback-only).
+func httpError(code int, url string, body []byte) error {
+	msg := fmt.Sprintf("HTTP %d from %s: %s", code, url, strings.TrimSpace(string(body)))
+	switch code {
+	case http.StatusUnauthorized:
+		if adminToken == "" {
+			msg += " (server requires an admin token: pass --admin-token or set VELTRIX_ADMIN_TOKEN)"
+		} else {
+			msg += " (the --admin-token / VELTRIX_ADMIN_TOKEN value was rejected)"
+		}
+	case http.StatusForbidden:
+		msg += " (server has no --admin-token, so /admin/* is loopback-only: run the CLI on the node, or start the server with --admin-token and pass the same token here)"
+	}
+	return fmt.Errorf("%s", msg)
+}
+
 func adminGet(adminAddr, path string) ([]byte, error) {
-	url := "http://" + adminAddr + path
-	resp, err := httpClient.Get(url)
+	url := baseURL(adminAddr) + path
+	req, err := newRequest(http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("GET %s: %w", url, err)
 	}
@@ -269,27 +321,52 @@ func adminGet(adminAddr, path string) ([]byte, error) {
 		return nil, err
 	}
 	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("HTTP %d from %s: %s", resp.StatusCode, url, strings.TrimSpace(string(body)))
+		return nil, httpError(resp.StatusCode, url, body)
 	}
 	return body, nil
 }
 
+// probe GETs a health endpoint and returns its status code and trimmed body.
+// /healthz answers 200 "ok"; /readyz answers 200 "ready", or 503 with
+// "initializing" / "degraded: disks [...] failed" (cmd/server/main.go).
+func probe(adminAddr, path string) (int, string, error) {
+	url := baseURL(adminAddr) + path
+	req, err := newRequest(http.MethodGet, url, nil)
+	if err != nil {
+		return 0, "", err
+	}
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return 0, "", err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	return resp.StatusCode, strings.TrimSpace(string(body)), nil
+}
+
 func adminPost(adminAddr, path, contentType, body string) ([]byte, error) {
-	url := "http://" + adminAddr + path
+	url := baseURL(adminAddr) + path
 	var rb io.Reader
 	if body != "" {
 		rb = strings.NewReader(body)
 	}
-	resp, err := httpClient.Post(url, contentType, rb)
+	req, err := newRequest(http.MethodPost, url, rb)
+	if err != nil {
+		return nil, err
+	}
+	if contentType != "" {
+		req.Header.Set("Content-Type", contentType)
+	}
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("POST %s: %w", url, err)
 	}
 	defer resp.Body.Close()
-	out, _ := io.ReadAll(resp.Body)
+	data, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode >= 400 {
-		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(out)))
+		return nil, httpError(resp.StatusCode, url, data)
 	}
-	return out, nil
+	return data, nil
 }
 
 func parseJSON(data []byte) (map[string]any, error) {
@@ -397,23 +474,27 @@ func metricVal(m map[string]float64, name string) float64 {
 
 // ── Commands ──────────────────────────────────────────────────────────────────
 
+// probeDetail renders why a health probe failed, e.g. " (503: initializing)".
+func probeDetail(code int, body string, err error) string {
+	if err != nil {
+		return dim(" (" + err.Error() + ")")
+	}
+	return dim(fmt.Sprintf(" (%d: %s)", code, body))
+}
+
 // cmdStatus prints a full health + ops summary.
 func cmdStatus(adminAddr, tcpAddr string, rawJSON bool) error {
-	// Health checks (parallel).
-	type hcheck struct{ name, url string }
-	checks := []hcheck{{"healthz", "/healthz"}, {"readyz", "/readyz"}}
-	health := make(map[string]bool, 2)
-	for _, c := range checks {
-		data, err := adminGet(adminAddr, c.url)
-		health[c.name] = err == nil && strings.Contains(string(data), "ok")
-	}
+	// Health checks. Decided by status code, not body text: /healthz is
+	// 200 "ok", /readyz is 200 "ready" or 503 "initializing" / "degraded: …".
+	hCode, hBody, hErr := probe(adminAddr, "/healthz")
+	rCode, rBody, rErr := probe(adminAddr, "/readyz")
 
 	statsData, err := adminGet(adminAddr, "/admin/stats")
 	if err != nil {
 		return err
 	}
 	if rawJSON {
-		fmt.Println(string(statsData))
+		fmt.Fprintln(out, string(statsData))
 		return nil
 	}
 	versionData, _ := adminGet(adminAddr, "/admin/version")
@@ -428,12 +509,12 @@ func cmdStatus(adminAddr, tcpAddr string, rawJSON bool) error {
 
 	// ── Header ───────────────────────────────────────────────────────────────
 	hStatus := tick() + " HEALTHY"
-	if !health["healthz"] {
-		hStatus = cross() + " UNHEALTHY"
+	if hErr != nil || hCode != http.StatusOK {
+		hStatus = cross() + " UNHEALTHY" + probeDetail(hCode, hBody, hErr)
 	}
 	rStatus := tick() + " READY"
-	if !health["readyz"] {
-		rStatus = warn() + " NOT READY"
+	if rErr != nil || rCode != http.StatusOK {
+		rStatus = warn() + " NOT READY" + probeDetail(rCode, rBody, rErr)
 	}
 
 	sb.WriteString(header(fmt.Sprintf("VeltrixDB Node — %s", bold(tcpAddr))))
@@ -462,10 +543,10 @@ func cmdStatus(adminAddr, tcpAddr string, rawJSON bool) error {
 	sb.WriteString(bold("Cache (LIRS)") + "\n")
 	cache := jMap(stats, "cache")
 	if cache != nil {
-		used := jUint(cache, "size_bytes")
-		cap_ := jUint(cache, "max_bytes")
-		hits := jUint(cache, "hits")
-		total := hits + jUint(cache, "misses")
+		used := jUint(cache, "CurrentSizeBytes")
+		cap_ := jUint(cache, "MaxSizeBytes")
+		hits := jUint(cache, "Hits")
+		total := hits + jUint(cache, "Misses")
 		var hitRate float64
 		if total > 0 {
 			hitRate = float64(hits) / float64(total)
@@ -483,7 +564,7 @@ func cmdStatus(adminAddr, tcpAddr string, rawJSON bool) error {
 		}
 		sb.WriteString(fmt.Sprintf("  %-20s %s / %s%s\n", "Size:", fmtBytes(used), fmtBytes(cap_), dim(pct)))
 		sb.WriteString(fmt.Sprintf("  %-20s %s\n", "Hit rate:", hitColor(fmtPct(hitRate))))
-		sb.WriteString(fmt.Sprintf("  %-20s %s\n", "Evictions:", fmtInt(jUint(cache, "evictions"))))
+		sb.WriteString(fmt.Sprintf("  %-20s %s\n", "Evictions:", fmtInt(jUint(cache, "Evictions"))))
 	}
 
 	// ── WAL ──────────────────────────────────────────────────────────────────
@@ -515,12 +596,12 @@ func cmdStatus(adminAddr, tcpAddr string, rawJSON bool) error {
 		sb.WriteString(sectionLine())
 		sb.WriteString(bold("VLog (per disk summary)") + "\n")
 		tbl := newTable("DISK", "SIZE", "GC RATIO", "LIVE BYTES", "STATUS")
-		for i, v := range vlogs {
+		for _, v := range vlogs {
 			vm, _ := v.(map[string]any)
 			if vm == nil {
 				continue
 			}
-			ratio := jFloat(vm, "gc_ratio")
+			ratio := jFloat(vm, "GarbageRatio")
 			gcState := green("normal")
 			if ratio >= 0.65 {
 				gcState = red("EMERGENCY")
@@ -528,10 +609,10 @@ func cmdStatus(adminAddr, tcpAddr string, rawJSON bool) error {
 				gcState = yellow("critical")
 			}
 			tbl.add(
-				fmt.Sprintf("%d", i),
-				fmtBytes(jUint(vm, "size_bytes")),
+				fmt.Sprintf("%d", int(jFloat(vm, "DiskIdx"))),
+				fmtBytes(jUint(vm, "FileBytes")),
 				gcRatioColor(ratio),
-				fmtBytes(jUint(vm, "live_bytes")),
+				fmtBytes(jUint(vm, "LiveBytes")),
 				gcState,
 			)
 		}
@@ -549,11 +630,11 @@ func cmdStatus(adminAddr, tcpAddr string, rawJSON bool) error {
 			sb.WriteString(sectionLine())
 			sb.WriteString(warn() + " " + bold("Admission control") + "\n")
 			sb.WriteString(fmt.Sprintf("  Write throttles: %s\n", yellow(fmtInt(throttles))))
-			sb.WriteString(fmt.Sprintf("  %s\n", dim("(read EWMA > 4ms triggered write throttling)")))
+			sb.WriteString(fmt.Sprintf("  %s\n", dim("(read EWMA > 20ms triggered write throttling)")))
 		}
 	}
 
-	fmt.Print(sb.String())
+	fmt.Fprint(out, sb.String())
 	return nil
 }
 
@@ -573,31 +654,31 @@ func cmdCompaction(adminAddr string, rawJSON bool) error {
 		return err
 	}
 	if rawJSON {
-		fmt.Println(string(statsData))
+		fmt.Fprintln(out, string(statsData))
 		return nil
 	}
 
-	fmt.Print(header("VLog Compaction (GC) Status"))
+	fmt.Fprint(out, header("VLog Compaction (GC) Status"))
 
 	vlogs := jSlice(stats, "vlogs")
 	if len(vlogs) == 0 {
-		fmt.Println(dim("  No VLog data available."))
+		fmt.Fprintln(out, dim("  No VLog data available."))
 		return nil
 	}
 
 	tbl := newTable("DISK", "SIZE", "LIVE", "DEAD", "GC RATIO", "STATUS")
-	for i, v := range vlogs {
+	for _, v := range vlogs {
 		vm, _ := v.(map[string]any)
 		if vm == nil {
 			continue
 		}
-		total := jUint(vm, "size_bytes")
-		live := jUint(vm, "live_bytes")
+		total := jUint(vm, "FileBytes")
+		live := jUint(vm, "LiveBytes")
 		var dead uint64
 		if total >= live {
 			dead = total - live
 		}
-		ratio := jFloat(vm, "gc_ratio")
+		ratio := jFloat(vm, "GarbageRatio")
 		gcStatus := green("normal")
 		if ratio >= 0.65 {
 			gcStatus = red("EMERGENCY — GC uncapped, bypass pause")
@@ -607,7 +688,7 @@ func cmdCompaction(adminAddr string, rawJSON bool) error {
 			gcStatus = yellow("active GC")
 		}
 		tbl.add(
-			fmt.Sprintf("%d", i),
+			fmt.Sprintf("%d", int(jFloat(vm, "DiskIdx"))),
 			fmtBytes(total),
 			fmtBytes(live),
 			fmtBytes(dead),
@@ -615,11 +696,11 @@ func cmdCompaction(adminAddr string, rawJSON bool) error {
 			gcStatus,
 		)
 	}
-	fmt.Print(tbl.render())
+	fmt.Fprint(out, tbl.render())
 
 	if metrics != nil {
-		fmt.Print(sectionLine())
-		fmt.Println(bold("GC Run Counters"))
+		fmt.Fprint(out, sectionLine())
+		fmt.Fprintln(out, bold("GC Run Counters"))
 		gcRuns := uint64(metricVal(metrics, "vlog_gc_runs_total"))
 		emergency := uint64(metricVal(metrics, "vlog_gc_emergency_runs_total"))
 		skippedPaused := uint64(metricVal(metrics, "vlog_gc_skipped_paused_total"))
@@ -628,7 +709,7 @@ func cmdCompaction(adminAddr string, rawJSON bool) error {
 		casFails := uint64(metricVal(metrics, "vlog_gc_cas_fails_total"))
 		throttles := uint64(metricVal(metrics, "storage_write_admission_throttles_total"))
 
-		fmt.Printf("  %-36s %s\n", "GC runs (total):", fmtInt(gcRuns))
+		fmt.Fprintf(out, "  %-36s %s\n", "GC runs (total):", fmtInt(gcRuns))
 
 		emStr := fmtInt(emergency)
 		if emergency > 0 {
@@ -636,37 +717,37 @@ func cmdCompaction(adminAddr string, rawJSON bool) error {
 		} else {
 			emStr = green(emStr)
 		}
-		fmt.Printf("  %-36s %s\n", "Emergency runs:", emStr)
-		fmt.Printf("  %-36s %s\n", "Skipped (ratio below threshold):", fmtInt(skippedRatio))
+		fmt.Fprintf(out, "  %-36s %s\n", "Emergency runs:", emStr)
+		fmt.Fprintf(out, "  %-36s %s\n", "Skipped (ratio below threshold):", fmtInt(skippedRatio))
 
 		pausedStr := fmtInt(skippedPaused)
 		if skippedPaused > 0 {
-			pausedStr = yellow(pausedStr + " (read EWMA > 4ms, GC paused)")
+			pausedStr = yellow(pausedStr + " (read EWMA > 20ms, GC paused)")
 		}
-		fmt.Printf("  %-36s %s\n", "Skipped (admission pause):", pausedStr)
+		fmt.Fprintf(out, "  %-36s %s\n", "Skipped (admission pause):", pausedStr)
 
 		if readErrs > 0 {
-			fmt.Printf("  %-36s %s\n", "Read errors (VLog corruption?):", red(fmtInt(readErrs)))
+			fmt.Fprintf(out, "  %-36s %s\n", "Read errors (VLog corruption?):", red(fmtInt(readErrs)))
 		}
 		if casFails > 0 {
-			fmt.Printf("  %-36s %s\n", "CAS failures (concurrent writes):", yellow(fmtInt(casFails)))
+			fmt.Fprintf(out, "  %-36s %s\n", "CAS failures (concurrent writes):", yellow(fmtInt(casFails)))
 		}
 		if throttles > 0 {
-			fmt.Printf("  %-36s %s\n", "Write admission throttles:", yellow(fmtInt(throttles)))
+			fmt.Fprintf(out, "  %-36s %s\n", "Write admission throttles:", yellow(fmtInt(throttles)))
 		}
 
 		// Admission control state
-		fmt.Print(sectionLine())
-		fmt.Println(bold("Admission Control"))
+		fmt.Fprint(out, sectionLine())
+		fmt.Fprintln(out, bold("Admission Control"))
 		gcPaused := skippedPaused > 0 && gcRuns == 0
 		if gcPaused {
-			fmt.Printf("  GC state: %s\n", red("PAUSED — read EWMA above 4ms threshold"))
+			fmt.Fprintf(out, "  GC state: %s\n", red("PAUSED — read EWMA above 20ms threshold"))
 		} else {
-			fmt.Printf("  GC state: %s\n", green("running"))
+			fmt.Fprintf(out, "  GC state: %s\n", green("running"))
 		}
-		fmt.Printf("  %s\n", dim("GC latency threshold: 3ms EWMA → throttle to 60 MB/s"))
-		fmt.Printf("  %s\n", dim("Admission threshold:  4ms EWMA → pause GC + throttle writes 2ms"))
-		fmt.Printf("  %s\n", dim("Emergency:           ≥65%% garbage → bypass pause, uncap BW"))
+		fmt.Fprintf(out, "  %s\n", dim("GC latency threshold: 15ms EWMA → throttle to 60 MB/s"))
+		fmt.Fprintf(out, "  %s\n", dim("Admission threshold:  20ms EWMA → pause GC + throttle writes (resume < 10ms)"))
+		fmt.Fprintf(out, "  %s\n", dim("Emergency:           ≥65%% garbage → bypass pause, uncap BW"))
 	}
 
 	return nil
@@ -679,22 +760,22 @@ func cmdCache(adminAddr string, rawJSON bool) error {
 		return err
 	}
 	if rawJSON {
-		fmt.Println(string(data))
+		fmt.Fprintln(out, string(data))
 		return nil
 	}
 	stats, _ := parseJSON(data)
 	cache := jMap(stats, "cache")
 
-	fmt.Print(header("Cache (LIRS)"))
+	fmt.Fprint(out, header("Cache (LIRS)"))
 	if cache == nil {
-		fmt.Println(dim("  No cache stats available."))
+		fmt.Fprintln(out, dim("  No cache stats available."))
 		return nil
 	}
 
-	used := jUint(cache, "size_bytes")
-	cap_ := jUint(cache, "max_bytes")
-	hits := jUint(cache, "hits")
-	misses := jUint(cache, "misses")
+	used := jUint(cache, "CurrentSizeBytes")
+	cap_ := jUint(cache, "MaxSizeBytes")
+	hits := jUint(cache, "Hits")
+	misses := jUint(cache, "Misses")
 	total := hits + misses
 	var hitRate float64
 	if total > 0 {
@@ -722,22 +803,11 @@ func cmdCache(adminAddr string, rawJSON bool) error {
 	}
 	bar := green(strings.Repeat("█", filled)) + dim(strings.Repeat("░", barW-filled))
 
-	fmt.Printf("  %-20s %s / %s  (%.1f%%)\n", "Size:", fmtBytes(used), fmtBytes(cap_), fillPct)
-	fmt.Printf("  %-20s [%s]\n", "Fill:", bar)
-	fmt.Printf("  %-20s %s  (%s hits / %s misses)\n",
+	fmt.Fprintf(out, "  %-20s %s / %s  (%.1f%%)\n", "Size:", fmtBytes(used), fmtBytes(cap_), fillPct)
+	fmt.Fprintf(out, "  %-20s [%s]\n", "Fill:", bar)
+	fmt.Fprintf(out, "  %-20s %s  (%s hits / %s misses)\n",
 		"Hit rate:", hitColor(fmtPct(hitRate)), fmtInt(hits), fmtInt(misses))
-	fmt.Printf("  %-20s %s\n", "Evictions:", fmtInt(jUint(cache, "evictions")))
-
-	if hotKeys := jSlice(cache, "hot_keys"); len(hotKeys) > 0 {
-		fmt.Print(sectionLine())
-		fmt.Println(bold("Hot Keys (most frequent)"))
-		for i, k := range hotKeys {
-			if i >= 10 {
-				break
-			}
-			fmt.Printf("  %2d. %s\n", i+1, k)
-		}
-	}
+	fmt.Fprintf(out, "  %-20s %s\n", "Evictions:", fmtInt(jUint(cache, "Evictions")))
 
 	return nil
 }
@@ -749,15 +819,15 @@ func cmdWAL(adminAddr string, rawJSON bool) error {
 		return err
 	}
 	if rawJSON {
-		fmt.Println(string(data))
+		fmt.Fprintln(out, string(data))
 		return nil
 	}
 	stats, _ := parseJSON(data)
 	metrics, _ := fetchMetrics(adminAddr)
 
-	fmt.Print(header("Write-Ahead Log (WAL)"))
-	fmt.Printf("  %-24s %s\n", "Bytes written:", fmtBytes(jUint(stats, "wal_bytes")))
-	fmt.Printf("  %-24s %s\n", "Entries written:", fmtInt(jUint(stats, "wal_entries")))
+	fmt.Fprint(out, header("Write-Ahead Log (WAL)"))
+	fmt.Fprintf(out, "  %-24s %s\n", "Bytes written:", fmtBytes(jUint(stats, "wal_bytes")))
+	fmt.Fprintf(out, "  %-24s %s\n", "Entries written:", fmtInt(jUint(stats, "wal_entries")))
 
 	if metrics != nil {
 		flushes := uint64(metricVal(metrics, "storage_wal_flushes_total"))
@@ -765,40 +835,47 @@ func cmdWAL(adminAddr string, rawJSON bool) error {
 		if flushes > 0 {
 			batchSize = float64(jUint(stats, "wal_entries")) / float64(flushes)
 		}
-		fmt.Printf("  %-24s %s\n", "Total flushes:", fmtInt(flushes))
-		fmt.Printf("  %-24s %.1f entries/flush\n", "Avg batch size:", batchSize)
+		fmt.Fprintf(out, "  %-24s %s\n", "Total flushes:", fmtInt(flushes))
+		fmt.Fprintf(out, "  %-24s %.1f entries/flush\n", "Avg batch size:", batchSize)
 	}
 
-	fmt.Print(sectionLine())
-	fmt.Printf("  %s\n", dim("Flush window: 15 ms default (group-commit). P99 ≈ window + fdatasync."))
-	fmt.Printf("  %s\n", dim("On Linux NVMe: fdatasync ~0.2–0.5ms → P99 ~15.2ms."))
-	fmt.Printf("  %s\n", dim("macOS uses plain fsync(2) (~0.02ms, drive cache only) — dev builds"))
-	fmt.Printf("  %s\n", dim("are not power-loss safe and their write timings do not predict Linux."))
+	fmt.Fprint(out, sectionLine())
+	fmt.Fprintf(out, "  %s\n", dim("Flush window: 15 ms default (group-commit). P99 ≈ window + fdatasync."))
+	fmt.Fprintf(out, "  %s\n", dim("On Linux NVMe: fdatasync ~0.2–0.5ms → P99 ~15.2ms."))
+	fmt.Fprintf(out, "  %s\n", dim("macOS uses plain fsync(2) (~0.02ms, drive cache only) — dev builds"))
+	fmt.Fprintf(out, "  %s\n", dim("are not power-loss safe and their write timings do not predict Linux."))
 
 	return nil
 }
 
-// cmdReplication shows replication state.
+// cmdReplication shows replication state from GET /admin/cluster
+// (cmd/server/admin_cluster.go): top-level "mode"/"consistency" and a
+// "replication" list of {node_id, state, last_ack_seq, lag_bytes, lag_ns}.
+// /admin/stats carries no replica information.
 func cmdReplication(adminAddr string, rawJSON bool) error {
-	data, err := adminGet(adminAddr, "/admin/stats")
+	data, err := adminGet(adminAddr, "/admin/cluster")
 	if err != nil {
 		return err
 	}
 	if rawJSON {
-		fmt.Println(string(data))
+		fmt.Fprintln(out, string(data))
 		return nil
 	}
-	stats, _ := parseJSON(data)
+	topo, err := parseJSON(data)
+	if err != nil {
+		return err
+	}
 
-	fmt.Print(header("Replication"))
+	fmt.Fprint(out, header("Replication"))
 
-	replicas := jSlice(stats, "replicas")
+	replicas := jSlice(topo, "replication")
 	if len(replicas) == 0 {
-		fmt.Println(dim("  Single-node mode — no replicas configured."))
+		fmt.Fprintln(out, dim(fmt.Sprintf("  mode=%s — no replicas reported (replica lag is only reported in --mode=replicated).", jStr(topo, "mode"))))
 		return nil
 	}
+	consistency := jStr(topo, "consistency")
 
-	tbl := newTable("REPLICA", "STATE", "CONSISTENCY", "LAG", "ACK WATERMARK")
+	tbl := newTable("REPLICA", "STATE", "CONSISTENCY", "LAG", "LAG BYTES", "LAST ACK SEQ")
 	for _, r := range replicas {
 		rm, _ := r.(map[string]any)
 		if rm == nil {
@@ -813,25 +890,27 @@ func cmdReplication(adminAddr string, rawJSON bool) error {
 		} else {
 			lagStr = green(lagStr)
 		}
+		// replication.ReplicaState.String(): SYNC, SYNC_PENDING, LAG, FAILED.
 		state := jStr(rm, "state")
 		stateStr := state
-		switch state {
-		case "Sync":
+		switch strings.ToUpper(state) {
+		case "SYNC":
 			stateStr = green(state)
-		case "Lag":
+		case "LAG", "SYNC_PENDING":
 			stateStr = yellow(state)
-		case "Failed":
+		case "FAILED":
 			stateStr = red(state)
 		}
 		tbl.add(
-			jStr(rm, "id"),
+			jStr(rm, "node_id"),
 			stateStr,
-			jStr(rm, "consistency"),
+			consistency,
 			lagStr,
-			fmtInt(jUint(rm, "ack_watermark")),
+			fmtBytes(jUint(rm, "lag_bytes")),
+			fmtInt(jUint(rm, "last_ack_seq")),
 		)
 	}
-	fmt.Print(tbl.render())
+	fmt.Fprint(out, tbl.render())
 
 	return nil
 }
@@ -845,12 +924,12 @@ func cmdNodes(adminAddr string, rawJSON bool) error {
 		return err
 	}
 	if rawJSON {
-		fmt.Println(string(data))
+		fmt.Fprintln(out, string(data))
 		return nil
 	}
 	topo, _ := parseJSON(data)
 
-	fmt.Print(header("Cluster Nodes"))
+	fmt.Fprint(out, header("Cluster Nodes"))
 
 	mode := jStr(topo, "mode")
 	raft, _ := topo["raft"].(map[string]any)
@@ -860,11 +939,11 @@ func cmdNodes(adminAddr string, rawJSON bool) error {
 		leaderID = jStr(raft, "leader_id")
 		term = jFloat(raft, "term")
 	}
-	fmt.Printf("  mode=%s  epoch=%g", mode, jFloat(topo, "epoch"))
+	fmt.Fprintf(out, "  mode=%s  epoch=%g", mode, jFloat(topo, "epoch"))
 	if c := jStr(topo, "consistency"); c != "" {
-		fmt.Printf("  consistency=%s", c)
+		fmt.Fprintf(out, "  consistency=%s", c)
 	}
-	fmt.Println()
+	fmt.Fprintln(out)
 
 	// Index replica lag by node id (replicated mode).
 	lagByNode := map[string]float64{}
@@ -877,7 +956,7 @@ func cmdNodes(adminAddr string, rawJSON bool) error {
 
 	nodes := jSlice(topo, "nodes")
 	if len(nodes) == 0 {
-		fmt.Println(dim("  No nodes reported."))
+		fmt.Fprintln(out, dim("  No nodes reported."))
 		return nil
 	}
 
@@ -912,65 +991,77 @@ func cmdNodes(adminAddr string, rawJSON bool) error {
 		}
 		tbl.add(id, role, termStr, healthStr, addr, lagStr)
 	}
-	fmt.Print(tbl.render())
+	fmt.Fprint(out, tbl.render())
 	return nil
 }
 
-// cmdQuotas shows per-namespace quota usage.
+// cmdQuotas shows per-namespace quota usage. GET /admin/quotas returns
+// []storage.QuotaSnapshot, which has no json tags, so the keys are the Go
+// field names: Namespace, WritesPerSec, BurstWrites, MaxKeys, KeyCount,
+// TokensLeft.
 func cmdQuotas(adminAddr string, rawJSON bool) error {
 	data, err := adminGet(adminAddr, "/admin/quotas")
 	if err != nil {
 		return err
 	}
 	if rawJSON {
-		fmt.Println(string(data))
+		fmt.Fprintln(out, string(data))
 		return nil
 	}
 
 	var quotas []map[string]any
 	if err := json.Unmarshal(data, &quotas); err != nil {
-		// Try as the stats format.
-		fmt.Println(string(data))
-		return nil
+		return fmt.Errorf("decode /admin/quotas: %w", err)
 	}
+	sort.Slice(quotas, func(i, j int) bool { return jStr(quotas[i], "Namespace") < jStr(quotas[j], "Namespace") })
 
-	fmt.Print(header("Per-Namespace Quotas"))
+	fmt.Fprint(out, header("Per-Namespace Quotas"))
 	if len(quotas) == 0 {
-		fmt.Println(dim("  No quotas configured."))
+		fmt.Fprintln(out, dim("  No quotas configured."))
 		return nil
 	}
 
-	tbl := newTable("NAMESPACE", "WRITES/S LIMIT", "BURST", "MAX KEYS", "CURRENT KEYS", "RATE STATUS")
+	tbl := newTable("NAMESPACE", "WRITES/S LIMIT", "BURST", "MAX KEYS", "CURRENT KEYS", "TOKENS LEFT", "RATE STATUS")
 	for _, q := range quotas {
-		ns := jStr(q, "namespace")
-		limit := jFloat(q, "writes_per_sec")
-		burst := jFloat(q, "burst_writes")
-		maxKeys := jFloat(q, "max_keys")
-		curKeys := jFloat(q, "current_keys")
+		ns := jStr(q, "Namespace")
+		if ns == "" {
+			ns = dim("(default)")
+		}
+		limit := jFloat(q, "WritesPerSec")
+		burst := jFloat(q, "BurstWrites")
+		maxKeys := jFloat(q, "MaxKeys")
+		curKeys := jFloat(q, "KeyCount")
+		tokens := jFloat(q, "TokensLeft")
 
 		limitStr := fmt.Sprintf("%g", limit)
+		burstStr := fmt.Sprintf("%g", burst)
+		tokStr := fmt.Sprintf("%.0f", tokens)
 		if limit == 0 {
 			limitStr = dim("unlimited")
+			burstStr = dim("—")
+			tokStr = dim("—")
 		}
-		maxStr := fmt.Sprintf("%s", fmtInt(uint64(maxKeys)))
+		maxStr := fmtInt(uint64(maxKeys))
 		if maxKeys == 0 {
 			maxStr = dim("unlimited")
 		}
 		curStr := fmtInt(uint64(curKeys))
-		if maxKeys > 0 && curKeys/maxKeys > 0.9 {
+		if maxKeys > 0 && curKeys >= maxKeys {
+			curStr = red(curStr + " (full)")
+		} else if maxKeys > 0 && curKeys/maxKeys > 0.9 {
 			curStr = yellow(curStr + " (90%+)")
 		}
 
-		rateStatus := jStr(q, "rate_status")
-		if rateStatus == "" {
-			rateStatus = green("ok")
-		} else if rateStatus == "throttled" {
-			rateStatus = red(rateStatus)
+		// TokensLeft is the bucket level at the last write; < 1 means the
+		// next write would be rejected with ErrRateLimited.
+		rateStatus := green("ok")
+		if limit > 0 && tokens < 1 {
+			rateStatus = red("throttled")
 		}
 
-		tbl.add(ns, limitStr, fmt.Sprintf("%g", burst), maxStr, curStr, rateStatus)
+		tbl.add(ns, limitStr, burstStr, maxStr, curStr, tokStr, rateStatus)
 	}
-	fmt.Print(tbl.render())
+	fmt.Fprint(out, tbl.render())
 	return nil
 }
 
@@ -983,11 +1074,11 @@ func cmdCDC(adminAddr string, rawJSON bool) error {
 	stats, _ := parseJSON(data)
 
 	if rawJSON {
-		fmt.Println(string(data))
+		fmt.Fprintln(out, string(data))
 		return nil
 	}
 
-	fmt.Print(header("CDC (Change Data Capture)"))
+	fmt.Fprint(out, header("CDC (Change Data Capture)"))
 	total := jUint(stats, "cdc_broadcast_total")
 	dropped := jUint(stats, "cdc_dropped_total")
 	subs := int(jFloat(stats, "cdc_subscribers"))
@@ -999,53 +1090,103 @@ func cmdCDC(adminAddr string, rawJSON bool) error {
 		dropStr = green(dropStr)
 	}
 
-	fmt.Printf("  %-24s %s\n", "Events broadcast:", fmtInt(total))
-	fmt.Printf("  %-24s %s\n", "Events dropped:", dropStr)
-	fmt.Printf("  %-24s %d\n", "Active subscribers:", subs)
-	fmt.Print(sectionLine())
-	fmt.Printf("  %s\n", dim("Slow consumers are auto-evicted after 3 consecutive drops."))
-	fmt.Printf("  %s\n", dim("For cross-node CDC: use repl-ship (long-polls /admin/cdc)."))
-	fmt.Printf("  %s\n", dim("Stream live: veltrix cdc-tail [--prefix=<key-prefix>]"))
+	fmt.Fprintf(out, "  %-24s %s\n", "Events broadcast:", fmtInt(total))
+	fmt.Fprintf(out, "  %-24s %s\n", "Events dropped:", dropStr)
+	fmt.Fprintf(out, "  %-24s %d\n", "Active subscribers:", subs)
+	fmt.Fprint(out, sectionLine())
+	fmt.Fprintf(out, "  %s\n", dim("A subscriber is auto-evicted after 3 consecutive dropped events."))
+	fmt.Fprintf(out, "  %s\n", dim("For cross-node CDC: use repl-ship (long-polls /admin/cdc)."))
+	fmt.Fprintf(out, "  %s\n", dim("Stream live: veltrix cdc-tail [--prefix=<key-prefix>]"))
 
 	return nil
 }
 
-// cmdCDCTail streams CDC events to stdout.
-func cmdCDCTail(adminAddr, prefix string) error {
-	url := "http://" + adminAddr + "/admin/cdc"
-	if prefix != "" {
-		url += "?prefix=" + prefix
+// cdcEvent mirrors storage.CDCEvent as /admin/cdc encodes it: no json tags,
+// so the keys are "Op", "Key", "Value" (base64 []byte; null for DEL) and
+// "Timestamp" (µs since epoch). encoding/json matches keys case-insensitively,
+// so lowercase "op"/"key"/"value"/"timestamp" decode too.
+type cdcEvent struct {
+	Op        string
+	Key       string
+	Value     []byte
+	Timestamp int64
+}
+
+// maxValuePreview caps how many value bytes cdc-tail prints per event.
+const maxValuePreview = 64
+
+// formatCDCLine renders one /admin/cdc JSON line for cdc-tail. ok is false
+// when the line is not a CDC event (caller prints it verbatim).
+func formatCDCLine(line []byte) (string, bool) {
+	var ev cdcEvent
+	if err := json.Unmarshal(line, &ev); err != nil || ev.Op == "" {
+		return "", false
 	}
-	fmt.Printf("%s Streaming CDC events from %s (Ctrl+C to stop)\n\n",
-		dim("[cdc]"), bold(adminAddr))
-	resp, err := http.Get(url)
+	opStr := padRight(ev.Op, 4)
+	switch strings.ToUpper(ev.Op) {
+	case "PUT", "SET":
+		opStr = green(opStr)
+	case "DEL", "DELETE":
+		opStr = red(opStr)
+	}
+	t := time.UnixMicro(ev.Timestamp).Format("15:04:05.000000")
+	s := fmt.Sprintf("%s  %s  %s", dim(t), opStr, bold(ev.Key))
+	if ev.Value != nil {
+		v := ev.Value
+		suffix := ""
+		if len(v) > maxValuePreview {
+			v = v[:maxValuePreview]
+			suffix = "…"
+		}
+		s += "  " + dim(fmt.Sprintf("(%d B)", len(ev.Value))) + " " + strconv.Quote(string(v)) + suffix
+	}
+	return s, true
+}
+
+// cmdCDCTail streams CDC events (GET /admin/cdc, JSON Lines) to out until the
+// server closes the stream or durationSec elapses (0 = forever).
+func cmdCDCTail(adminAddr, prefix string, durationSec int, rawJSON bool) error {
+	q := url.Values{}
+	if prefix != "" {
+		q.Set("prefix", prefix)
+	}
+	if durationSec > 0 {
+		q.Set("duration_seconds", strconv.Itoa(durationSec))
+	}
+	u := baseURL(adminAddr) + "/admin/cdc"
+	if len(q) > 0 {
+		u += "?" + q.Encode()
+	}
+	req, err := newRequest(http.MethodGet, u, nil)
 	if err != nil {
 		return err
 	}
+	// No client timeout: the stream is long-lived by design.
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("GET %s: %w", u, err)
+	}
 	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return httpError(resp.StatusCode, u, body)
+	}
+	if !rawJSON {
+		fmt.Fprintf(errOut, "%s Streaming CDC events from %s (Ctrl+C to stop)\n\n",
+			dim("[cdc]"), bold(adminAddr))
+	}
 	scanner := bufio.NewScanner(resp.Body)
+	scanner.Buffer(make([]byte, 64*1024), 64<<20) // values can be large
 	for scanner.Scan() {
-		line := scanner.Text()
-		// Pretty-print the JSON line.
-		var m map[string]any
-		if json.Unmarshal([]byte(line), &m) == nil {
-			op := jStr(m, "op")
-			opStr := op
-			switch strings.ToUpper(op) {
-			case "PUT", "SET":
-				opStr = green(op)
-			case "DEL", "DELETE":
-				opStr = red(op)
-			}
-			ts := int64(jFloat(m, "timestamp_us"))
-			t := time.UnixMicro(ts).Format("15:04:05.000")
-			fmt.Printf("%s  %s  %s  %s\n",
-				dim(t),
-				padRight(opStr, 8),
-				bold(jStr(m, "key")),
-				dim(fmt.Sprintf("ver=%s", jStr(m, "version"))))
+		line := scanner.Bytes()
+		if rawJSON {
+			fmt.Fprintln(out, string(line))
+			continue
+		}
+		if s, ok := formatCDCLine(line); ok {
+			fmt.Fprintln(out, s)
 		} else {
-			fmt.Println(line)
+			fmt.Fprintln(out, string(line))
 		}
 	}
 	return scanner.Err()
@@ -1058,13 +1199,13 @@ func cmdMetrics(adminAddr, filter string, rawJSON bool) error {
 		return err
 	}
 	if rawJSON || filter == "" {
-		fmt.Println(string(data))
+		fmt.Fprintln(out, string(data))
 		return nil
 	}
 	filter = strings.ToLower(filter)
 	for _, line := range strings.Split(string(data), "\n") {
 		if strings.Contains(strings.ToLower(line), filter) {
-			fmt.Println(line)
+			fmt.Fprintln(out, line)
 		}
 	}
 	return nil
@@ -1077,11 +1218,11 @@ func cmdTraces(adminAddr string, rawJSON bool) error {
 		return err
 	}
 	if rawJSON {
-		fmt.Println(string(data))
+		fmt.Fprintln(out, string(data))
 		return nil
 	}
 
-	fmt.Print(header("Recent OTel Traces (slow + error spans)"))
+	fmt.Fprint(out, header("Recent OTel Traces (slow + error spans)"))
 	scanner := bufio.NewScanner(bytes.NewReader(data))
 	count := 0
 	for scanner.Scan() {
@@ -1107,24 +1248,23 @@ func cmdTraces(adminAddr string, rawJSON bool) error {
 				marker = red("E")
 			}
 
-			ts := int64(jFloat(m, "start_us"))
-			t := time.UnixMicro(ts).Format("15:04:05.000")
-			fmt.Printf("  %s %s  %-30s  %s\n",
+			t := time.Unix(0, int64(jFloat(m, "start_unix_ns"))).Format("15:04:05.000")
+			fmt.Fprintf(out, "  %s %s  %-30s  %s\n",
 				marker,
 				dim(t),
 				bold(name),
 				durColor(fmtDur(durNs)))
 			if errStr != "" && errStr != "—" && errStr != "false" {
-				fmt.Printf("       %s\n", red(errStr))
+				fmt.Fprintf(out, "       %s\n", red(errStr))
 			}
 			count++
 		} else {
-			fmt.Println(line)
+			fmt.Fprintln(out, line)
 			count++
 		}
 	}
 	if count == 0 {
-		fmt.Println(dim("  No traces in ring buffer. Traces appear for ops ≥50ms or with errors."))
+		fmt.Fprintln(out, dim("  No traces in ring buffer. Traces appear for ops ≥50ms or with errors."))
 	}
 	return scanner.Err()
 }
@@ -1132,7 +1272,7 @@ func cmdTraces(adminAddr string, rawJSON bool) error {
 // cmdTop runs a live dashboard that refreshes every interval seconds.
 func cmdTop(adminAddr, tcpAddr string, interval int) error {
 	clearScreen := func() {
-		fmt.Print("\033[H\033[2J") // move cursor home + clear
+		fmt.Fprint(out, "\033[H\033[2J") // move cursor home + clear
 	}
 	type snapshot struct {
 		writes, reads, deletes uint64
@@ -1149,7 +1289,7 @@ func cmdTop(adminAddr, tcpAddr string, interval int) error {
 		statsData, err := adminGet(adminAddr, "/admin/stats")
 		if err != nil {
 			clearScreen()
-			fmt.Println(red("Connection error: ") + err.Error())
+			fmt.Fprintln(out, red("Connection error: ")+err.Error())
 			time.Sleep(time.Duration(interval) * time.Second)
 			continue
 		}
@@ -1165,8 +1305,8 @@ func cmdTop(adminAddr, tcpAddr string, interval int) error {
 		}
 		cache := jMap(stats, "cache")
 		if cache != nil {
-			cur.cacheHits = jUint(cache, "hits")
-			cur.cacheMisses = jUint(cache, "misses")
+			cur.cacheHits = jUint(cache, "Hits")
+			cur.cacheMisses = jUint(cache, "Misses")
 		}
 		vlogs := jSlice(stats, "vlogs")
 		if len(vlogs) > 0 {
@@ -1175,7 +1315,7 @@ func cmdTop(adminAddr, tcpAddr string, interval int) error {
 				if vm == nil {
 					continue
 				}
-				r := jFloat(vm, "gc_ratio")
+				r := jFloat(vm, "GarbageRatio")
 				if r > cur.gcRatio {
 					cur.gcRatio = r
 				}
@@ -1187,11 +1327,11 @@ func cmdTop(adminAddr, tcpAddr string, interval int) error {
 
 		clearScreen()
 		now := time.Now().Format("15:04:05")
-		fmt.Printf("%s  VeltrixDB Live — %s     %s\n",
+		fmt.Fprintf(out, "%s  VeltrixDB Live — %s     %s\n",
 			bold("⚡"),
 			bold(tcpAddr),
 			dim("refresh: "+strconv.Itoa(interval)+"s   Ctrl+C to exit   "+now))
-		fmt.Println(dim(strings.Repeat("─", 70)))
+		fmt.Fprintln(out, dim(strings.Repeat("─", 70)))
 
 		if prev != nil {
 			elapsed := cur.ts.Sub(prev.ts).Seconds()
@@ -1217,21 +1357,21 @@ func cmdTop(adminAddr, tcpAddr string, interval int) error {
 				hitColor = red
 			}
 
-			fmt.Printf("\n  %s  %-14s  %s  %-14s  %s  %-14s\n",
+			fmt.Fprintf(out, "\n  %s  %-14s  %s  %-14s  %s  %-14s\n",
 				bold("Writes/s:"), cyan(fmt.Sprintf("%.0f", writePS)),
 				bold("Reads/s:"), cyan(fmt.Sprintf("%.0f", readPS)),
 				bold("Deletes/s:"), cyan(fmt.Sprintf("%.0f", delPS)))
-			fmt.Printf("  %s  %-14s  %s  %-14s\n",
+			fmt.Fprintf(out, "  %s  %-14s  %s  %-14s\n",
 				bold("Cache hit:"), hitColor(fmtPct(hitRate)),
 				bold("GC ratio:"), gcRatioColor(cur.gcRatio))
 		} else {
-			fmt.Printf("\n  %s\n", dim("Collecting baseline... (next refresh in "+strconv.Itoa(interval)+"s)"))
+			fmt.Fprintf(out, "\n  %s\n", dim("Collecting baseline... (next refresh in "+strconv.Itoa(interval)+"s)"))
 		}
 
-		fmt.Printf("\n  %s  %s\n", bold("Live keys:"), cyan(fmtInt(cur.keys)))
+		fmt.Fprintf(out, "\n  %s  %s\n", bold("Live keys:"), cyan(fmtInt(cur.keys)))
 
 		if cur.gcEmergency > 0 {
-			fmt.Printf("\n  %s %s\n", red("⚠  EMERGENCY GC:"),
+			fmt.Fprintf(out, "\n  %s %s\n", red("⚠  EMERGENCY GC:"),
 				red("garbage ratio ≥65%%. Write rate exceeds GC throughput."))
 		}
 
@@ -1240,21 +1380,21 @@ func cmdTop(adminAddr, tcpAddr string, interval int) error {
 			throttles = uint64(metricVal(metrics, "storage_write_admission_throttles_total"))
 		}
 		if throttles > 0 {
-			fmt.Printf("  %s %s throttle events\n", warn(), yellow(fmtInt(throttles)+" write admission"))
+			fmt.Fprintf(out, "  %s %s throttle events\n", warn(), yellow(fmtInt(throttles)+" write admission"))
 		}
 
 		// Per-disk GC bar.
 		if len(vlogs) > 0 {
-			fmt.Println()
-			fmt.Println(dim(strings.Repeat("─", 70)))
-			fmt.Printf("  %-6s %-12s %s\n", bold("DISK"), bold("GC RATIO"), bold("GARBAGE BAR"))
+			fmt.Fprintln(out)
+			fmt.Fprintln(out, dim(strings.Repeat("─", 70)))
+			fmt.Fprintf(out, "  %-6s %-12s %s\n", bold("DISK"), bold("GC RATIO"), bold("GARBAGE BAR"))
 			barW := 40
-			for i, v := range vlogs {
+			for _, v := range vlogs {
 				vm, _ := v.(map[string]any)
 				if vm == nil {
 					continue
 				}
-				ratio := jFloat(vm, "gc_ratio")
+				ratio := jFloat(vm, "GarbageRatio")
 				filled := int(ratio * float64(barW))
 				if filled > barW {
 					filled = barW
@@ -1266,7 +1406,7 @@ func cmdTop(adminAddr, tcpAddr string, interval int) error {
 					barColor = yellow
 				}
 				bar := barColor(strings.Repeat("█", filled)) + dim(strings.Repeat("░", barW-filled))
-				fmt.Printf("  %-6d %-12s [%s]\n", i, gcRatioColor(ratio), bar)
+				fmt.Fprintf(out, "  %-6d %-12s [%s]\n", int(jFloat(vm, "DiskIdx")), gcRatioColor(ratio), bar)
 			}
 		}
 
@@ -1277,7 +1417,7 @@ func cmdTop(adminAddr, tcpAddr string, interval int) error {
 
 // cmdPing checks connectivity and reports round-trip latency.
 func cmdPing(tcpAddr, adminAddr string) error {
-	fmt.Printf("Pinging VeltrixDB at %s ...\n\n", bold(tcpAddr))
+	fmt.Fprintf(out, "Pinging VeltrixDB at %s ...\n\n", bold(tcpAddr))
 
 	// TCP ping.
 	const n = 5
@@ -1287,30 +1427,30 @@ func cmdPing(tcpAddr, adminAddr string) error {
 		resp, err := tcpCmd(tcpAddr, "PING")
 		rtt := time.Since(start)
 		if err != nil {
-			fmt.Printf("  #%d  TCP  %s\n", i+1, red(err.Error()))
+			fmt.Fprintf(out, "  #%d  TCP  %s\n", i+1, red(err.Error()))
 		} else if resp == "PONG" {
-			fmt.Printf("  #%d  TCP  %s  rtt=%s\n", i+1, green("PONG"), cyan(rtt.Round(time.Microsecond).String()))
+			fmt.Fprintf(out, "  #%d  TCP  %s  rtt=%s\n", i+1, green("PONG"), cyan(rtt.Round(time.Microsecond).String()))
 			totalTCP += rtt
 		} else {
-			fmt.Printf("  #%d  TCP  unexpected response: %q\n", i+1, resp)
+			fmt.Fprintf(out, "  #%d  TCP  unexpected response: %q\n", i+1, resp)
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
 
 	// HTTP health ping.
-	fmt.Println()
+	fmt.Fprintln(out)
 	start := time.Now()
 	data, err := adminGet(adminAddr, "/healthz")
 	httpRTT := time.Since(start)
 	if err != nil {
-		fmt.Printf("  HTTP /healthz  %s\n", red(err.Error()))
+		fmt.Fprintf(out, "  HTTP /healthz  %s\n", red(err.Error()))
 	} else {
 		status := strings.TrimSpace(string(data))
-		fmt.Printf("  HTTP /healthz  %s  %s  rtt=%s\n",
+		fmt.Fprintf(out, "  HTTP /healthz  %s  %s  rtt=%s\n",
 			green(status), dim("(admin port)"), cyan(httpRTT.Round(time.Microsecond).String()))
 	}
 
-	fmt.Printf("\n  Avg TCP RTT: %s\n", cyan((totalTCP / n).Round(time.Microsecond).String()))
+	fmt.Fprintf(out, "\n  Avg TCP RTT: %s\n", cyan((totalTCP / n).Round(time.Microsecond).String()))
 	return nil
 }
 
@@ -1321,9 +1461,9 @@ func cmdPut(tcpAddr, key, value string) error {
 		return err
 	}
 	if resp == "OK" {
-		fmt.Println(green("OK"))
+		fmt.Fprintln(out, green("OK"))
 	} else {
-		fmt.Println(red(resp))
+		fmt.Fprintln(out, red(resp))
 	}
 	return nil
 }
@@ -1333,10 +1473,11 @@ func cmdGet(tcpAddr, key string) error {
 	if err != nil {
 		return err
 	}
-	if resp == "ERR" || resp == "" {
-		fmt.Println(red("(not found)"))
+	if strings.HasPrefix(resp, "ERR") {
+		// The text protocol answers "ERR <reason>" (e.g. "ERR key not found").
+		fmt.Fprintln(out, red(resp))
 	} else {
-		fmt.Println(resp)
+		fmt.Fprintln(out, resp)
 	}
 	return nil
 }
@@ -1347,9 +1488,9 @@ func cmdDel(tcpAddr, key string) error {
 		return err
 	}
 	if resp == "OK" {
-		fmt.Println(green("OK"))
+		fmt.Fprintln(out, green("OK"))
 	} else {
-		fmt.Println(red(resp))
+		fmt.Fprintln(out, red(resp))
 	}
 	return nil
 }
@@ -1361,7 +1502,7 @@ func cmdCheckpoint(adminAddr string) error {
 		return err
 	}
 	m, _ := parseJSON(data)
-	fmt.Printf("%s Checkpoint complete in %s ms\n",
+	fmt.Fprintf(out, "%s Checkpoint complete in %s ms\n",
 		green(tick()), bold(jStr(m, "duration_ms")))
 	return nil
 }
@@ -1369,16 +1510,16 @@ func cmdCheckpoint(adminAddr string) error {
 // cmdBackup triggers a full backup.
 func cmdBackup(adminAddr, destDir string) error {
 	body := fmt.Sprintf(`{"type":"full","dest_dir":%q}`, destDir)
-	fmt.Printf("Triggering full backup → %s ...\n", bold(destDir))
+	fmt.Fprintf(out, "Triggering full backup → %s ...\n", bold(destDir))
 	data, err := adminPost(adminAddr, "/admin/backup", "application/json", body)
 	if err != nil {
 		return err
 	}
 	m, _ := parseJSON(data)
-	fmt.Printf("%s Backup complete\n", green(tick()))
-	fmt.Printf("  ID:       %s\n", bold(jStr(m, "backup_id")))
-	fmt.Printf("  Duration: %s ms\n", jStr(m, "duration_ms"))
-	fmt.Printf("  Disks:    %s\n", jStr(m, "num_disks"))
+	fmt.Fprintf(out, "%s Backup complete\n", green(tick()))
+	fmt.Fprintf(out, "  ID:       %s\n", bold(jStr(m, "backup_id")))
+	fmt.Fprintf(out, "  Duration: %s ms\n", jStr(m, "duration_ms"))
+	fmt.Fprintf(out, "  Disks:    %s\n", jStr(m, "num_disks"))
 	return nil
 }
 
@@ -1389,8 +1530,8 @@ func cmdVersion(adminAddr string) error {
 		return err
 	}
 	m, _ := parseJSON(data)
-	fmt.Printf("Schema version: %s\n", bold(jStr(m, "current_schema_version")))
-	fmt.Printf("Encryption:     %s\n", jStr(m, "encryption_enabled"))
+	fmt.Fprintf(out, "Schema version: %s\n", bold(jStr(m, "current_schema_version")))
+	fmt.Fprintf(out, "Encryption:     %s\n", jStr(m, "encryption_enabled"))
 	return nil
 }
 
@@ -1401,21 +1542,21 @@ func cmdScrubber(adminAddr string) error {
 		return err
 	}
 
-	fmt.Print(header("Data Integrity Scrubber"))
+	fmt.Fprint(out, header("Data Integrity Scrubber"))
 	records := uint64(metricVal(metrics, "scrub_records_total"))
 	corruption := uint64(metricVal(metrics, "scrub_corruption_total"))
 
-	fmt.Printf("  %-24s %s\n", "Records scanned:", fmtInt(records))
+	fmt.Fprintf(out, "  %-24s %s\n", "Records scanned:", fmtInt(records))
 	corrStr := fmtInt(corruption)
 	if corruption > 0 {
 		corrStr = red(corrStr + " ⚠  CRC32C mismatches detected!")
 	} else {
 		corrStr = green(corrStr + " (clean)")
 	}
-	fmt.Printf("  %-24s %s\n", "Corruptions found:", corrStr)
-	fmt.Print(sectionLine())
-	fmt.Printf("  %s\n", dim("Scrubber walks VLog records at 50 MB/s (configurable)."))
-	fmt.Printf("  %s\n", dim("Corruption increments veltrixdb_scrub_corruption_total and logs disk+offset."))
+	fmt.Fprintf(out, "  %-24s %s\n", "Corruptions found:", corrStr)
+	fmt.Fprint(out, sectionLine())
+	fmt.Fprintf(out, "  %s\n", dim("Scrubber walks VLog records at 50 MB/s (configurable)."))
+	fmt.Fprintf(out, "  %s\n", dim("Corruption increments veltrixdb_scrub_corruption_total and logs disk+offset."))
 	return nil
 }
 
@@ -1424,13 +1565,17 @@ func cmdScrubber(adminAddr string) error {
 const usageText = `veltrix — VeltrixDB operator CLI
 
 Usage:
-  veltrix [flags] COMMAND [args]
+  veltrix [flags] COMMAND [args] [flags]
+
+Flags may appear before or after the command (veltrix --watch 2 top and
+veltrix top --watch 2 are equivalent). Use -- to end flag parsing when an
+argument starts with '-' (veltrix put k -- -1).
 
 Commands:
   status              Full node health + ops summary
   nodes               Cluster node topology (role, term, health)
   compaction          VLog GC per disk — ratio, runs, emergency state
-  replication         Replication lag + vector clock status
+  replication         Replication lag per replica (GET /admin/cluster)
   cache               LIRS cache hit rate, size, evictions
   wal                 WAL bytes, entries, flush stats
   quotas              Per-namespace quota usage
@@ -1439,21 +1584,25 @@ Commands:
   scrubber            Data integrity scrubber status
   metrics [filter]    Raw Prometheus metrics (optional grep filter)
   traces              Recent OTel spans (slow + error ops)
-  top                 Live dashboard (refreshes every --watch seconds)
+  top                 Live dashboard (refreshes every --watch seconds, default 2)
   ping                Round-trip latency check (TCP + HTTP)
   put KEY VALUE       Write a key
   get KEY             Read a key
   del KEY             Delete a key
   checkpoint          Force WAL checkpoint on all disks
-  backup DEST_DIR     Trigger full backup to DEST_DIR
+  backup DEST_DIR     Trigger full backup to DEST_DIR (a path on the server)
   version             Engine + schema version
 
-Global flags:
-  --addr   Admin/metrics HTTP address  (default 127.0.0.1:2112)
-  --tcp    TCP data address            (default 127.0.0.1:9000)
-  --watch  Refresh interval (seconds) for top/status/compaction (0 = once)
-  --json   Print raw JSON instead of formatted tables
-  --no-color  Disable ANSI colors
+Flags:
+  --addr         Admin/metrics HTTP address  (default 127.0.0.1:2112)
+  --tcp          TCP data address            (default 127.0.0.1:9000)
+  --admin-token  Token for /admin/* (sent as Authorization: Bearer); required
+                 when the server runs with --admin-token (env VELTRIX_ADMIN_TOKEN)
+  --watch N      Refresh interval (seconds) for top and read-only commands (0 = once)
+  --json         Print raw JSON instead of formatted tables
+  --prefix P     Key prefix filter for cdc-tail
+  --duration N   cdc-tail: stop after N seconds (0 = until interrupted)
+  --no-color     Disable ANSI colors
 
 Examples:
   veltrix status
@@ -1465,176 +1614,187 @@ Examples:
   veltrix get mykey
   veltrix backup /mnt/backup/2026-05-22
   veltrix checkpoint
-  veltrix --addr 10.0.0.5:2112 status
+  veltrix --addr 10.0.0.5:2112 --admin-token "$TOKEN" status
 `
 
-func main() {
-	var (
-		adminAddr = flag.String("addr", "127.0.0.1:2112", "Admin/metrics HTTP address")
-		tcpAddr   = flag.String("tcp", "127.0.0.1:9000", "TCP data address")
-		watchSec  = flag.Int("watch", 0, "Refresh interval in seconds (0 = run once)")
-		rawJSON   = flag.Bool("json", false, "Print raw JSON")
-		noColor   = flag.Bool("no-color", false, "Disable ANSI colours")
-		prefix    = flag.String("prefix", "", "Key prefix for cdc-tail")
-	)
-	flag.Usage = func() { fmt.Fprint(os.Stderr, usageText) }
-	flag.Parse()
+// errOut receives diagnostics (tests swap it for a buffer).
+var errOut io.Writer = os.Stderr
 
-	if *noColor {
+// config holds every flag value.
+type config struct {
+	adminAddr   string
+	tcpAddr     string
+	token       string
+	prefix      string
+	watchSec    int
+	durationSec int
+	rawJSON     bool
+	noColor     bool
+}
+
+// parseArgs parses flags that may sit before, between or after positional
+// arguments. Go's flag package stops at the first non-flag argument, so the
+// remaining args are re-parsed after each positional one is peeled off; a
+// literal "--" ends flag parsing for everything after it.
+func parseArgs(args []string, stderr io.Writer) (config, []string, error) {
+	c := config{
+		adminAddr: "127.0.0.1:2112",
+		tcpAddr:   "127.0.0.1:9000",
+		token:     os.Getenv("VELTRIX_ADMIN_TOKEN"),
+	}
+	fs := flag.NewFlagSet("veltrix", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	fs.Usage = func() { fmt.Fprint(stderr, usageText) }
+	fs.StringVar(&c.adminAddr, "addr", c.adminAddr, "Admin/metrics HTTP address")
+	fs.StringVar(&c.tcpAddr, "tcp", c.tcpAddr, "TCP data address")
+	fs.StringVar(&c.token, "admin-token", c.token, "Admin API token (env VELTRIX_ADMIN_TOKEN)")
+	fs.IntVar(&c.watchSec, "watch", 0, "Refresh interval in seconds (0 = run once)")
+	fs.IntVar(&c.durationSec, "duration", 0, "cdc-tail: stop after N seconds (0 = until interrupted)")
+	fs.BoolVar(&c.rawJSON, "json", false, "Print raw JSON")
+	fs.BoolVar(&c.noColor, "no-color", false, "Disable ANSI colours")
+	fs.StringVar(&c.prefix, "prefix", "", "Key prefix for cdc-tail")
+
+	var pos []string
+	for {
+		if err := fs.Parse(args); err != nil {
+			return c, nil, err
+		}
+		rest := fs.Args()
+		if len(rest) == 0 {
+			break
+		}
+		if consumed := len(args) - len(rest); consumed > 0 && args[consumed-1] == "--" {
+			pos = append(pos, rest...)
+			break
+		}
+		pos = append(pos, rest[0])
+		args = rest[1:]
+	}
+	return c, pos, nil
+}
+
+func main() { os.Exit(run(os.Args[1:])) }
+
+// run executes one CLI invocation and returns the process exit code.
+func run(argv []string) int {
+	c, args, err := parseArgs(argv, errOut)
+	if err == flag.ErrHelp {
+		return 0
+	}
+	if err != nil {
+		return 2
+	}
+	if c.noColor {
 		useColor = false
 	}
+	adminToken = c.token
 
-	args := flag.Args()
 	if len(args) == 0 {
-		flag.Usage()
-		os.Exit(2)
+		fmt.Fprint(errOut, usageText)
+		return 2
 	}
 
 	cmd := args[0]
 	rest := args[1:]
 
-	// Commands that support --watch run in a loop.
-	runOnce := func(fn func() error) {
-		if *watchSec > 0 {
-			for {
-				if err := fn(); err != nil {
-					fmt.Fprintln(os.Stderr, red("error: ")+err.Error())
-				}
-				time.Sleep(time.Duration(*watchSec) * time.Second)
-				fmt.Print("\033[H\033[2J") // clear
-			}
-		} else {
+	fail := func(err error) int {
+		if err != nil {
+			fmt.Fprintln(errOut, red("error: ")+err.Error())
+			return 1
+		}
+		return 0
+	}
+	usage := func(s string) int {
+		fmt.Fprintln(errOut, "usage: "+s)
+		return 2
+	}
+
+	// Read-only commands honour --watch and run in a loop.
+	runOnce := func(fn func() error) int {
+		if c.watchSec <= 0 {
+			return fail(fn())
+		}
+		for {
 			if err := fn(); err != nil {
-				fmt.Fprintln(os.Stderr, red("error: ")+err.Error())
-				os.Exit(1)
+				fmt.Fprintln(errOut, red("error: ")+err.Error())
 			}
+			time.Sleep(time.Duration(c.watchSec) * time.Second)
+			fmt.Fprint(out, "\033[H\033[2J") // clear
 		}
 	}
 
 	switch cmd {
 	case "status":
-		runOnce(func() error { return cmdStatus(*adminAddr, *tcpAddr, *rawJSON) })
-
+		return runOnce(func() error { return cmdStatus(c.adminAddr, c.tcpAddr, c.rawJSON) })
 	case "nodes":
-		runOnce(func() error { return cmdNodes(*adminAddr, *rawJSON) })
-
+		return runOnce(func() error { return cmdNodes(c.adminAddr, c.rawJSON) })
 	case "compaction", "gc":
-		runOnce(func() error { return cmdCompaction(*adminAddr, *rawJSON) })
-
+		return runOnce(func() error { return cmdCompaction(c.adminAddr, c.rawJSON) })
 	case "replication", "repl":
-		runOnce(func() error { return cmdReplication(*adminAddr, *rawJSON) })
-
+		return runOnce(func() error { return cmdReplication(c.adminAddr, c.rawJSON) })
 	case "cache":
-		runOnce(func() error { return cmdCache(*adminAddr, *rawJSON) })
-
+		return runOnce(func() error { return cmdCache(c.adminAddr, c.rawJSON) })
 	case "wal":
-		runOnce(func() error { return cmdWAL(*adminAddr, *rawJSON) })
-
+		return runOnce(func() error { return cmdWAL(c.adminAddr, c.rawJSON) })
 	case "quotas", "quota":
-		runOnce(func() error { return cmdQuotas(*adminAddr, *rawJSON) })
-
+		return runOnce(func() error { return cmdQuotas(c.adminAddr, c.rawJSON) })
 	case "cdc":
-		runOnce(func() error { return cmdCDC(*adminAddr, *rawJSON) })
-
+		return runOnce(func() error { return cmdCDC(c.adminAddr, c.rawJSON) })
 	case "cdc-tail":
-		if err := cmdCDCTail(*adminAddr, *prefix); err != nil {
-			fmt.Fprintln(os.Stderr, red("error: ")+err.Error())
-			os.Exit(1)
-		}
-
+		return fail(cmdCDCTail(c.adminAddr, c.prefix, c.durationSec, c.rawJSON))
 	case "scrubber":
-		runOnce(func() error { return cmdScrubber(*adminAddr) })
-
+		return runOnce(func() error { return cmdScrubber(c.adminAddr) })
 	case "metrics":
 		filter := ""
 		if len(rest) > 0 {
 			filter = rest[0]
 		}
-		runOnce(func() error { return cmdMetrics(*adminAddr, filter, *rawJSON) })
-
+		return runOnce(func() error { return cmdMetrics(c.adminAddr, filter, c.rawJSON) })
 	case "traces":
-		runOnce(func() error { return cmdTraces(*adminAddr, *rawJSON) })
-
+		return runOnce(func() error { return cmdTraces(c.adminAddr, c.rawJSON) })
 	case "top":
-		interval := *watchSec
-		if interval == 0 {
+		interval := c.watchSec
+		if interval <= 0 {
 			interval = 2
 		}
-		cmdTop(*adminAddr, *tcpAddr, interval) // runs until Ctrl+C
-
+		return fail(cmdTop(c.adminAddr, c.tcpAddr, interval)) // runs until Ctrl+C
 	case "ping":
-		if err := cmdPing(*tcpAddr, *adminAddr); err != nil {
-			fmt.Fprintln(os.Stderr, red("error: ")+err.Error())
-			os.Exit(1)
-		}
-
+		return fail(cmdPing(c.tcpAddr, c.adminAddr))
 	case "put":
 		if len(rest) < 2 {
-			fmt.Fprintln(os.Stderr, "usage: veltrix put KEY VALUE")
-			os.Exit(2)
+			return usage("veltrix put KEY VALUE")
 		}
-		if err := cmdPut(*tcpAddr, rest[0], strings.Join(rest[1:], " ")); err != nil {
-			fmt.Fprintln(os.Stderr, red("error: ")+err.Error())
-			os.Exit(1)
-		}
-
+		return fail(cmdPut(c.tcpAddr, rest[0], strings.Join(rest[1:], " ")))
 	case "get":
 		if len(rest) < 1 {
-			fmt.Fprintln(os.Stderr, "usage: veltrix get KEY")
-			os.Exit(2)
+			return usage("veltrix get KEY")
 		}
-		if err := cmdGet(*tcpAddr, rest[0]); err != nil {
-			fmt.Fprintln(os.Stderr, red("error: ")+err.Error())
-			os.Exit(1)
-		}
-
+		return fail(cmdGet(c.tcpAddr, rest[0]))
 	case "del":
 		if len(rest) < 1 {
-			fmt.Fprintln(os.Stderr, "usage: veltrix del KEY")
-			os.Exit(2)
+			return usage("veltrix del KEY")
 		}
-		if err := cmdDel(*tcpAddr, rest[0]); err != nil {
-			fmt.Fprintln(os.Stderr, red("error: ")+err.Error())
-			os.Exit(1)
-		}
-
+		return fail(cmdDel(c.tcpAddr, rest[0]))
 	case "checkpoint":
-		if err := cmdCheckpoint(*adminAddr); err != nil {
-			fmt.Fprintln(os.Stderr, red("error: ")+err.Error())
-			os.Exit(1)
-		}
-
+		return fail(cmdCheckpoint(c.adminAddr))
 	case "backup":
 		if len(rest) < 1 {
-			fmt.Fprintln(os.Stderr, "usage: veltrix backup DEST_DIR")
-			os.Exit(2)
+			return usage("veltrix backup DEST_DIR")
 		}
-		if err := cmdBackup(*adminAddr, rest[0]); err != nil {
-			fmt.Fprintln(os.Stderr, red("error: ")+err.Error())
-			os.Exit(1)
-		}
-
+		return fail(cmdBackup(c.adminAddr, rest[0]))
 	case "version":
-		if err := cmdVersion(*adminAddr); err != nil {
-			fmt.Fprintln(os.Stderr, red("error: ")+err.Error())
-			os.Exit(1)
-		}
-
-	case "help", "--help", "-h":
-		fmt.Fprint(os.Stdout, usageText)
-
+		return fail(cmdVersion(c.adminAddr))
+	case "help":
+		fmt.Fprint(out, usageText)
+		return 0
 	default:
 		// Try to be helpful: if they typed a Prometheus metric name directly,
 		// show matching metrics.
 		if strings.Contains(cmd, "_") {
-			if err := cmdMetrics(*adminAddr, cmd, *rawJSON); err != nil {
-				fmt.Fprintln(os.Stderr, red("error: ")+err.Error())
-				os.Exit(1)
-			}
-			return
+			return fail(cmdMetrics(c.adminAddr, cmd, c.rawJSON))
 		}
-		fmt.Fprintf(os.Stderr, "unknown command %q — run 'veltrix help' for usage\n", cmd)
-		os.Exit(2)
+		fmt.Fprintf(errOut, "unknown command %q — run 'veltrix help' for usage\n", cmd)
+		return 2
 	}
 }
 

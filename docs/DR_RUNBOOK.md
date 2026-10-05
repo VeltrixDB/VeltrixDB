@@ -1,6 +1,6 @@
 # VeltrixDB Disaster Recovery Runbook
 
-> Assumes `kubectl` admin rights and pods labelled `app.kubernetes.io/name=veltrixdb` in `-n veltrixdb` (the `kubectl veltrix` plugin's defaults, `cmd/kubectl-veltrix`). The plugin reaches `/admin/*` through `kubectl port-forward` (a loopback connection) and sends no admin token, so it only works on servers started without `--admin-token`.
+> Assumes `kubectl` admin rights and pods labelled `app.kubernetes.io/name=veltrixdb` in `-n veltrixdb` (the `kubectl veltrix` plugin's defaults, `cmd/kubectl-veltrix`). The plugin reaches `/admin/*` through `kubectl port-forward` (a loopback connection). If the server runs with `--admin-token`, pass the same token with `--admin-token` or `VELTRIX_ADMIN_TOKEN`. Flags may follow the command (`kubectl veltrix cdc-tail --prefix orders/`). Use `--admin-url http://127.0.0.1:PORT` to reuse an existing port-forward.
 
 ---
 
@@ -81,7 +81,7 @@ curl -s localhost:2112/metrics | grep -E 'storage_wal_flushes_total|vlog_garbage
 | Cause | Fix |
 |-------|-----|
 | Disk 100% full + GC paused | `kubectl veltrix checkpoint`; check `kubectl veltrix gc-status` |
-| GC can't keep up | `kubectl veltrix quota-set NS 1000 5000000` — throttle writes |
+| GC can't keep up | `kubectl veltrix quota-set NS 1000 5000000` — throttle writes (burst defaults to the rate; `--burst N` to change) |
 | Network partition | `kubectl debug -n veltrixdb POD -it --image=busybox:1.36 -- nc -zv OTHER_POD 9000` — check CNI/NetworkPolicies |
 
 ---
@@ -89,7 +89,8 @@ curl -s localhost:2112/metrics | grep -E 'storage_wal_flushes_total|vlog_garbage
 ## 4. GC death-spiral / garbage ratio > 65% (SEV-2)
 
 ```bash
-# 1. Throttle writes
+# 1. Throttle writes: 1000 writes/s, max 5M keys. The token-bucket burst
+#    defaults to the rate (1000); add --burst N for a larger burst.
 kubectl veltrix quota-set tenant_42 1000 5000000
 
 # 2. Watch GC work through it (ratio per disk, runs, emergency state).
@@ -115,9 +116,11 @@ curl -s -X POST localhost:2112/admin/backup \
 # incremental: {"type":"incremental","dest_dir":"...","base_dir":"<previous backup dir>"}
 # (equivalent for a full backup: veltrix --addr 127.0.0.1:2112 backup DEST_DIR)
 
-# veltrixdb-backup (cmd/backup) opens the data dirs with its OWN engine:
-# run it only while the server is STOPPED. Pointed at a live server's
-# directories it races the server and can truncate wal.log / vlog_active.dat.
+# veltrixdb-backup (cmd/backup) opens the data dirs with its OWN engine, so
+# it works only while the server is STOPPED. Against a live server's dirs it
+# refuses ("data directory is locked by another VeltrixDB engine", from the
+# server's <data-dir>/LOCK) and leaves the live files alone — use the
+# POST /admin/backup / `veltrix backup` commands above for a running node.
 # It is not in the server image (the Dockerfile builds only cmd/server).
 veltrixdb-backup full --data-dirs=/mnt/nvme0,...,/mnt/nvme7 --dest=/backup/$(date +%F)
 
@@ -227,21 +230,28 @@ WAL records are binary by default. Replay reads binary and legacy text records
 in any mix, so **upgrading needs no step**: the new build replays the existing
 text WAL and appends binary records after it.
 
-A build that predates the binary WAL cannot read it. To roll back:
+A build that predates the binary WAL cannot read it, and a build that predates
+TTL-in-WAL cannot read a record of a key with a TTL (binary version 2, or the
+11th text field): either stops its replay there and **drops every later
+record**. To roll back to any older build:
 
 ```bash
-# 1. On the CURRENT build, restart once writing the legacy text WAL
-#    (logs "[wal] WARNING: --wal-format=text ...")
-veltrixdb --wal-format=text ...        # add to the StatefulSet args, re-roll
+# 1. On the CURRENT build, restart once writing the TTL-free legacy text WAL
+#    (logs "[wal] WARNING: --wal-format=text-legacy ...")
+veltrixdb --wal-format=text-legacy ... # add to the StatefulSet args, re-roll
 # 2. Stop it CLEANLY (SIGTERM, not SIGKILL) — the shutdown checkpoint
-#    rewrites wal.log as text
+#    rewrites wal.log as text without TTLs
 kubectl scale statefulset/veltrixdb --replicas=0 -n veltrixdb
 # 3. Deploy the older build
 ```
 
-If the node crashed instead of stopping cleanly, repeat steps 1–2. While
-running with `--wal-format=text`, keys containing `|` or a newline are not
-crash-safe: a crash can drop every acknowledged write after such a key.
+Keys written with a TTL come back **immortal** on the older build (it has no
+way to store the TTL — and it lost TTLs on every restart anyway); re-apply
+expiry from the application if that matters. `--wal-format=text` is NOT a
+rollback mode: it keeps the TTL field. If the node crashed instead of stopping
+cleanly, repeat steps 1–2. While running with either text format, keys
+containing `|` or a newline are not crash-safe: a crash can drop every
+acknowledged write after such a key.
 
 ## Contact
 

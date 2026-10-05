@@ -112,8 +112,9 @@ type coordinator struct {
 	replFactor  int
 	replTimeout int // ms
 
-	// linReads (raft mode, --linearizable-reads): GET runs the ReadIndex fence
-	// on the leader before reading; followers redirect with MOVED.
+	// linReads (raft mode, --linearizable-reads): every read (readBarrier)
+	// runs the ReadIndex fence on the leader first; followers redirect with
+	// MOVED.
 	linReads bool
 
 	// Distributed search (search_fanout.go): peers are queried through the
@@ -139,8 +140,13 @@ func (c *coordinator) Get(key string) ([]byte, error) {
 	return c.engine.Get(key)
 }
 
-// readBarrier is what every read (GET and the MGET paths) passes before it
-// reads the local engine.
+// readBarrier is what every read passes before it reads the local engine
+// (invariant 58): GET (coordinator.Get), the text read commands
+// (handleTextConn's checkRead), the binary read frames (handleBinaryConn's
+// readBlocked, handleMGet, the GET coalescing path) and the extended read ops
+// (handleExtOp's checkRead: RANGE, SCANCUR, IDXQUERY, VSEARCH[X], SEARCH
+// TSEARCH/HSEARCH, QUERY, GETVER). TestReadBarrier_* (read_barrier_test.go)
+// sends every one of them to a non-leader and expects MOVED.
 //   - raft, --linearizable-reads: redirect followers; run the ReadIndex fence.
 //   - raft, local reads: on a leader elected moments ago, wait for its term's
 //     no-op to apply, so writes the previous leader acknowledged are visible

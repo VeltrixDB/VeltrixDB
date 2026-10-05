@@ -76,6 +76,10 @@ type WriteAheadLog struct {
 	// binary format (wal_format.go). Rollback insurance only: an older build
 	// cannot read binary records. Set before the first append.
 	legacyText bool
+	// dropTTL (--wal-format=text-legacy, always with legacyText) omits the
+	// TTL field so records are readable by builds that predate it; TTL'd keys
+	// then come back immortal after a restart. Set before the first append.
+	dropTTL bool
 }
 
 type walItem struct {
@@ -193,7 +197,7 @@ func (wal *WriteAheadLog) appendAll(entries []*WALEntry) []error {
 	bufPtr := walRecPool.Get().(*[]byte)
 	buf := (*bufPtr)[:0]
 	for _, e := range entries {
-		buf = appendWALRecordFor(buf, e, wal.legacyText)
+		buf = appendWALRecordEnc(buf, e, wal.legacyText, wal.dropTTL)
 	}
 	*bufPtr = buf
 
@@ -235,7 +239,7 @@ const walRecMaxPooled = 1 << 20
 // caller must hand the pointer to the flusher, which owns returning it.
 func (wal *WriteAheadLog) serialize(entry *WALEntry) *[]byte {
 	bufPtr := walRecPool.Get().(*[]byte)
-	*bufPtr = appendWALRecordFor((*bufPtr)[:0], entry, wal.legacyText)
+	*bufPtr = appendWALRecordEnc((*bufPtr)[:0], entry, wal.legacyText, wal.dropTTL)
 	return bufPtr
 }
 
@@ -243,7 +247,20 @@ func (wal *WriteAheadLog) serialize(entry *WALEntry) *[]byte {
 // encoding and returns the grown buffer, so a batch of records can be built
 // into a single allocation.
 func appendWALRecordFor(buf []byte, entry *WALEntry, legacyText bool) []byte {
+	return appendWALRecordEnc(buf, entry, legacyText, false)
+}
+
+// appendWALRecordEnc is appendWALRecordFor with the text-legacy option:
+// dropTTL writes a TTL'd entry as if it had none, so a build that predates
+// the TTL field can still parse it (wal_format.go, "Mixed files and
+// rollback"). Only meaningful with legacyText.
+func appendWALRecordEnc(buf []byte, entry *WALEntry, legacyText, dropTTL bool) []byte {
 	if legacyText {
+		if dropTTL && entry.TTLExpiryUs != 0 {
+			e := *entry
+			e.TTLExpiryUs = 0
+			return appendWALRecordText(buf, &e)
+		}
 		return appendWALRecordText(buf, entry)
 	}
 	return appendWALRecordBinary(buf, entry)
@@ -306,15 +323,26 @@ func appendWALRecordText(buf []byte, entry *WALEntry) []byte {
 	// an older binary would mishandle anyway (it is the bug being fixed), and
 	// leaves deployments with compression and encryption off fully
 	// rollback-compatible.
+	//
+	// Field 11 (ttlExpiryUs, absolute Unix µs) follows the same rule: written
+	// only for a key with a TTL — which forces fields 9-10 out too, since the
+	// layout is positional — so a TTL-free record is byte-identical to what
+	// earlier builds wrote. Parsers older than field 11 cannot read it (they
+	// stop replay at it); text-legacy mode strips it — see appendWALRecordEnc.
 	diskLen := entry.DiskValueLen
 	if diskLen == 0 {
 		diskLen = entry.ValueLen // no transform applied — on-disk == plaintext
 	}
-	if entry.XformFlags != 0 || diskLen != entry.ValueLen {
+	hasTTL := entry.TTLExpiryUs > 0
+	if hasTTL || entry.XformFlags != 0 || diskLen != entry.ValueLen {
 		buf = append(buf, '|')
 		buf = strconv.AppendUint(buf, uint64(diskLen), 10)
 		buf = append(buf, '|')
 		buf = strconv.AppendUint(buf, uint64(entry.XformFlags), 16)
+	}
+	if hasTTL {
+		buf = append(buf, '|')
+		buf = strconv.AppendInt(buf, entry.TTLExpiryUs, 10)
 	}
 	buf = append(buf, '\n')
 
@@ -525,5 +553,5 @@ func (wal *WriteAheadLog) close() error {
 // checkpoint writes a compacted WAL (one record per live key) via an atomic
 // rename so keys survive a clean restart.  Must be called after close().
 func (wal *WriteAheadLog) checkpoint(index *shardedIndex, numDisks int, kvSep bool, version uint64) error {
-	return writeWALCheckpoint(wal.walPath, index, wal.diskIdx, numDisks, kvSep, version, wal.legacyText)
+	return writeWALCheckpoint(wal.walPath, index, wal.diskIdx, numDisks, kvSep, version, wal.legacyText, wal.dropTTL)
 }

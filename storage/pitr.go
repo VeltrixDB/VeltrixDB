@@ -283,7 +283,7 @@ func (a *WALArchiver) archiveDisk(d *diskArchiver) error {
 		if len(val) > 0 {
 			crc = computeCRC32C(val)
 		}
-		seg = appendArchiveRecord(seg, r.timestampNs, r.isTombstone, r.key, val, crc, r.version, d.wal.legacyText)
+		seg = appendArchiveRecord(seg, r.timestampNs, r.isTombstone, r.key, val, crc, r.version, r.ttlExpiryUs, d.wal.legacyText, d.wal.dropTTL)
 
 		if meta.Entries == 0 {
 			meta.FirstVersion, meta.LastVersion = r.version, r.version
@@ -483,9 +483,11 @@ func parseWALBuffer(data []byte) ([]walReplayEntry, int) {
 }
 
 // appendArchiveRecord serialises one self-contained record: an inline,
-// untransformed value (or a tombstone), no VLog reference. legacyText picks
-// the encoding — see WriteAheadLog.legacyText.
-func appendArchiveRecord(buf []byte, tsNs int64, tombstone bool, key string, value []byte, crc uint32, version uint64, legacyText bool) []byte {
+// untransformed value (or a tombstone), no VLog reference, and the key's
+// absolute TTL expiry (0 = none) so a restored key expires when the original
+// would have. legacyText / dropTTL pick the encoding — see
+// WriteAheadLog.legacyText and WriteAheadLog.dropTTL.
+func appendArchiveRecord(buf []byte, tsNs int64, tombstone bool, key string, value []byte, crc uint32, version uint64, ttlExpiryUs int64, legacyText, dropTTL bool) []byte {
 	e := WALEntry{
 		Timestamp:   tsNs,
 		IsTombstone: tombstone,
@@ -496,7 +498,10 @@ func appendArchiveRecord(buf []byte, tsNs int64, tombstone bool, key string, val
 		Checksum:    crc,
 		Version:     version,
 	}
-	return appendWALRecordFor(buf, &e, legacyText)
+	if !tombstone {
+		e.TTLExpiryUs = ttlExpiryUs
+	}
+	return appendWALRecordEnc(buf, &e, legacyText, dropTTL)
 }
 
 // ── point-in-time restore ─────────────────────────────────────────────────────
@@ -637,7 +642,7 @@ func RestorePITR(baseBackupDir, archiveDir string, target PITRTarget, destDirs [
 				}
 				// Binary: the restored dir is opened by this build, whose
 				// replay reads binary alongside any text in the base backup.
-				out = appendArchiveRecord(out[:0], r.timestampNs, r.isTombstone, r.key, r.value, r.crc, r.version, false)
+				out = appendArchiveRecord(out[:0], r.timestampNs, r.isTombstone, r.key, r.value, r.crc, r.version, r.ttlExpiryUs, false, false)
 				if _, err := bw.Write(out); err != nil {
 					f.Close()
 					return applied, fmt.Errorf("pitr: append to restored wal disk %d: %w", diskIdx, err)

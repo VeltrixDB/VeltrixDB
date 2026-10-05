@@ -23,6 +23,12 @@ type FailureDetector struct {
 	closeOnce             sync.Once
 	recoveryQueue         chan string // Failed nodes to recover
 	lastPartitionMapCheck int64
+
+	// recoveryOK counts consecutive successful recovery pings per RECOVERING
+	// node (guarded by mu).  At RecoveryConfirmations the node is ACTIVE.
+	recoveryOK map[string]int
+	// ping is the liveness probe (pingNode by default; tests replace it).
+	ping func(address string, port int) bool
 }
 
 // FailureDetectorConfig contains failure detector configuration
@@ -34,7 +40,13 @@ type FailureDetectorConfig struct {
 	RecoveryInterval   time.Duration // How often to attempt recovery
 	MaxRecoveryRetries int
 	PingTimeout        time.Duration // Dial + exchange timeout for pingNode; 0 → defaultPingTimeout
+	// RecoveryConfirmations is the number of consecutive successful recovery
+	// pings (one per RecoveryInterval) a RECOVERING node needs, with a fresh
+	// heartbeat, before it is promoted back to ACTIVE.  0 → 2.
+	RecoveryConfirmations int
 }
+
+const defaultRecoveryConfirmations = 2
 
 // defaultPingTimeout is used when FailureDetectorConfig.PingTimeout is zero
 // (e.g. configs built before the field existed).
@@ -43,13 +55,14 @@ const defaultPingTimeout = 2 * time.Second
 // DefaultFailureDetectorConfig returns sensible defaults
 func DefaultFailureDetectorConfig() *FailureDetectorConfig {
 	return &FailureDetectorConfig{
-		HeartbeatInterval:  1 * time.Second,
-		SuspectThreshold:   3 * time.Second,
-		FailureThreshold:   10 * time.Second,
-		MaxSuspectTime:     15 * time.Second,
-		RecoveryInterval:   5 * time.Second,
-		MaxRecoveryRetries: 3,
-		PingTimeout:        defaultPingTimeout,
+		HeartbeatInterval:     1 * time.Second,
+		SuspectThreshold:      3 * time.Second,
+		FailureThreshold:      10 * time.Second,
+		MaxSuspectTime:        15 * time.Second,
+		RecoveryInterval:      5 * time.Second,
+		MaxRecoveryRetries:    3,
+		PingTimeout:           defaultPingTimeout,
+		RecoveryConfirmations: defaultRecoveryConfirmations,
 	}
 }
 
@@ -61,6 +74,7 @@ type FailureDetectionMetrics struct {
 	RecoveryAttempts atomic.Uint64
 	RecoverySuccess  atomic.Uint64
 	RecoveryFailures atomic.Uint64
+	NodesReactivated atomic.Uint64 // RECOVERING → ACTIVE promotions
 }
 
 // NewFailureDetector creates a new failure detector
@@ -74,6 +88,7 @@ func NewFailureDetector(pm *PartitionMap, config *FailureDetectorConfig) *Failur
 		metrics:        &FailureDetectionMetrics{},
 		done:           make(chan struct{}),
 		recoveryQueue:  make(chan string, 100),
+		recoveryOK:     make(map[string]int),
 	}
 }
 
@@ -223,7 +238,7 @@ func (fd *FailureDetector) backgroundRecoveryWorker() {
 			}
 
 		case <-ticker.C:
-			// Periodically check for recovery update
+			fd.promoteRecoveredNodes()
 		}
 	}
 }
@@ -240,8 +255,12 @@ func (fd *FailureDetector) attemptNodeRecovery(nodeID string) bool {
 		return false
 	}
 
+	ping := fd.ping
+	if ping == nil {
+		ping = fd.pingNode
+	}
 	// Try to ping the node
-	if fd.pingNode(node.Address, node.Port) {
+	if ping(node.Address, node.Port) {
 		// Node is back online, mark as recovering
 		fd.partitionMap.UpdateNodeState(nodeID, NodeStateRecovering)
 
@@ -252,6 +271,86 @@ func (fd *FailureDetector) attemptNodeRecovery(nodeID string) bool {
 	}
 
 	return false
+}
+
+// promoteRecoveredNodes pings every RECOVERING node once.  A node that has
+// answered RecoveryConfirmations consecutive pings and whose heartbeat is
+// fresh (younger than SuspectThreshold) moves to ACTIVE: Rebalance assigns
+// partitions to ACTIVE nodes only, so the partition table is rebuilt
+// (triggerRebalance here; cmd/server's auto-rebalancer also reacts to the
+// ACTIVE membership event and migrates keys).  A failed ping resets the count.
+func (fd *FailureDetector) promoteRecoveredNodes() {
+	type target struct {
+		id, addr string
+		port     int
+		lastHB   int64
+	}
+	pm := fd.partitionMap
+	var targets []target
+	pm.mu.RLock()
+	for id, n := range pm.Nodes {
+		if st, ok := n.State.Load().(NodeState); ok && st == NodeStateRecovering {
+			targets = append(targets, target{id: id, addr: n.Address, port: n.Port, lastHB: n.LastHeartbeat})
+		}
+	}
+	pm.mu.RUnlock()
+	if len(targets) == 0 {
+		fd.mu.Lock()
+		for id := range fd.recoveryOK {
+			delete(fd.recoveryOK, id)
+		}
+		fd.mu.Unlock()
+		return
+	}
+
+	need := fd.config.RecoveryConfirmations
+	if need <= 0 {
+		need = defaultRecoveryConfirmations
+	}
+	ping := fd.ping
+	if ping == nil {
+		ping = fd.pingNode
+	}
+
+	promoted := false
+	for _, t := range targets {
+		ok := ping(t.addr, t.port)
+		fd.mu.Lock()
+		if !ok {
+			delete(fd.recoveryOK, t.id)
+			fd.mu.Unlock()
+			continue
+		}
+		fd.recoveryOK[t.id]++
+		hb := fd.nodeHeartbeats[t.id]
+		if hb == 0 {
+			hb = t.lastHB
+		}
+		fresh := time.Now().UnixNano()-hb < fd.config.SuspectThreshold.Nanoseconds()
+		if fd.recoveryOK[t.id] < need || !fresh {
+			fd.mu.Unlock()
+			continue
+		}
+		delete(fd.recoveryOK, t.id)
+		fd.mu.Unlock()
+
+		// Re-check the state: a heartbeat timeout may have failed it again.
+		pm.mu.RLock()
+		n, exists := pm.Nodes[t.id]
+		still := exists && n.State.Load().(NodeState) == NodeStateRecovering
+		pm.mu.RUnlock()
+		if !still {
+			continue
+		}
+		if err := pm.UpdateNodeState(t.id, NodeStateActive); err == nil {
+			fd.metrics.NodesReactivated.Add(1)
+			log.Printf("[fd] node %s recovered — ACTIVE", t.id)
+			promoted = true
+		}
+	}
+	if promoted {
+		fd.triggerRebalance()
+	}
 }
 
 // pingNode performs a real TCP health check against address:port.

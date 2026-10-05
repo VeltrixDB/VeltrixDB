@@ -37,6 +37,15 @@ secondary-index definitions as `@idxdef/<name>` and index entries as
 `@idx/<name>/<value>/<id>`. The search indexes in RAM are derived from those
 keys and rebuilt from them at startup. Similarity is cosine.
 
+Deleting the record (`DEL doc-42`, a `TXN` delete, or the same delete
+applied by raft / replication on another node) also deletes `@vec/<ns>/doc-42`
+and `@txt/<ns>/doc-42` in every namespace, so the record stops appearing in
+`VSEARCH`, `TSEARCH` and `HSEARCH`. A vector or document whose id never had a
+record (pure vector search) is left alone: only `VDEL` / `TDEL` remove it, and
+a `DEL` of an id with no record does nothing to it. A vector written after
+its record was deleted is a new, record-less vector. TTL expiry of a record
+does not delete its vectors or documents.
+
 ## Commands
 
 Text protocol (the binary protocol and the Go client have the same
@@ -46,7 +55,7 @@ operations; see [README — Wire protocol](../README.md#wire-protocol)):
 |--|--|
 | `VCREATE ns dim [QUANT none\|int8\|pq] [PQM m] [PQTRAIN n] [GRAPH memory\|disk]` | create or reconfigure a namespace (optional: the first `VSET` creates a float32 one) |
 | `VSET id [NS ns] f1 f2 ...` | upsert a vector |
-| `VDEL id [NS ns]` | delete a vector |
+| `VDEL id [NS ns]` | delete a vector (`DEL id` of its record also does, in every namespace) |
 | `VSEARCH k [NS ns] [EF n] [FILTER field op value] f1 f2 ...` | top-k by cosine; `k = 0` returns every match (exact scan) |
 | `TSET id [NS ns] TEXT free text` / `TDEL id [NS ns]` | upsert / delete a text document (text = rest of the line, at most 1 MiB) |
 | `TSEARCH k [NS ns] [FILTER field op value] QUERY free text` | top-k by BM25; `k = 0` returns every match |
@@ -150,6 +159,10 @@ checked best-first on the scored documents until k match.
 
 - Search writes (`VSET`, `TSET`, `VCREATE`, `IDXCREATE`, …) go through the
   normal raft / replicated write path.
+- Searches, `QUERY` and `IDXQUERY` pass the same read barrier as GET
+  (`coordinator.readBarrier`): in raft mode a freshly elected leader waits
+  for its term's no-op to apply, and with `--linearizable-reads` followers
+  answer `MOVED` and the leader runs the ReadIndex fence first.
 - The ring places `@vec/<ns>/<id>`, `@txt/<ns>/<id>` and
   `@idx/<rule>/<value>/<id>` on the node that owns `<id>`, so after a
   rebalance each node holds whole records and filters locally.
@@ -191,6 +204,11 @@ checked best-first on the scored documents until k match.
   the kill are not checked; after each cycle the test rewrites every such id
   to a fresh, fully acknowledged version (record, text and vector), so later
   cycles check it again.
+- A record delete writes the record's tombstone first, then deletes its
+  vectors and documents. If the process dies in between, the startup rebuild
+  finds each vector / document whose record carries a newer tombstone,
+  deletes it (durably) and does not index it
+  (`TestSearch_CrashBetweenRecordAndDerivedDelete`).
 
 ## Measured performance
 
@@ -296,8 +314,10 @@ after deleting 40 % 0.96 / 0.92.
 - No same-hardware comparison with other vector databases (below).
 - Text search has no stemming, phrase queries or per-field weighting; one
   document is at most 1 MiB.
-- Dimension 1–4096. Deleting a KV record (`DEL`) does not delete its vector
-  or text document; use `VDEL` / `TDEL` as well.
+- Dimension 1–4096.
+- A record that expires by TTL keeps its vectors and documents (only a
+  delete removes them); use `VDEL` / `TDEL` for those, and for vectors left
+  behind by deletes made before this version.
 
 ## Benchmarks against other databases
 

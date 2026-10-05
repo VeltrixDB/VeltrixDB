@@ -231,7 +231,7 @@ On-disk format (binary, the default — `storage/wal_format.go`): a 48-byte litt
 48 key bytes [value bytes if inline] CRC32C(record)
 ```
 
-The legacy text format (`ts|tomb|key|valueLen|crc|version|vlogOffset|packed|diskLen|xflags\n[value\n]`) is still read, mixed record by record with binary. It is written only with `--wal-format=text`. Split on `|` and `\n`, it truncated replay at any key containing either byte. To roll back to a pre-binary build, run once with `--wal-format=text` and stop cleanly. Crash replay, the PITR archiver and PITR restore all decode through the same reader in `wal_format.go`.
+A record of a key with a TTL is version 2: an 8-byte absolute expiry (Unix µs) follows the 48-byte header; TTL-free records stay version 1, byte-identical. The legacy text format (`ts|tomb|key|valueLen|crc|version|vlogOffset|packed|diskLen|xflags[|ttlExpiryUs]\n[value\n]`) is still read, mixed record by record with binary. It is written only with `--wal-format=text` (keeps TTLs) or `--wal-format=text-legacy` (drops them). Split on `|` and `\n`, it truncated replay at any key containing either byte. To roll back to any older build, run once with `--wal-format=text-legacy` and stop cleanly; TTL'd keys come back immortal on the older build. Crash replay, the PITR archiver and PITR restore all decode through the same reader in `wal_format.go`.
 
 ### VLog Record (24-byte header)
 

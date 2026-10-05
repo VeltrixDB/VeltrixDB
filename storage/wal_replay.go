@@ -28,6 +28,10 @@ type walReplayEntry struct {
 	// onto the rebuilt IndexEntry; without them the read path would hand back
 	// ciphertext. Zero for pre-10-field WALs.
 	xflags uint8
+	// ttlExpiryUs is the key's absolute expiry (Unix µs, IndexEntry.TTLExpiryUs
+	// semantics); 0 = immortal. From a version-2 binary record or the 11th
+	// text field; always 0 for records written before the WAL carried TTL.
+	ttlExpiryUs int64
 }
 
 // replayWAL reads the WAL file at walPath and returns all valid, fully-written
@@ -114,6 +118,9 @@ func applyWALReplay(
 	transform func([]byte) ([]byte, uint8, error),
 ) uint64 {
 	var maxVersion uint64
+	// TTL deadlines are absolute, so "already expired" is judged against the
+	// wall clock at replay, once for the whole pass.
+	replayNowUs := time.Now().UnixMicro()
 
 	// pending collects old-format KV-sep entries whose VLog fdatasync is in
 	// flight.  All beginAppend calls are submitted before any response is read
@@ -132,6 +139,15 @@ func applyWALReplay(
 		nowUs := e.timestampNs / 1000
 
 		if e.isTombstone {
+			index.replayMarkTombstone(e.key, nowUs)
+			continue
+		}
+		// A TTL'd write whose deadline has already passed is applied as an
+		// expiry: it supersedes whatever earlier record the key had, exactly
+		// as the TTL scanner's tombstone would have, and is never installed
+		// as live — no resurrecting a key a client saw expire, and no VLog
+		// re-append for a legacy inline value nobody can read.
+		if e.ttlExpiryUs > 0 && replayNowUs >= e.ttlExpiryUs {
 			index.replayMarkTombstone(e.key, nowUs)
 			continue
 		}
@@ -158,6 +174,12 @@ func applyWALReplay(
 		// Restore the transform bits so Get() decrypts/decompresses this
 		// record exactly as it would have before the restart.
 		entry.Flags |= e.xflags & (FlagCompressed | FlagEncrypted)
+		// Restore the TTL. Before the WAL carried it, every TTL'd key came
+		// back immortal after any restart, crash or clean.
+		if e.ttlExpiryUs > 0 {
+			entry.Flags |= FlagHasTTL
+			entry.TTLExpiryUs = e.ttlExpiryUs
+		}
 
 		switch {
 		case kvSep && vl != nil && e.vlogOffset > 0:
@@ -231,13 +253,19 @@ func walPathForDir(dir string) string {
 // entries the dirty value is embedded.
 //
 // legacyText selects the pre-binary text encoding — what --wal-format=text
-// uses to make a clean shutdown leave a WAL an older build can read.
+// uses to make a clean shutdown leave a WAL an older build can read — and
+// dropTTL (--wal-format=text-legacy) additionally omits the TTL field, which
+// builds older than it cannot parse (wal_format.go).
+//
+// Each live key's TTL is carried as its absolute expiry; keys already expired
+// are left out, since the checkpoint replaces the whole WAL and nothing older
+// can resurrect them.
 //
 // The write is crash-safe: we write to walPath+".ckpt", fdatasync, then
 // rename to walPath — so a crash mid-write leaves the old WAL intact.
 //
 // Must be called after the WAL flusher goroutine has stopped (w.close()).
-func writeWALCheckpoint(walPath string, index *shardedIndex, diskIdx, numDisks int, kvSep bool, version uint64, legacyText bool) error {
+func writeWALCheckpoint(walPath string, index *shardedIndex, diskIdx, numDisks int, kvSep bool, version uint64, legacyText, dropTTL bool) error {
 	tmpPath := walPath + ".ckpt"
 	f, err := os.Create(tmpPath)
 	if err != nil {
@@ -246,6 +274,7 @@ func writeWALCheckpoint(walPath string, index *shardedIndex, diskIdx, numDisks i
 
 	bw := bufio.NewWriterSize(f, 1<<20) // 1 MB write buffer
 	now := time.Now().UnixNano()
+	nowUs := now / 1000
 	var writeErr error
 	var buf []byte // reused across entries to avoid per-entry allocation
 	var we WALEntry
@@ -254,8 +283,8 @@ func writeWALCheckpoint(walPath string, index *shardedIndex, diskIdx, numDisks i
 		shard := &index.shards[i]
 		shard.mu.RLock()
 		shard.entries.rangeAll(func(key string, entry *IndexEntry) bool {
-			if entry.IsTombstone() {
-				return true // deleted keys are not checkpointed
+			if entry.IsTombstone() || entry.IsExpired(nowUs) {
+				return true // deleted and expired keys are not checkpointed
 			}
 
 			ts := entry.WriteTimestampUs * 1000 // μs → ns (WAL stores nanoseconds)
@@ -272,6 +301,9 @@ func writeWALCheckpoint(walPath string, index *shardedIndex, diskIdx, numDisks i
 				plainLen = entry.ValueSize
 			}
 			we = WALEntry{Timestamp: ts, Key: key, KeyLen: uint32(len(key)), Version: version}
+			if entry.HasTTL() && entry.TTLExpiryUs > 0 {
+				we.TTLExpiryUs = entry.TTLExpiryUs
+			}
 
 			if kvSep && entry.DiskOffset > 0 {
 				// Value is durable in VLog — header-only record.
@@ -295,7 +327,7 @@ func writeWALCheckpoint(walPath string, index *shardedIndex, diskIdx, numDisks i
 				we.ValueLen = uint32(len(dirtyVal))
 				we.Checksum = computeCRC32C(dirtyVal)
 			}
-			buf = appendWALRecordFor(buf[:0], &we, legacyText)
+			buf = appendWALRecordEnc(buf[:0], &we, legacyText, dropTTL)
 			_, writeErr = bw.Write(buf)
 			return writeErr == nil
 		})

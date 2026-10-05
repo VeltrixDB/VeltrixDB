@@ -39,6 +39,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -331,8 +332,15 @@ func (ta *TransferAgent) MigrateToNewOwners() error {
 	}
 
 	// Every destination also gets a copy of the pinned keys, sent FIRST so a
-	// namespace's settings apply before its vectors arrive.
+	// namespace's settings apply before its vectors arrive. Derived keys
+	// (vectors, text documents, index entries) go before the records: only a
+	// sent prefix is deleted locally, and deleting a record also deletes its
+	// vectors and documents (storage deleteDerivedSearchKeys), so a record
+	// must never be deleted here while one of its derived keys is unsent.
 	for nodeID, kvs := range byDest {
+		sort.SliceStable(kvs, func(i, j int) bool {
+			return isDerivedKey(kvs[i].Key) && !isDerivedKey(kvs[j].Key)
+		})
 		byDest[nodeID] = append(append([]KeyValue(nil), pinned...), kvs...)
 	}
 
@@ -388,6 +396,9 @@ func (ta *TransferAgent) MigrateToNewOwners() error {
 // quantization), which each node applies to the vectors it owns.
 // "@idxdef/<name>" carries a secondary-index definition the same way.
 var pinnedKeyPrefixes = []string{"@vecns/", "@idxdef/"}
+
+// isDerivedKey reports whether key is routed as another key (RoutingKey).
+func isDerivedKey(key string) bool { return RoutingKey(key) != key }
 
 func isPinnedKey(key string) bool {
 	for _, p := range pinnedKeyPrefixes {
@@ -567,6 +578,8 @@ func (ta *TransferAgent) sendBatches(nodeID string, kvs []KeyValue) (sent int, e
 			return sent, fmt.Errorf("remote HTTP %d", resp.StatusCode)
 		}
 		sent += end - i
+		// One completed key-batch migration (veltrixdb_cluster_partition_migrations_total).
+		ta.pm.metrics.PartitionMigrations.Add(1)
 	}
 	return sent, nil
 }

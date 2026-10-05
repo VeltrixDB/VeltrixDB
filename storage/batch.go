@@ -247,6 +247,9 @@ func (se *StorageEngine) multiPutKVSep(reqs []MultiPutRequest, errs []error) []e
 				we.Packed = s.packed
 				we.DiskValueLen = s.diskLen
 				we.XformFlags = s.xflags
+				// Same absolute deadline Phase 4 installs on the IndexEntry;
+				// always assigned, so a pooled entry never keeps an old one.
+				we.TTLExpiryUs = walTTLExpiryUs(nowUs, r.TTL)
 				walEntries = append(walEntries, we)
 			}
 
@@ -293,6 +296,12 @@ func (se *StorageEngine) multiPutKVSep(reqs []MultiPutRequest, errs []error) []e
 			}
 
 			// Phase 4: index + cache update for entries that survived both.
+			// Each key's audit record and CDC event go out right after its
+			// index install — the same point in the write as engine.Put —
+			// so a subscriber never sees a key before a reader can. Both
+			// sinks are non-blocking; with neither enabled the per-key work
+			// is skipped and only the broadcast counter moves.
+			emit := se.cdc.hasSubscribers() || se.audit.isEnabled()
 			survived := 0
 			for _, s := range committed {
 				if errs[s.reqIdx] != nil {
@@ -317,9 +326,9 @@ func (se *StorageEngine) multiPutKVSep(reqs []MultiPutRequest, errs []error) []e
 					entry.Flags |= FlagPacked
 				}
 				entry.Flags |= s.xflags
-				if r.TTL > 0 {
+				if exp := walTTLExpiryUs(nowUs, r.TTL); exp > 0 {
 					entry.Flags |= FlagHasTTL
-					entry.TTLExpiryUs = nowUs + int64(r.TTL)*1_000_000
+					entry.TTLExpiryUs = exp
 				}
 				se.index.put(r.Key, entry, nil)
 				// Write-around: refresh the key if it is already cached (else a
@@ -334,8 +343,15 @@ func (se *StorageEngine) multiPutKVSep(reqs []MultiPutRequest, errs []error) []e
 				// The single-key Put path stays write-through: one interactive
 				// write is far more likely to be read back than one of a
 				// thousand keys in a bulk batch.
-				se.cache.PutIfPresent(r.Key, r.Value)
+				se.cache.PutIfPresentWithExpiry(r.Key, r.Value, entry.CacheExpiryUs())
+				if emit {
+					se.audit.Log(AuditRecord{Op: "PUT", Key: r.Key, Status: "ok"})
+					se.cdc.Broadcast(CDCEvent{Op: "PUT", Key: r.Key, Value: r.Value, Timestamp: nowUs})
+				}
 				survived++
+			}
+			if !emit {
+				se.cdc.countBroadcasts(survived)
 			}
 			se.metrics.VLogWrites.Add(uint64(survived))
 			se.metrics.Writes.Add(uint64(survived))
@@ -380,7 +396,9 @@ func (se *StorageEngine) MultiGet(keys []string) []MultiGetResult {
 		results[i] = MultiGetResult{
 			Key:   keys[i],
 			Value: val,
-			Found: err == nil && val != nil,
+			// err == nil alone decides Found: Get returns a non-nil
+			// empty slice for a stored empty value (see emptyValue).
+			Found: err == nil,
 			Err:   err,
 		}
 	}

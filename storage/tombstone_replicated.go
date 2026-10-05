@@ -7,22 +7,28 @@ package storage
 // otherwise a slow replica that hasn't yet seen the delete would resurrect the
 // key on next anti-entropy ("zombie data").
 //
-// This file adds a "minimum replica acknowledgement" check: a tombstone is
-// reaped only when EITHER
-//   (a) GCGracePeriodSec has elapsed, AND
-//   (b) every known replica has reported `LastSeenWriteTimestampUs >= the
-//       tombstone's timestamp` via the replication acknowledgement channel.
+// This file adds a "minimum replica acknowledgement" check.  A tombstone is
+// reaped when
+//   (a) it is older than GCGracePeriodSec (unchanged rule — also protects the
+//       repl-ship catch-up feed and single-node / raft deployments), AND
+//   (b) every replica that reported a watermark has acknowledged a write
+//       timestamp >= the tombstone's, OR the tombstone is older than
+//       2 × GCGracePeriodSec (upper bound: a replica that never catches up
+//       delays reaping by at most one extra grace period).
 //
-// When (b) cannot be satisfied (replica unreachable, replication subsystem not
-// wired), the engine falls back to (a) alone — the same behaviour we had
-// before this change. Operators who run replication should wire the
-// SetReplicaWatermark API from the replication package.
+// When no replica has ever reported a watermark (single node, raft mode,
+// replication not wired) rule (b) is skipped: grace period alone.
 //
-// Wire flow:
-//   - Replication subsystem calls SetReplicaWatermark(replicaID, timestamp)
-//     periodically (after each replica acks a batch).
-//   - The defragmenter's tombstone-reap loop calls minReplicaWatermark()
-//     and skips any tombstone whose timestamp > min watermark.
+// Wire flow (cmd/server, --mode=replicated):
+//   - replication.ReplicationEngine.SetWatermarkObserver → every second,
+//     StorageEngine.SetReplicaWatermark(replicaID, watermarkUs), where the
+//     watermark is the timestamp of the oldest write the replica has not
+//     acked (or now, when caught up) minus a safety margin.
+//   - Defragmenter.reapExpiredTombstones calls canReapTombstone for every
+//     tombstone past the grace period.
+//
+// Watermarks live in memory: after a restart they are empty until the
+// replication engine reports again (≤ 1 s).
 
 import (
 	"sync"
@@ -97,19 +103,26 @@ func (se *StorageEngine) SetReplicaWatermark(replicaID string, writeTimestampUs 
 // CanReapTombstone returns true when a tombstone with the given timestamp
 // can be physically removed without risking zombie data on a lagging replica.
 //
-// Two conditions must BOTH hold:
-//  1. The tombstone is older than the configured grace period (existing rule).
-//  2. Every known replica has acknowledged a writeTimestamp ≥ this one.
-//
-// Single-node deployments (no replicas tracked) skip rule (2) entirely.
+// The tombstone must be older than the grace period, and every known replica
+// must have acknowledged a writeTimestamp ≥ this one unless the tombstone is
+// older than twice the grace period.  Single-node deployments (no replicas
+// tracked) skip the replica check entirely.
 func (se *StorageEngine) CanReapTombstone(tombstoneWriteTsUs int64, nowUs int64, gracePeriodSec int64) bool {
-	if nowUs-tombstoneWriteTsUs < gracePeriodSec*1_000_000 {
+	return canReapTombstone(se.tombstones, tombstoneWriteTsUs, nowUs, gracePeriodSec)
+}
+
+// canReapTombstone implements the rule documented at the top of this file.
+// tc may be nil (grace period only).
+func canReapTombstone(tc *TombstoneCoordinator, tombstoneWriteTsUs, nowUs, gracePeriodSec int64) bool {
+	graceUs := gracePeriodSec * 1_000_000
+	age := nowUs - tombstoneWriteTsUs
+	if age < graceUs {
 		return false
 	}
-	if se.tombstones.MinWatermarkUs() < tombstoneWriteTsUs {
-		return false
+	if tc == nil || age >= 2*graceUs {
+		return true
 	}
-	return true
+	return tc.MinWatermarkUs() >= tombstoneWriteTsUs
 }
 
 // ReplicatedTombstoneStats exposes the watermark snapshot via the admin API.
