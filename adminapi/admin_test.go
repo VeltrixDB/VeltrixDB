@@ -43,7 +43,7 @@ func newMockEngine() *mockEngine {
 	}
 	// Initialise all atomic fields so nil-pointer panics can't happen.
 	m.metrics.Writes = &atomic.Uint64{}
-	m.metrics.Reads = &atomic.Uint64{}
+	m.metrics.Reads = &storage.StripedCounter{}
 	m.metrics.Deletes = &atomic.Uint64{}
 	m.metrics.AtomicOps = &atomic.Uint64{}
 	m.metrics.AuditDropped = &atomic.Uint64{}
@@ -106,7 +106,7 @@ func TestStats_GET_OK(t *testing.T) {
 	me := newMockEngine()
 	me.indexSize = 77
 	me.metrics.Writes.Store(10)
-	me.metrics.Reads.Store(20)
+	me.metrics.Reads.AddAt(0, 20)
 
 	mux := newRouter(me)
 	rec := do(t, mux, http.MethodGet, "/admin/stats", "")

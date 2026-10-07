@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"runtime"
 	"runtime/pprof"
 	"runtime/trace"
 	"strconv"
@@ -22,6 +23,9 @@ import (
 //	/debug/pprof/profile?seconds=N   CPU profile (default 30 s)
 //	/debug/pprof/trace?seconds=N     execution trace (default 5 s) — `go tool trace`
 //	/debug/pprof/<name>              heap, goroutine, allocs, block, mutex, threadcreate
+//
+// block and mutex stay empty unless --pprof-block-rate / --pprof-mutex-fraction
+// turn them on (enableContentionProfiles): the runtime records neither by default.
 //
 // Both are `go tool pprof`-compatible.
 func servePprof(addr string) {
@@ -71,5 +75,19 @@ func servePprof(addr string) {
 	log.Printf("[pprof] serving on http://%s/debug/pprof/", addr)
 	if err := http.ListenAndServe(addr, mux); err != nil {
 		log.Printf("[pprof] listener stopped: %v", err)
+	}
+}
+
+// enableContentionProfiles turns on the runtime's mutex and block profiling,
+// which are off by default (so /debug/pprof/mutex and /block are empty).
+// Values <= 0 leave a profile off.
+func enableContentionProfiles(mutexFraction, blockRateNs int) {
+	if mutexFraction > 0 {
+		runtime.SetMutexProfileFraction(mutexFraction)
+		log.Printf("[pprof] mutex profile on: sampling 1 in %d contention events", mutexFraction)
+	}
+	if blockRateNs > 0 {
+		runtime.SetBlockProfileRate(blockRateNs)
+		log.Printf("[pprof] block profile on: events >= %d ns", blockRateNs)
 	}
 }

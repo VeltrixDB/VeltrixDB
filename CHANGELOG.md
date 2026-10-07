@@ -11,6 +11,24 @@ Releases are cut automatically on every merge to `main` (GitHub release +
 
 ## [Unreleased]
 
+### Performance
+
+- **Read counters no longer share one cache line.** `Reads`, `CacheHits` and
+  `CacheMisses` — bumped by every `Get` — are `storage.StripedCounter`s: 64
+  stripes of 128 bytes, picked by the key's hash, summed on a scrape. A
+  read-heavy in-process profile had put the two hot counters at 14% of CPU.
+  Measured in-process on an 18-core Mac (1M cached keys, 64 goroutines, two
+  runs each): reads 11.5M → 13.0M/s (+13%); reads beside 19 writers 10.8M →
+  12.0M/s (+11%), writes unchanged within noise. Prometheus and
+  `/admin/stats` values are unchanged.
+
+### Added
+
+- `--pprof-mutex-fraction N` and `--pprof-block-rate NS` (with
+  `--pprof-addr`): turn on the runtime's mutex and block profiling, so
+  `/debug/pprof/mutex` and `/debug/pprof/block` are no longer always empty.
+  Both default to 0 (off).
+
 ### Fixed
 
 - **Data loss on node failure with `--auto-rebalance=true` (the default).**

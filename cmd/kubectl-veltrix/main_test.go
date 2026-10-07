@@ -24,7 +24,7 @@ type mockEngine struct {
 
 func newMockEngine() *mockEngine {
 	m := &storage.StorageMetrics{}
-	m.Writes, m.Reads, m.Deletes = &atomic.Uint64{}, &atomic.Uint64{}, &atomic.Uint64{}
+	m.Writes, m.Reads, m.Deletes = &atomic.Uint64{}, &storage.StripedCounter{}, &atomic.Uint64{}
 	m.AtomicOps, m.AuditDropped = &atomic.Uint64{}, &atomic.Uint64{}
 	return &mockEngine{limits: map[string]storage.QuotaLimit{}, m: m}
 }

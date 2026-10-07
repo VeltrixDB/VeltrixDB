@@ -140,8 +140,7 @@ For large changes, consider opening a draft PR early to get feedback on the appr
 
 - **RESP protocol compatibility** — the single most-requested feature. Implementing a RESP3 layer so Redis clients work without code changes.
 - **Raft snapshots at scale** — snapshots exist (`consensus/snapshot.go`, `raftFSM.Snapshot`), but they gob-encode the whole keyspace into one in-memory blob, ship it in a single InstallSnapshot message and do not preserve TTLs. Chunked / streaming snapshots are needed for large datasets.
-- **Read barrier coverage** — in raft mode GET and MGET pass the read barrier, but namespace, hash and `RANGE` / `SCANCUR` reads do not yet (CLAUDE.md invariant 58).
-- **Client SDK improvements** — the SDKs live in the separate Veltrixdb-client repository ([clients/README.md](clients/README.md)) and do not yet expose the search API; connection pool tuning, timeout handling and retry logic are also open.
+- **Client SDK improvements** — the SDKs live in the separate Veltrixdb-client repository ([clients/README.md](clients/README.md)); connection pool tuning, timeout handling and retry logic are open.
 - **Documentation** — tutorials, getting-started guides, and runbooks are always useful.
 
 ---
