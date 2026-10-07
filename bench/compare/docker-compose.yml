@@ -38,7 +38,9 @@ services:
     command: ["--config-file", "/opt/aerospike/etc/aerospike.conf"]
     ports: ["3000:3000"]
     volumes:
-      - ./aerospike.conf:/opt/aerospike/etc/aerospike.conf:ro
+      # compare.sh renders this file (flush-max-ms / commit-to-device) into
+      # results/<ts>/aerospike-conf and points AEROSPIKE_CONF_DIR there.
+      - ${AEROSPIKE_CONF_DIR:-.}/aerospike.conf:/opt/aerospike/etc/aerospike.conf:ro
       - "${BENCH_DATA:-./data}/aerospike:/opt/aerospike/data"
 
   scylla:
@@ -46,8 +48,12 @@ services:
     image: scylladb/scylla:${SCYLLA_VERSION:-latest}
     # --smp / --memory pin Seastar to the same budget as the limits above.
     # Durability: ScyllaDB's default commitlog_sync is periodic (10 s), i.e.
-    # a write is ACKed before it is on disk. For a like-for-like durable
-    # comparison set commitlog_sync: batch in scylla.yaml (see README).
-    command: ["--smp", "${BENCH_CPUS:-8}", "--memory", "12G", "--overprovisioned", "1", "--developer-mode", "0"]
+    # a write is ACKed before it is on disk. SCYLLA_COMMITLOG=batch (default
+    # here, like VeltrixDB's fdatasync-before-ACK) syncs the commitlog before
+    # the ACK. The image's entrypoint passes options it does not know itself
+    # (--commitlog-sync) on to the scylla binary, which accepts every
+    # scylla.yaml option as a command-line flag.
+    command: ["--smp", "${BENCH_CPUS:-8}", "--memory", "12G", "--overprovisioned", "1", "--developer-mode", "0",
+              "--commitlog-sync", "${SCYLLA_COMMITLOG:-batch}"]
     ports: ["9042:9042"]
     volumes: ["${BENCH_DATA:-./data}/scylla:/var/lib/scylla"]

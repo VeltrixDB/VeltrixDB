@@ -52,7 +52,7 @@ func TestSubmit_CommitNotifyPrompt(t *testing.T) {
 // TestSubmit_Timeout: when the quorum is unreachable, Submit fails after the
 // configured timeout (not sooner, not never).
 func TestSubmit_Timeout(t *testing.T) {
-	c := newSnapCluster(t, 3, Options{})
+	c := newSnapCluster(t, 3, testOpts(Options{}))
 	li := waitForStableLeader(c.nodes, 5*time.Second)
 	if li < 0 {
 		t.Fatal("no stable leader")

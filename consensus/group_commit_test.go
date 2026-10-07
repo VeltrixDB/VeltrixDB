@@ -44,7 +44,7 @@ func submitToCluster(nodes []*RaftNode, cmd []byte, timeout time.Duration) error
 // 3-node cluster and asserts:
 //   - every command commits and applies exactly once,
 //   - all three nodes apply them in an identical order,
-//   - the leader performed FAR fewer writeStateFile fsyncs than there were
+//   - the leader performed FAR fewer raft log fsyncs than there were
 //     Submits (i.e. group commit coalesced them).
 func TestGroupCommit_BatchingReducesFsyncs(t *testing.T) {
 	nodes, _ := newTestCluster(t, 3)
@@ -59,7 +59,7 @@ func TestGroupCommit_BatchingReducesFsyncs(t *testing.T) {
 		numWorkers = 32
 	)
 
-	fsyncBefore := leader.writeStateFileCalls.Load()
+	fsyncBefore := leader.store.syncCalls.Load()
 
 	var next atomic.Int64
 	var wg sync.WaitGroup
@@ -88,9 +88,9 @@ func TestGroupCommit_BatchingReducesFsyncs(t *testing.T) {
 		}
 	}
 
-	fsyncAfter := leader.writeStateFileCalls.Load()
+	fsyncAfter := leader.store.syncCalls.Load()
 	leaderFsyncs := fsyncAfter - fsyncBefore
-	t.Logf("group commit: %d Submits → %d leader writeStateFile fsyncs (%.1f Submits/fsync)",
+	t.Logf("group commit: %d Submits → %d leader raft log fsyncs (%.1f Submits/fsync)",
 		numCmds, leaderFsyncs, float64(numCmds)/float64(max64(leaderFsyncs, 1)))
 
 	// Batching MUST have happened: with 32 concurrent submitters coalesced per

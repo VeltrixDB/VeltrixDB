@@ -59,7 +59,7 @@ func newBatchCluster(t *testing.T, n int) ([]*RaftNode, *mockTransport, []string
 				peers = append(peers, ids[j])
 			}
 		}
-		node, err := NewRaftNode(ids[i], peers, t.TempDir(), &batchMockSM{}, transport)
+		node, err := newTestNode(ids[i], peers, t.TempDir(), &batchMockSM{}, transport)
 		if err != nil {
 			t.Fatalf("NewRaftNode(%s): %v", ids[i], err)
 		}
@@ -260,7 +260,7 @@ func TestApplyBatch_MixedWithConfigChange(t *testing.T) {
 
 	// While writes are in flight, add a 4th node through the log.
 	newID := t.Name() + "-node-3"
-	node4, err := NewRaftNode(newID, ids, t.TempDir(), &batchMockSM{}, transport)
+	node4, err := newTestNode(newID, ids, t.TempDir(), &batchMockSM{}, transport)
 	if err != nil {
 		t.Fatalf("new node: %v", err)
 	}

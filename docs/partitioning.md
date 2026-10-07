@@ -129,7 +129,7 @@ Each cluster node cycles through these states:
 | `RECOVERING` | A FAILED node heartbeated again, or answered the recovery ping. Left out of `Rebalance` but included in search fan-out. After 2 consecutive successful recovery pings (one per `RecoveryInterval`, 5 s) with a fresh heartbeat it returns to ACTIVE and `Rebalance` runs |
 | `DRAINING` | Set by `RemoveNodeAndRebalance` just before the node is removed from the ring |
 
-States are derived locally: each node's `FailureDetector` checks heartbeat ages every second. Heartbeats arrive through **gossip** — every second a node exchanges digests with 3 random peers, and a node whose heartbeat counter advanced in a digest counts as alive (so liveness spreads transitively). Receivers do not adopt the sender's view of node states. With `--auto-rebalance` (default on), joins, removals, and transitions to FAILED / ACTIVE / RECOVERING trigger `Rebalance` + `MigrateToNewOwners` after a 3 s debounce (`cmd/server/rebalancer.go`).
+States are derived locally: each node's `FailureDetector` checks heartbeat ages every second. Heartbeats arrive through **gossip** — every second a node exchanges digests with 3 random peers, and a node whose heartbeat counter advanced in a digest counts as alive (so liveness spreads transitively). Receivers do not adopt the sender's view of node states. State transitions never move data: a FAILED node keeps its replica slots (it stays on the ring) and comes back through RECOVERING → ACTIVE with its data. With `--auto-rebalance` (default on, `--mode=replicated` only), membership changes — a node added to or removed from the map — trigger `Rebalance` + `MigrateToNewOwners` after a 3 s debounce (`cmd/server/rebalancer.go`); in `--mode=raft` the flag is a no-op (see "Raft mode" below).
 
 ---
 
@@ -169,35 +169,46 @@ Partitions are assigned round-robin over the ID-sorted node list, so every membe
 
 ### After Rebalance: Data Migration
 
-`Rebalance()` only updates routing metadata. No data moves during rebalance. Data migration is handled by `TransferAgent.MigrateToNewOwners()`:
+`Rebalance()` only updates routing metadata. No data moves during rebalance. Data migration is handled by `TransferAgent.MigrateToNewOwners()`, which works on **replica sets** (`GetReplicasForKey`: RF distinct nodes, rack-aware), not on the single ring owner:
 
 ```
-MigrateToNewOwners()
+MigrateToNewOwners()                      (refuses in raft mode: ErrMigrationRaftMode)
     │
     ▼
-ScanKeys() → all local keys
+cur  = replica placement of the current membership
+prev = replica placement of the agent's baseline membership
+       (membership at agent creation, advanced after each fully successful call)
     │
     ▼
-For each key:
-    owner = pm.GetNodeForKey(key)  ← using updated ring
-    if owner == localNodeID: skip
-    else: queue for transfer to owner
+For each local key:
+    now = cur.replicas(key)
+    if localNodeID ∈ now:                      ← key stays here
+        send to now − prev.replicas(key) − {self}   (replicas that newly need it)
+    else:                                       ← this node left the key's replica set
+        send to EVERY member of now
+        delete locally only after every member of now acknowledged it
     │
     ▼
 Fan out to destination nodes in parallel:
     ├─ Batch 500 keys × ≤64 KB average ≈ 32 MB per HTTP POST /transfer/keys (JSON)
     ├─ Destination receives batch → calls store.Put(key, value, ttl) for each
     │   (any failed Put → HTTP 500 for the batch)
-    └─ After confirmed delivery: store.Delete(key) locally
+    └─ Delete only the leaving keys every current replica acknowledged
 ```
 
-**Safety guarantee**: `Put` on destination happens before `Delete` on source. Only keys in batches the destination acknowledged with HTTP 200 are deleted; on the first failed batch the rest of that destination's keys stay local and the next `MigrateToNewOwners()` call retries them. A "connection refused" is retried 3 times, 100 ms apart; each HTTP call times out after 60 s.
+With an unchanged membership `prev == cur`, so nothing is sent or deleted — a node failure or recovery (a state change) never moves data. With 3 nodes and RF=3 every node is a replica of every key, so nothing ever moves. With N > RF, a join or removal copies keys to the replicas that newly need them and deletes a key only on a node that is no longer among its RF replicas.
+
+**Safety guarantee**: `Put` on every current replica happens before `Delete` on the source. A key is deleted only when every member of its current replica set acknowledged a batch holding it with HTTP 200; if any replica is down or refuses, the key stays local, the error is returned, the baseline is not advanced, and the next `MigrateToNewOwners()` call re-sends. A "connection refused" is retried 3 times, 100 ms apart; each HTTP call times out after 60 s. Every holder of a key that stays sends it to a newly-needing replica, so a newcomer may receive up to RF−1 identical copies (idempotent `Put`). Known limit (unchanged): a received copy overwrites whatever the destination holds for that key, so a client write that reached the newcomer between the membership change and the copy can be overwritten by the older migrated value.
+
+**Raft mode**: every node applies the whole raft log, so every node already holds every key; migration would write and delete outside the log. `cmd/server` marks the agent `SetRaftManaged(true)` in `--mode=raft` (`setupRebalancer`, `cmd/server/rebalancer.go`): the auto-rebalancer is not started (`--auto-rebalance` logs that it has no effect), `MigrateToNewOwners` returns `ErrMigrationRaftMode` without touching data, and inbound `/transfer/keys` batches are refused with HTTP 403. (Before this rule, killing the leader of a loaded 3-node raft cluster made each survivor delete about two thirds of its keys.)
+
+**What `cmd/server` actually migrates**: membership is static (built from `--peers` at startup) and gossip does not carry joins, so a running server sees only state changes, which never migrate. In `--mode=replicated` the replication engine also sends every write to every peer (the server's replication factor is the fixed default 3 and only sets the quorum / strong ack count), and reads are served from the local engine, so every node holds every key. The RF-aware rules above matter for embedding programs that call `AddNodeAndRebalance` / `RemoveNodeAndRebalance` / `MigrateToNewOwners`.
 
 **Epoch fencing**: every batch carries the sender's membership epoch (advanced by each AddNode/RemoveNode and by newer epochs seen in gossip); a receiver whose epoch is newer refuses it with HTTP 409.
 
-**Pinned keys**: `@vecns/<ns>` (vector namespace settings) and `@idxdef/<name>` (secondary-index definitions) are needed on every node, so they are *copied* to each destination — placed at the head of its key list, ahead of the migrated keys — and never deleted locally.
+**Pinned keys**: `@vecns/<ns>` (vector namespace settings) and `@idxdef/<name>` (secondary-index definitions) are needed on every node, so they are *copied* to each destination — placed at the head of its key list, ahead of the other keys — and never deleted locally.
 
-**Search indexes follow the keys**: the destination's `Put` and the source's `Delete` run the engine's search hooks, so migrated vectors and documents become searchable on the new owner and disappear from the old one. (Before these hooks, migrated vectors stayed searchable on the source and were unsearchable on the destination.) Within each destination's list, vectors, text documents and index entries are sent before records: deleting a record also deletes its vectors and documents, so a record is only deleted locally once all of its derived keys were delivered.
+**Search indexes follow the keys**: the destination's `Put` and the source's `Delete` run the engine's search hooks, so migrated vectors and documents become searchable on the new owner and disappear from the old one. (Before these hooks, migrated vectors stayed searchable on the source and were unsearchable on the destination.) Derived keys route as their record (`RoutingKey`), so they have the same replica set and the same keep / leave decision. Within each destination's list, vectors, text documents and index entries are sent before records, and local deletes run derived keys first: deleting a record also deletes its vectors and documents, so a record is only deleted locally once all of its derived keys were acknowledged by every replica (and never if one of them could not be read).
 
 **Authentication**: with `--cluster-secret-file` (or `VELTRIXDB_CLUSTER_SECRET`; at least 16 bytes, whitespace trimmed) every request on the transfer listener — `/transfer/keys` and the distributed-search endpoint `/internal/search` — carries `X-Veltrix-Cluster-Time` (unix seconds) and `X-Veltrix-Cluster-Auth` (hex HMAC-SHA256 over time, method, path and body), and is refused (HTTP 401) if it does not verify or is more than 5 minutes off the receiver's clock. `/transfer/health` stays open. Without a secret or mTLS (`--cluster-mtls`) the server logs `[transfer] WARNING: listener <addr> is unauthenticated (no --cluster-secret-file and no mTLS) ...`.
 
@@ -218,12 +229,11 @@ Fan out to destination nodes in parallel:
    └─ Re-deals every partition round-robin over the new node list (most
       primaries change; key placement follows the ring, where ~1/N of keys move)
 
-3. ta.MigrateToNewOwners()  [background goroutine]
+3. ta.MigrateToNewOwners()  [background goroutine, on every existing member]
    ├─ Scan all local keys
-   ├─ Identify keys now owned by new node
-   └─ Stream to new node in 500-key batches
-        ├─ New node receives via POST /transfer/keys
-        └─ Source deletes after confirmed delivery
+   ├─ Keys whose replica set now includes the new node → copied to it
+   └─ Keys whose replica set no longer includes this node → sent to every
+        current replica, deleted locally after all of them acknowledged
 ```
 
 Gossip does not carry membership: every member must run `AddNode` itself (the server does it for `--peers` at startup). Because `Rebalance` is deterministic, members with the same node set compute the same table.
@@ -248,8 +258,11 @@ The migration runs in the background. Reads/writes continue normally during migr
    └─ Reassign departed node's partitions to surviving nodes
 
 4. ta.MigrateToNewOwners()  [departing node's own TransferAgent]
-   └─ Evacuate all local keys to their new owners
+   └─ Evacuate all local keys to every member of their replica sets; each
+      key is deleted only after all of its replicas acknowledged it
       (ta.localNodeID MUST == nodeID — using another node's TA would scan wrong data)
+   Surviving members also run MigrateToNewOwners so replicas that newly need
+   a key (the departed node's slot moved to them) get it.
 ```
 
 **Important**: `ta` must be the **departing node's own TransferAgent**. The `RemoveNodeAndRebalance()` function enforces this:
@@ -275,7 +288,7 @@ pm.ForceRemoveNode(nodeID, 256)
     (no data migration — surviving replicas are the source of truth)
 ```
 
-Nothing re-creates the lost copies afterwards: the Replication Engine's anti-entropy and replica recovery only re-send writes a replica missed (from the retention buffer or the change feed) and never copy existing data to a new node, so the replication factor stays reduced for keys the dead node held.
+The replication engine does not re-create the lost copies: its anti-entropy and replica recovery only re-send writes a replica missed (from the retention buffer or the change feed). What does restore them is a `MigrateToNewOwners()` pass on each survivor afterwards (the auto-rebalancer runs one on the "removed" event): the removal is a membership change, so every survivor copies each key it still holds to the replicas that newly need it. Nothing is deleted by that pass unless a survivor dropped out of a key's replica set, and then only after every current replica acknowledged the key.
 
 ---
 
@@ -322,6 +335,6 @@ pm.Rebalance(...)    → Version++
 | `SuspectThreshold` | 3 s | Heartbeat age before SUSPECT |
 | `FailureThreshold` | 10 s | Heartbeat age before FAILED |
 | `RecoveryInterval` / `RecoveryConfirmations` | 5 s / 2 | Recovery-ping cadence, and consecutive successful pings before RECOVERING → ACTIVE |
-| `rebalanceDebounce` | 3 s | Auto-rebalance debounce (`--auto-rebalance`, default true) |
+| `rebalanceDebounce` | 3 s | Auto-rebalance debounce (`--auto-rebalance`, default true; membership changes only; no-op in raft mode) |
 | `transferBatchSize` | 500 keys | Keys per HTTP migration batch |
 | `transferHTTPTimeout` | 60 s | Timeout per migration HTTP call |

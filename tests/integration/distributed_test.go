@@ -14,6 +14,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"strconv"
 	"testing"
 	"time"
 
@@ -122,6 +123,7 @@ type topo struct {
 		Term     uint64 `json:"term"`
 		LeaderID string `json:"leader_id"`
 		IsLeader bool   `json:"is_leader"`
+		Pipeline bool   `json:"pipeline"`
 	} `json:"raft"`
 	Nodes []struct {
 		NodeID string `json:"node_id"`
@@ -129,6 +131,48 @@ type topo struct {
 }
 
 // queryTopo runs the TOPOLOGY command against addr.
+// wantRaftPipeline is the --raft-pipeline mode the raft tests run with:
+// VELTRIX_RAFT_PIPELINE=1 go test ./tests/integration -run TestRaft… runs
+// them with the pipeline on; unset means the server default (off).
+func wantRaftPipeline(t *testing.T) bool {
+	t.Helper()
+	v := os.Getenv("VELTRIX_RAFT_PIPELINE")
+	if v == "" {
+		return false
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		t.Fatalf("VELTRIX_RAFT_PIPELINE=%q is not a boolean", v)
+	}
+	return b
+}
+
+// raftArgs is the flag list for one raft-mode node, including the
+// --raft-pipeline mode chosen by VELTRIX_RAFT_PIPELINE.
+func raftArgs(t *testing.T, id, peers string, extra ...string) []string {
+	t.Helper()
+	args := []string{"-mode", "raft", "-node-id", id, "-peers", peers,
+		"-raft-pipeline=" + strconv.FormatBool(wantRaftPipeline(t))}
+	return append(args, extra...)
+}
+
+// checkRaftPipeline fails unless every node reports the expected
+// --raft-pipeline mode in its topology.
+func checkRaftPipeline(t *testing.T, addrs []string) {
+	t.Helper()
+	want := wantRaftPipeline(t)
+	for _, a := range addrs {
+		tp, err := queryTopo(t, a)
+		if err != nil || tp.Raft == nil {
+			t.Fatalf("%s: topology: %v", a, err)
+		}
+		if tp.Raft.Pipeline != want {
+			t.Fatalf("%s: raft pipeline=%v, want %v", a, tp.Raft.Pipeline, want)
+		}
+	}
+	t.Logf("raft pipeline=%v on all %d nodes", want, len(addrs))
+}
+
 func queryTopo(t *testing.T, addr string) (topo, error) {
 	t.Helper()
 	c := newTextClient(t, addr)
@@ -195,14 +239,14 @@ func TestRaftClusterFailover(t *testing.T) {
 
 	nodes := make([]*testServer, 3)
 	for i := range ids {
-		nodes[i] = startNode(t, ports[i], metrics[i],
-			"-mode", "raft", "-node-id", ids[i], "-peers", pf)
+		nodes[i] = startNode(t, ports[i], metrics[i], raftArgs(t, ids[i], pf)...)
 		defer nodes[i].stop()
 	}
 	addrs := []string{nodes[0].Addr, nodes[1].Addr, nodes[2].Addr}
 
 	leaderID, leaderAddr := waitForRaftLeader(t, addrs, 20*time.Second)
 	t.Logf("elected leader %s at %s", leaderID, leaderAddr)
+	checkRaftPipeline(t, addrs)
 
 	// Write through the leader.
 	lc := newTextClient(t, leaderAddr)

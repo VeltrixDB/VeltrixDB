@@ -277,7 +277,7 @@ In `Put()`, both WAL and VLog `beginAppend()` are called concurrently. The calle
 └── .vlog_punch_wm       — GC punch-hole watermark (8-byte little-endian offset)
 ```
 
-The first data dir also holds `index_defs.json` (secondary-index definitions). Raft state is not per disk: in `--mode=raft` it lives in `<--data>/raft/` (`raft_state.gob`, `raft_snapshot.gob`); see [replication.md](replication.md#persistence).
+The first data dir also holds `index_defs.json` (secondary-index definitions). Raft state is not per disk: in `--mode=raft` it lives in `<--data>/raft/` (`raft_log.dat`, `raft_meta.dat`, `raft_snapshot.gob`); see [replication.md](replication.md#persistence).
 
 With multiple disks (`--data-dirs /mnt/nvme0,...,/mnt/nvme7`), each disk gets its own independent WAL, VLog, segment file, and compaction goroutine. Shard `i` always lives on disk `i % numDisks`.
 

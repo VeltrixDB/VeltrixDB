@@ -5,9 +5,12 @@ package cluster
 // When a node is added to the cluster (or removed), the consistent hash ring
 // re-assigns some key ranges to different nodes.  PartitionMap.Rebalance()
 // updates the routing table but does not move any data.  TransferAgent closes
-// that gap: it scans the local key space, identifies keys whose new owner is a
-// different node, streams those keys to the new owner over HTTP in batches, and
-// deletes them locally after confirmed receipt.
+// that gap: it scans the local key space, copies each key to the members of
+// its RF replica set (GetReplicasForKey) that newly need it, and deletes a key
+// locally only when this node is no longer one of its replicas and every
+// current replica confirmed receipt (MigrateToNewOwners; CLAUDE.md invariant
+// 62).  It never runs on a raft node (SetRaftManaged), and a node state change
+// (failure / recovery) is not a membership change, so it moves nothing.
 //
 // Protocol
 //   POST /transfer/keys        — receive a KeyBatch from another node
@@ -109,6 +112,15 @@ type TransferAgent struct {
 	// secret, when set, is the shared cluster key every request on this
 	// listener must be signed with (SetClusterSecret).
 	secret []byte
+	// raftManaged: the store is a raft state machine; migration and inbound
+	// batches are refused (SetRaftManaged).
+	raftManaged atomic.Bool
+	// migrateMu serialises MigrateToNewOwners; baseline (guarded by it) is
+	// the membership (node ID → rack) the last successful call migrated
+	// against — initially the membership when the agent was created.
+	migrateMu sync.Mutex
+	baseline  map[string]string
+	stopOnce  sync.Once
 }
 
 // NewTransferAgent creates a plaintext TransferAgent.
@@ -141,6 +153,7 @@ func NewTransferAgentTLS(pm *PartitionMap, localNodeID string, store LocalStore,
 		transferAddr: listenAddr,
 		scheme:       "http",
 		httpClient:   &http.Client{Timeout: transferHTTPTimeout},
+		baseline:     pm.memberRacks(),
 	}
 
 	mux := http.NewServeMux()
@@ -247,14 +260,21 @@ func (ta *TransferAgent) BoundAddr() string {
 	return ""
 }
 
-// Stop shuts down the HTTP server.
+// Stop shuts down the HTTP server. Safe to call more than once.
 func (ta *TransferAgent) Stop() {
-	close(ta.done)
-	_ = ta.httpServer.Close()
+	ta.stopOnce.Do(func() {
+		close(ta.done)
+		_ = ta.httpServer.Close()
+	})
 }
 
 // handleReceive accepts a KeyBatch from another node and applies each key locally.
 func (ta *TransferAgent) handleReceive(w http.ResponseWriter, r *http.Request) {
+	if ta.RaftManaged() {
+		// A key written here would bypass the raft log.
+		http.Error(w, ErrMigrationRaftMode.Error(), http.StatusForbidden)
+		return
+	}
 	var batch KeyBatch
 	if err := json.NewDecoder(r.Body).Decode(&batch); err != nil {
 		http.Error(w, "bad request: "+err.Error(), http.StatusBadRequest)
@@ -285,23 +305,62 @@ func (ta *TransferAgent) handleReceive(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
-// MigrateToNewOwners scans all local keys and pushes any key whose new owner
-// (per current ring state) is a different node to that node, then deletes it
-// locally.  Safe to call concurrently with ongoing reads/writes; Put is atomic
-// on the destination before Delete fires on the source.
-//
-// Returns the first non-nil error if any destination batch fails.  Keys whose
-// batch failed are NOT deleted locally so the next call can retry them.
-func (ta *TransferAgent) MigrateToNewOwners() error {
-	keys := ta.store.ScanKeys()
-	if len(keys) == 0 {
-		return nil
-	}
+// ErrMigrationRaftMode is returned by MigrateToNewOwners, and answered (HTTP
+// 403) to inbound /transfer/keys batches, on an agent marked SetRaftManaged.
+// In raft mode every node applies the whole log, so each node already holds
+// every key; moving keys between nodes would write and delete outside the
+// log and destroy committed data.
+var ErrMigrationRaftMode = errors.New("partition migration is disabled in raft mode: every node holds the full raft-replicated state")
 
-	// Group keys by destination node ID. Pinned keys are not grouped: they
-	// are copied to every destination below and never deleted here.
+// SetRaftManaged marks this node's store as a raft state machine. From then
+// on MigrateToNewOwners refuses (ErrMigrationRaftMode) and inbound key
+// batches are rejected, whoever calls them. cmd/server sets it in --mode=raft.
+func (ta *TransferAgent) SetRaftManaged(on bool) { ta.raftManaged.Store(on) }
+
+// RaftManaged reports whether SetRaftManaged(true) was called.
+func (ta *TransferAgent) RaftManaged() bool { return ta.raftManaged.Load() }
+
+// MigrateToNewOwners reconciles the local store with the replica sets of the
+// current membership, using the replication factor (GetReplicasForKey):
+//
+//   - A key for which this node is still one of the RF replicas stays. It is
+//     copied only to replicas that newly need it — members of its current
+//     replica set that were not in its replica set under the membership this
+//     agent last migrated against (the "baseline": the membership when the
+//     agent was created, advanced after every fully successful call). With
+//     an unchanged membership nothing is sent, so a node failure or recovery
+//     (a state change, not a membership change) never moves anything.
+//   - A key for which this node is no longer a replica is sent to EVERY
+//     current replica, and deleted locally only after every one of them
+//     acknowledged the batch holding it. A replica that is down keeps the
+//     key here until a later call reaches it.
+//   - Pinned keys (@vecns/, @idxdef/) are copied ahead of everything else to
+//     every destination and never deleted (invariant 55).
+//   - Derived keys are sent before records, and a record is deleted only if
+//     no key routed as it was left unread (invariant 60).
+//
+// Returns the first error any destination produced; the baseline is then not
+// advanced, so the next call re-sends. Refuses in raft mode
+// (ErrMigrationRaftMode).
+func (ta *TransferAgent) MigrateToNewOwners() error {
+	if ta.RaftManaged() {
+		log.Printf("[transfer] migration refused on node=%s: %v", ta.localNodeID, ErrMigrationRaftMode)
+		return ErrMigrationRaftMode
+	}
+	ta.migrateMu.Lock()
+	defer ta.migrateMu.Unlock()
+
+	members := ta.pm.memberRacks()
+	vnodes, rf := ta.pm.Ring.replicas, ta.pm.ReplicationFactor
+	cur := newReplicaPlacement(members, vnodes, rf)
+	prev := newReplicaPlacement(ta.baseline, vnodes, rf)
+
+	keys := ta.store.ScanKeys()
 	byDest := make(map[string][]KeyValue)
 	var pinned []KeyValue
+	leaving := make(map[string][]string) // key → replicas that must all ack before the local delete
+	unread := make(map[string]bool)      // routing keys with a leaving key we could not read
+	copies := 0
 	for _, key := range keys {
 		if isPinnedKey(key) {
 			if val, err := ta.store.Get(key); err == nil {
@@ -309,34 +368,56 @@ func (ta *TransferAgent) MigrateToNewOwners() error {
 			}
 			continue
 		}
-		owner, err := ta.pm.GetNodeForKey(key)
-		if err != nil {
-			log.Printf("[transfer] route key=%q: %v", key, err)
-			continue
+		now := cur.replicas(key)
+		if len(now) == 0 {
+			continue // empty membership: nowhere to send, nothing to delete
 		}
-		if owner == ta.localNodeID {
-			continue // this key stays here
+		var targets []string
+		stays := containsID(now, ta.localNodeID)
+		if stays {
+			before := prev.replicas(key)
+			for _, id := range now {
+				if id != ta.localNodeID && !containsID(before, id) {
+					targets = append(targets, id)
+				}
+			}
+		} else {
+			targets = now
+		}
+		if len(targets) == 0 {
+			continue
 		}
 		val, err := ta.store.Get(key)
 		if err != nil {
+			if !stays {
+				unread[RoutingKey(key)] = true
+			}
 			log.Printf("[transfer] read key=%q: %v", key, err)
 			continue
 		}
-		ttl := ta.store.GetTTLForKey(key)
-		byDest[owner] = append(byDest[owner], KeyValue{Key: key, Value: val, TTL: ttl})
+		kv := KeyValue{Key: key, Value: val, TTL: ta.store.GetTTLForKey(key)}
+		for _, id := range targets {
+			byDest[id] = append(byDest[id], kv)
+		}
+		if stays {
+			copies++
+		} else {
+			leaving[key] = targets
+		}
 	}
 
 	if len(byDest) == 0 {
-		log.Printf("[transfer] migration complete — all %d keys already on correct nodes", len(keys))
+		ta.baseline = members
+		log.Printf("[transfer] migration complete — all %d keys already on their replicas", len(keys))
 		return nil
 	}
 
-	// Every destination also gets a copy of the pinned keys, sent FIRST so a
-	// namespace's settings apply before its vectors arrive. Derived keys
-	// (vectors, text documents, index entries) go before the records: only a
-	// sent prefix is deleted locally, and deleting a record also deletes its
-	// vectors and documents (storage deleteDerivedSearchKeys), so a record
-	// must never be deleted here while one of its derived keys is unsent.
+	// Pinned keys go first so a namespace's settings apply before its
+	// vectors arrive. Derived keys (vectors, text documents, index entries)
+	// go before records: only an acknowledged prefix counts as delivered,
+	// and deleting a record also deletes its vectors and documents (storage
+	// deleteDerivedSearchKeys), so a record must never be deleted while one
+	// of its derived keys is unacknowledged.
 	for nodeID, kvs := range byDest {
 		sort.SliceStable(kvs, func(i, j int) bool {
 			return isDerivedKey(kvs[i].Key) && !isDerivedKey(kvs[j].Key)
@@ -347,7 +428,7 @@ func (ta *TransferAgent) MigrateToNewOwners() error {
 	// Fan out to all destination nodes in parallel.
 	var mu sync.Mutex
 	var firstErr error
-	successByDest := make(map[string][]string) // nodeID → successfully-sent keys
+	acked := make(map[string]map[string]bool, len(byDest)) // nodeID → keys it acknowledged
 
 	var wg sync.WaitGroup
 	for nodeID, kvs := range byDest {
@@ -355,6 +436,10 @@ func (ta *TransferAgent) MigrateToNewOwners() error {
 		go func(nodeID string, kvs []KeyValue) {
 			defer wg.Done()
 			sent, err := ta.sendBatches(nodeID, kvs)
+			got := make(map[string]bool, sent)
+			for i := len(pinned); i < sent; i++ {
+				got[kvs[i].Key] = true
+			}
 			mu.Lock()
 			defer mu.Unlock()
 			if err != nil {
@@ -364,30 +449,58 @@ func (ta *TransferAgent) MigrateToNewOwners() error {
 				log.Printf("[transfer] send to node=%s error: %v  sent=%d/%d",
 					nodeID, err, sent, len(kvs))
 			}
-			// Only migrated keys are deleted locally; the pinned copies at
-			// the head of kvs stay.
-			for i := len(pinned); i < sent; i++ {
-				successByDest[nodeID] = append(successByDest[nodeID], kvs[i].Key)
-			}
+			acked[nodeID] = got
 		}(nodeID, kvs)
 	}
 	wg.Wait()
 
-	// Delete only the keys that were successfully delivered.
-	for _, keys := range successByDest {
-		for _, key := range keys {
-			if err := ta.store.Delete(key); err != nil {
-				log.Printf("[transfer] local delete key=%q: %v", key, err)
+	// Delete a key that left this node only once EVERY current replica has
+	// acknowledged it. Derived keys first, then records.
+	var deletable []string
+	for key, replicas := range leaving {
+		ok := true
+		for _, id := range replicas {
+			if !acked[id][key] {
+				ok = false
+				break
 			}
 		}
+		if ok && !(isRecordKey(key) && unread[key]) {
+			deletable = append(deletable, key)
+		}
+	}
+	sort.SliceStable(deletable, func(i, j int) bool {
+		return isDerivedKey(deletable[i]) && !isDerivedKey(deletable[j])
+	})
+	deleted := 0
+	for _, key := range deletable {
+		if err := ta.store.Delete(key); err != nil {
+			if !isDerivedKey(key) {
+				log.Printf("[transfer] local delete key=%q: %v", key, err)
+			}
+			continue
+		}
+		deleted++
 	}
 
-	totalMoved := 0
-	for _, keys := range successByDest {
-		totalMoved += len(keys)
+	if firstErr == nil {
+		ta.baseline = members
 	}
-	log.Printf("[transfer] migration done  moved=%d  errors=%v", totalMoved, firstErr != nil)
+	log.Printf("[transfer] migration done  copied=%d  moved=%d  kept-unacked=%d  errors=%v",
+		copies, deleted, len(leaving)-deleted, firstErr != nil)
 	return firstErr
+}
+
+// isRecordKey reports whether key is routed as itself (not a derived key).
+func isRecordKey(key string) bool { return !isDerivedKey(key) }
+
+func containsID(ids []string, id string) bool {
+	for _, x := range ids {
+		if x == id {
+			return true
+		}
+	}
+	return false
 }
 
 // pinnedKeyPrefixes are key families every node needs a copy of, so

@@ -20,6 +20,9 @@ go test ./tests/integration/... -v -run TestIntegration_PutGet -timeout 60s
 # nightly workflow runs 20m and 10 cycles):
 VELTRIX_SOAK_DURATION=2m go test ./tests/integration/ -v -run TestSearchSoak -timeout 10m
 VELTRIX_CHAOS_CYCLES=3 go test ./tests/integration/ -v -run TestSearchCrashRecovery -timeout 10m
+
+# Raft tests with pipelined replication on (default: --raft-pipeline=false):
+VELTRIX_RAFT_PIPELINE=1 go test ./tests/integration/ -v -run 'TestRaftClusterFailover|TestRaftAutoRebalance' -timeout 10m
 ```
 
 ## Test categories
@@ -38,7 +41,10 @@ VELTRIX_CHAOS_CYCLES=3 go test ./tests/integration/ -v -run TestSearchCrashRecov
 - No special environment variables are required. Set `VELTRIX_SERVER_BIN` to
   a pre-built server binary to skip the build (CI does this).
   `VELTRIX_SOAK_DURATION` and `VELTRIX_CHAOS_CYCLES` enable the two
-  `soak_test.go` tests.
+  `soak_test.go` tests. `VELTRIX_RAFT_PIPELINE` (bool, default false) sets
+  `--raft-pipeline` on the nodes of `TestRaftClusterFailover` and
+  `TestRaftAutoRebalance_LeaderKillKeepsEveryKey`, which check every node
+  reports that mode in its topology.
 - Otherwise the server-process tests (`single_node_test.go`,
   `distributed_test.go`, `search_test.go`, `soak_test.go`)
   `go build ./cmd/server` once per test run, so the Go

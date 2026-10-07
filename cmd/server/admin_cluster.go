@@ -32,6 +32,8 @@ type raftStatus struct {
 	Term     uint64 `json:"term"`
 	LeaderID string `json:"leader_id"`
 	IsLeader bool   `json:"is_leader"`
+	// Pipeline: --raft-pipeline on this node.
+	Pipeline bool `json:"pipeline"`
 }
 
 type replicaStatus struct {
@@ -94,6 +96,7 @@ func buildTopology(coord *coordinator, pm *cluster.PartitionMap) topologyRespons
 				Term:     coord.raft.Term(),
 				LeaderID: coord.raft.GetLeaderID(),
 				IsLeader: coord.raft.IsLeader(),
+				Pipeline: coord.raft.Pipeline(),
 			}
 		}
 	case modeReplicated:

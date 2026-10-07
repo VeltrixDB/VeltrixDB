@@ -111,6 +111,9 @@ type clusterParams struct {
 	tlsKey  string
 	tlsCA   string
 	mutual  bool
+
+	// raftPipeline: --raft-pipeline (consensus.Options.Pipeline).
+	raftPipeline bool
 }
 
 // buildCoordinator constructs the coordinator for raft/replicated mode and
@@ -153,7 +156,8 @@ func buildRaftCoordinator(p clusterParams) (*coordinator, func(), *replication.R
 	fsm := newRaftFSM(pCurrentEngine)
 
 	raftDir := p.dataDir + "/raft"
-	node, err := consensus.NewRaftNode(p.nodeID, peerIDs, raftDir, fsm, transport)
+	node, err := consensus.NewRaftNodeWithOptions(p.nodeID, peerIDs, raftDir, fsm, transport,
+		consensus.Options{SnapshotThreshold: consensus.DefaultSnapshotThreshold, Pipeline: p.raftPipeline})
 	if err != nil {
 		_ = transport.Close()
 		return nil, nil, nil, fmt.Errorf("raft node: %w", err)
@@ -169,7 +173,7 @@ func buildRaftCoordinator(p clusterParams) (*coordinator, func(), *replication.R
 		return nil, nil, nil, fmt.Errorf("raft rpc server: %w", err)
 	}
 	go rpcSrv.ListenAndServe()
-	log.Printf("[raft] mode active  node=%s  rpc=%s  peers=%v", p.nodeID, raftListen, peerIDs)
+	log.Printf("[raft] mode active  node=%s  rpc=%s  peers=%v  pipeline=%v", p.nodeID, raftListen, peerIDs, p.raftPipeline)
 
 	c := &coordinator{
 		mode:           modeRaft,

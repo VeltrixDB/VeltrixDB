@@ -1,0 +1,153 @@
+# 3-node clusters of VeltrixDB, Aerospike CE and ScyllaDB on ONE machine —
+# for FUNCTIONAL checks of the NODES=3 path of compare.sh (cluster forms,
+# RF 3 keyspace / namespace, driver routing, failover), NOT for performance:
+# all three nodes share one CPU, one memory bus and one disk, so replication
+# traffic is loopback and the nodes compete with each other. Publish
+# multi-node numbers only from separate hosts (README "Multi-host runbook").
+#
+#   NODES=3 ./compare.sh                     # START=1: brings each cluster up in turn
+#   docker compose -f docker-compose.cluster.yml up -d veltrixdb-1 veltrixdb-2 veltrixdb-3
+#
+# Every node has a fixed IP on the "bench" network (172.28.0.0/24) and
+# advertises that IP to its peers and to clients: VeltrixDB's MOVED replies,
+# Aerospike's peer list and ScyllaDB's system.peers all hand out 172.28.0.x.
+# The YCSB client runs on the host, which reaches those IPs directly on Linux;
+# Docker Desktop (macOS / Windows) does not route to container IPs, so there
+# run the client in a container on the same network instead. The Aerospike
+# confs (aerospike-cluster-N.conf) hard-code the same IPs — change both
+# together.
+#
+# Limits per container: BENCH_CPUS (default 2) and BENCH_MEM (default 4g).
+#
+# Not run where it was written (no Docker there) — the YAML parses and the
+# service definitions follow the single-node docker-compose.yml.
+x-limits: &limits
+  cpus: "${BENCH_CPUS:-2}"
+  mem_limit: "${BENCH_MEM:-4g}"
+
+x-veltrixdb: &veltrixdb
+  <<: *limits
+  build:
+    context: ../..
+    dockerfile: Dockerfile
+  image: veltrixdb-bench:local
+  environment:
+    # Signs node-to-node transfer / search requests (HMAC). compare.sh
+    # generates a random one per run when VELTRIX_CLUSTER_SECRET is unset.
+    VELTRIXDB_CLUSTER_SECRET: "${VELTRIX_CLUSTER_SECRET:-}"
+  networks: [bench]
+
+x-aerospike: &aerospike
+  <<: *limits
+  image: aerospike/aerospike-server:${AEROSPIKE_VERSION:-latest}
+  command: ["--config-file", "/opt/aerospike/etc/aerospike.conf"]
+
+x-scylla: &scylla
+  <<: *limits
+  image: scylladb/scylla:${SCYLLA_VERSION:-latest}
+  healthcheck:
+    test: ["CMD-SHELL", "cqlsh -e 'SELECT now() FROM system.local' >/dev/null 2>&1"]
+    interval: 10s
+    timeout: 10s
+    retries: 30
+    start_period: 60s
+
+services:
+  # ── VeltrixDB: --mode raft (writes through the leader) or replicated ──────
+  veltrixdb-1:
+    <<: *veltrixdb
+    command:
+      - "--node-id=n1"
+      - "--addr=172.28.0.11:9000"
+      - "--mode=${VELTRIX_MODE:-raft}"
+      - "--peers=n1@172.28.0.11:9000,n2@172.28.0.12:9000,n3@172.28.0.13:9000"
+      - "--consistency=${VELTRIX_CONSISTENCY:-quorum}"   # replicated mode only
+      - "--linearizable-reads=${VELTRIX_LINEARIZABLE_READS:-false}"   # raft mode only
+      - "--raft-pipeline=${VELTRIX_RAFT_PIPELINE:-false}"   # raft mode only
+      - "--auto-rebalance=false"   # README: only needed on builds before the auto-rebalance fix
+      - "--metrics-addr=0.0.0.0:2112"
+      - "--data=/data"
+      - "--cache=1024"
+    networks: {bench: {ipv4_address: 172.28.0.11}}
+    volumes: ["${BENCH_DATA:-./data}/veltrixdb-1:/data"]
+  veltrixdb-2:
+    <<: *veltrixdb
+    command:
+      - "--node-id=n2"
+      - "--addr=172.28.0.12:9000"
+      - "--mode=${VELTRIX_MODE:-raft}"
+      - "--peers=n1@172.28.0.11:9000,n2@172.28.0.12:9000,n3@172.28.0.13:9000"
+      - "--consistency=${VELTRIX_CONSISTENCY:-quorum}"   # replicated mode only
+      - "--linearizable-reads=${VELTRIX_LINEARIZABLE_READS:-false}"   # raft mode only
+      - "--raft-pipeline=${VELTRIX_RAFT_PIPELINE:-false}"   # raft mode only
+      - "--auto-rebalance=false"   # README: only needed on builds before the auto-rebalance fix
+      - "--metrics-addr=0.0.0.0:2112"
+      - "--data=/data"
+      - "--cache=1024"
+    networks: {bench: {ipv4_address: 172.28.0.12}}
+    volumes: ["${BENCH_DATA:-./data}/veltrixdb-2:/data"]
+  veltrixdb-3:
+    <<: *veltrixdb
+    command:
+      - "--node-id=n3"
+      - "--addr=172.28.0.13:9000"
+      - "--mode=${VELTRIX_MODE:-raft}"
+      - "--peers=n1@172.28.0.11:9000,n2@172.28.0.12:9000,n3@172.28.0.13:9000"
+      - "--consistency=${VELTRIX_CONSISTENCY:-quorum}"   # replicated mode only
+      - "--linearizable-reads=${VELTRIX_LINEARIZABLE_READS:-false}"   # raft mode only
+      - "--raft-pipeline=${VELTRIX_RAFT_PIPELINE:-false}"   # raft mode only
+      - "--auto-rebalance=false"   # README: only needed on builds before the auto-rebalance fix
+      - "--metrics-addr=0.0.0.0:2112"
+      - "--data=/data"
+      - "--cache=1024"
+    networks: {bench: {ipv4_address: 172.28.0.13}}
+    volumes: ["${BENCH_DATA:-./data}/veltrixdb-3:/data"]
+
+  # ── Aerospike CE: mesh heartbeat, replication-factor 3 ────────────────────
+  aerospike-1:
+    <<: *aerospike
+    networks: {bench: {ipv4_address: 172.28.0.21}}
+    volumes:
+      - ${AEROSPIKE_CONF_DIR:-.}/aerospike-cluster-1.conf:/opt/aerospike/etc/aerospike.conf:ro
+      - "${BENCH_DATA:-./data}/aerospike-1:/opt/aerospike/data"
+  aerospike-2:
+    <<: *aerospike
+    networks: {bench: {ipv4_address: 172.28.0.22}}
+    volumes:
+      - ${AEROSPIKE_CONF_DIR:-.}/aerospike-cluster-2.conf:/opt/aerospike/etc/aerospike.conf:ro
+      - "${BENCH_DATA:-./data}/aerospike-2:/opt/aerospike/data"
+  aerospike-3:
+    <<: *aerospike
+    networks: {bench: {ipv4_address: 172.28.0.23}}
+    volumes:
+      - ${AEROSPIKE_CONF_DIR:-.}/aerospike-cluster-3.conf:/opt/aerospike/etc/aerospike.conf:ro
+      - "${BENCH_DATA:-./data}/aerospike-3:/opt/aerospike/data"
+
+  # ── ScyllaDB: seed = node 1, nodes join one at a time ─────────────────────
+  # --commitlog-sync is passed through the image's entrypoint to scylla
+  # (SCYLLA_COMMITLOG=batch|periodic, default batch: sync before ACK).
+  scylla-1:
+    <<: *scylla
+    command: &scylla-args ["--seeds", "172.28.0.31", "--smp", "${BENCH_CPUS:-2}", "--memory", "${SCYLLA_MEMORY:-3G}",
+                           "--overprovisioned", "1", "--developer-mode", "1",
+                           "--commitlog-sync", "${SCYLLA_COMMITLOG:-batch}"]
+    networks: {bench: {ipv4_address: 172.28.0.31}}
+    volumes: ["${BENCH_DATA:-./data}/scylla-1:/var/lib/scylla"]
+  scylla-2:
+    <<: *scylla
+    command: *scylla-args
+    depends_on: {scylla-1: {condition: service_healthy}}
+    networks: {bench: {ipv4_address: 172.28.0.32}}
+    volumes: ["${BENCH_DATA:-./data}/scylla-2:/var/lib/scylla"]
+  scylla-3:
+    <<: *scylla
+    command: *scylla-args
+    depends_on: {scylla-2: {condition: service_healthy}}
+    networks: {bench: {ipv4_address: 172.28.0.33}}
+    volumes: ["${BENCH_DATA:-./data}/scylla-3:/var/lib/scylla"]
+
+networks:
+  bench:
+    ipam:
+      config:
+        - subnet: 172.28.0.0/24

@@ -277,8 +277,8 @@ func (fd *FailureDetector) attemptNodeRecovery(nodeID string) bool {
 // answered RecoveryConfirmations consecutive pings and whose heartbeat is
 // fresh (younger than SuspectThreshold) moves to ACTIVE: Rebalance assigns
 // partitions to ACTIVE nodes only, so the partition table is rebuilt
-// (triggerRebalance here; cmd/server's auto-rebalancer also reacts to the
-// ACTIVE membership event and migrates keys).  A failed ping resets the count.
+// (triggerRebalance here). No data moves: cmd/server's auto-rebalancer
+// ignores state events (invariant 62).  A failed ping resets the count.
 func (fd *FailureDetector) promoteRecoveredNodes() {
 	type target struct {
 		id, addr string

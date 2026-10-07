@@ -246,8 +246,15 @@ cycles). Details: [tests/integration/README.md](tests/integration/README.md).
 
 `bench/compare/compare.sh` runs go-ycsb workloads A–F through a VeltrixDB
 driver and go-ycsb's Aerospike and Cassandra (ScyllaDB) drivers, one database
-at a time on the same machine, and writes `results/<ts>/summary.md`. Read
-[bench/compare/README.md](bench/compare/README.md) first — in particular the
-durability settings, which differ by default between the three. No shared
-run has been published yet; the Aerospike / ScyllaDB paths are compile-checked
-only.
+at a time, and writes `results/<ts>/summary.md`. `NODES=1` (default) runs
+single nodes; `NODES=3` runs 3-node clusters with replication factor 3
+(VeltrixDB `--mode=raft` or `replicated`, ScyllaDB keyspace RF 3 at QUORUM,
+Aerospike CE namespace RF 3) — on separate hosts with `START=0`, or as a
+one-machine functional check with `docker-compose.cluster.yml`. Read
+[bench/compare/README.md](bench/compare/README.md) first — the durability
+settings (ScyllaDB `commitlog_sync`, Aerospike `flush-max-ms`), the
+consistency levels per database, the multi-host runbook with its calibration
+step, and the known VeltrixDB cluster issues (raft-mode write throughput;
+the auto-rebalance data loss on node failure is fixed — the harness still
+passes `--auto-rebalance=false` so runs against older builds stay safe). No shared run has been
+published yet; the Aerospike / ScyllaDB paths are compile-checked only.

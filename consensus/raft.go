@@ -17,9 +17,12 @@
 // # Persistence
 //
 // Raft requires three fields to survive crashes: currentTerm, votedFor, and
-// the log.  RaftNode persists them to <dataDir>/raft_state.gob on every state
-// change.  ReadFile + WriteFile calls are synchronous and cheap; the
-// bottleneck is the storage engine fdatasync, not Raft overhead.
+// the log.  RaftNode keeps the log in an append-only, CRC-checked record file
+// (<dataDir>/raft_log.dat) and term + vote in a small atomically-replaced file
+// (<dataDir>/raft_meta.dat) — see raft_storage.go.  A commit costs one write
+// of the new records plus one fsync (shared by every append queued before it),
+// independent of the retained log length; the write and fsync run on the
+// syncer goroutine outside rn.mu (pipeline.go).
 //
 // When the log exceeds Options.SnapshotThreshold entries and the state machine
 // implements SnapshotStateMachine, the applied prefix of the log is replaced
@@ -50,12 +53,10 @@
 package consensus
 
 import (
-	"encoding/gob"
 	"fmt"
 	"log"
 	"math/rand"
 	"os"
-	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -104,7 +105,9 @@ type LogEntry struct {
 	Command []byte    // opaque bytes passed to StateMachine.Apply
 }
 
-// persistentState is serialised to disk on every term/vote/log change.
+// persistentState is the in-memory copy of Raft's persistent state.  It is
+// also the gob layout of the legacy whole-state file raft_state.gob, which
+// openLogStore migrates on startup (keep the field names).
 type persistentState struct {
 	CurrentTerm uint64
 	VotedFor    string // "" means no vote this term
@@ -133,6 +136,10 @@ type AppendEntriesArgs struct {
 	PrevLogTerm  uint64
 	Entries      []LogEntry
 	LeaderCommit uint64
+	// WantMatch: the leader reads AppendEntriesReply.MatchIndex, so a
+	// follower may answer a heartbeat at once with only its durable prefix.
+	// Unset (older leaders): Success means durable through prev+len(Entries).
+	WantMatch bool
 }
 
 // AppendEntriesReply is sent back by a Follower.
@@ -141,6 +148,12 @@ type AppendEntriesReply struct {
 	Success       bool
 	ConflictIndex uint64 // optimisation: first index of conflicting term
 	ConflictTerm  uint64
+	// HasMatch/MatchIndex (set by followers of this version on Success): the
+	// follower's log matches the leader's through MatchIndex and every entry
+	// up to it is durable on the follower.  Older followers leave HasMatch
+	// false; the leader then uses prev+len(Entries).
+	HasMatch   bool
+	MatchIndex uint64
 }
 
 // StateMachine is applied once a log entry is committed.
@@ -228,6 +241,21 @@ type Options struct {
 	// Snapshotting additionally requires the StateMachine passed to
 	// NewRaftNodeWithOptions to implement SnapshotStateMachine.
 	SnapshotThreshold uint64
+
+	// Pipeline enables pipelined replication (server flag --raft-pipeline,
+	// default off): up to PipelineWindow AppendEntries in flight per
+	// follower, sent as soon as entries are appended (before the leader's
+	// own fsync) and again on every reply.  Off (the zero value): window 1,
+	// and one AppendEntries round per leader fsync (paced) — see pipeline.go.
+	// Both modes keep every durability rule (followers ack only fsynced
+	// entries; the leader counts itself only up to durableIndex) and speak
+	// the same wire protocol, so a cluster may mix them.
+	Pipeline bool
+
+	// PipelineWindow is the number of entry-carrying AppendEntries the
+	// leader keeps in flight per follower when Pipeline is set.
+	// 0 = DefaultPipelineWindow.  Ignored (1) when Pipeline is false.
+	PipelineWindow int
 }
 
 // ── RaftNode ──────────────────────────────────────────────────────────────────
@@ -243,6 +271,27 @@ type RaftNode struct {
 
 	// Persistent state (written to disk before responding to RPCs)
 	ps persistentState
+
+	// store persists ps incrementally (raft_storage.go).  Log records are
+	// enqueued under rn.mu, so disk order == log order; the syncer goroutine
+	// writes + fsyncs them outside the lock (pipeline.go).
+	store *logStore
+	// durableIndex: every entry of the current log at or below it is fsynced.
+	// The leader counts itself toward a commit quorum only up to here, and a
+	// follower acknowledges entries only up to here, so an entry is never
+	// committed on the strength of a copy that is not on disk.
+	durableIndex  uint64
+	persistFailed bool // the store failed (logged once)
+	syncCh        chan struct{}
+	syncerDone    chan struct{}
+	// aeWaiters: accepted AppendEntries whose reply waits for durability.
+	aeWaiters []aeWaiter
+
+	// Pipelined replication (leader only, pipeline.go).
+	repl           map[string]*peerRepl
+	pipeline       bool // Options.Pipeline
+	pipelineWindow int  // entry-carrying AppendEntries in flight per peer (1 when !pipeline)
+	async          AsyncTransport
 
 	// Snapshot / log compaction state (see snapshot.go).
 	// lastIncludedIndex/Term describe the entry immediately preceding the
@@ -306,15 +355,10 @@ type RaftNode struct {
 
 	// Group commit: Submit enqueues a *submitReq here and blocks; a single
 	// flusher goroutine coalesces all currently-pending requests into ONE log
-	// append + ONE writeStateFile fsync + ONE broadcastAppendEntries per batch.
-	// This mirrors the storage WAL's group commit and eliminates the per-write
-	// fsync storm that was starving the heartbeat path under concurrent load.
+	// append per batch; the syncer covers every queued batch with ONE write(2)
+	// + ONE fsync, and the replicators ship them (pipeline.go).
 	submitCh    chan *submitReq
 	flusherDone chan struct{}
-
-	// writeStateFileCalls counts calls to writeStateFile.  Used by tests to
-	// assert that group commit collapses N Submits into far fewer fsyncs.
-	writeStateFileCalls atomic.Uint64
 
 	// Transport
 	transport Transport
@@ -324,10 +368,12 @@ type RaftNode struct {
 	stopped    atomic.Bool   // set before applyCh is closed to guard notifyApplier
 	tickerDone chan struct{} // closed when the ticker goroutine exits
 	// bgWG tracks short-lived background goroutines that persist state
-	// (elections, leader persist+broadcast, per-peer AppendEntries) so Stop can
-	// wait for them — otherwise a goroutine can create a raft_state_*.tmp file
-	// after Stop returns, racing with directory removal.
-	bgWG sync.WaitGroup
+	// (elections, replicators, per-peer send queues) so Stop can
+	// wait for them — otherwise a goroutine can still write raft files after
+	// Stop returns, racing with directory removal.
+	bgWG     sync.WaitGroup
+	wgMu     sync.Mutex // orders bgWG.Add (spawn) against Stop
+	stopOnce sync.Once
 
 	// electionGeneration is incremented every time the election timer is reset.
 	// The ticker reads it before waiting for rn.mu; if it changes while the
@@ -343,7 +389,7 @@ type RaftNode struct {
 //
 //	id        — unique string ID for this server (e.g. "node-1")
 //	peers     — IDs of ALL other servers (not including self)
-//	dataDir   — directory where raft_state.gob is persisted
+//	dataDir   — directory for raft_log.dat / raft_meta.dat / raft_snapshot.gob
 //	sm        — state machine to apply committed commands to
 //	transport — network layer (use NewTCPTransport from transport.go)
 func NewRaftNode(id string, peers []string, dataDir string, sm StateMachine, transport Transport) (*RaftNode, error) {
@@ -375,6 +421,21 @@ func NewRaftNodeWithOptions(id string, peers []string, dataDir string, sm StateM
 		matchIndex:        make(map[string]uint64),
 		waiters:           make(map[uint64][]chan error),
 		submitTimeout:     defaultSubmitTimeout,
+		syncCh:            make(chan struct{}, 1),
+		syncerDone:        make(chan struct{}),
+		pipeline:          opts.Pipeline,
+	}
+	rn.pipelineWindow = 1
+	if opts.Pipeline {
+		rn.pipelineWindow = opts.PipelineWindow
+		if rn.pipelineWindow <= 0 {
+			rn.pipelineWindow = DefaultPipelineWindow
+		}
+	}
+	if at, ok := transport.(AsyncTransport); ok {
+		rn.async = at
+	} else {
+		rn.async = &serialSender{rn: rn, queues: make(map[string]chan serialReq)}
 	}
 	rn.LeaderID.Store("")
 	rn.currentRole.Store(int32(RoleFollower))
@@ -399,8 +460,11 @@ func NewRaftNodeWithOptions(id string, peers []string, dataDir string, sm StateM
 		return nil, fmt.Errorf("load snapshot: %w", err)
 	}
 
-	// Load persisted state (or start fresh).
+	// Load persisted state (or start fresh, or migrate raft_state.gob).
 	if err := rn.loadState(); err != nil {
+		if rn.store != nil {
+			rn.store.close()
+		}
 		return nil, fmt.Errorf("load state: %w", err)
 	}
 
@@ -419,9 +483,14 @@ func NewRaftNodeWithOptions(id string, peers []string, dataDir string, sm StateM
 	log.Printf("[raft] node=%s started  peers=%v  term=%d  log_len=%d  snapshot_idx=%d",
 		id, rn.peers, rn.ps.CurrentTerm, len(rn.ps.Log), rn.lastIncludedIndex)
 
+	rn.mu.Lock()
+	rn.repl = make(map[string]*peerRepl)
+	rn.mu.Unlock()
+
 	go rn.ticker()
 	go rn.applier()
 	go rn.flusher()
+	go rn.syncer()
 
 	return rn, nil
 }
@@ -434,9 +503,9 @@ func NewRaftNodeWithOptions(id string, peers []string, dataDir string, sm StateM
 //
 // Submit does not touch the log directly: it hands the command to the
 // group-commit flusher and blocks.  The flusher coalesces all concurrently
-// pending Submits into a single log append, a single writeStateFile fsync, and
-// a single broadcastAppendEntries — collapsing the per-write fsync storm that
-// used to starve heartbeats under concurrent load.  Once the flusher has
+// pending Submits into a single log append; the syncer persists every queued
+// batch with one fsync while the replicators ship it to the followers.  Once
+// the flusher has
 // assigned this command a log index, Submit waits for that index's per-index
 // commit notification (signalled by the applier once the entry is quorum-
 // committed and applied), exactly as before.
@@ -472,10 +541,10 @@ func (rn *RaftNode) Submit(command []byte) error {
 
 // flusher is the single group-commit goroutine.  It blocks for the first
 // pending Submit, drains every other request already queued (up to
-// maxSubmitBatch), and flushes them as one batch.  While a flush is in flight
-// (the writeStateFile fsync + broadcast), newly arriving Submits accumulate in
-// submitCh and form the next batch — the fsync latency itself is the batching
-// window, so no artificial delay is added to the write latency.
+// maxSubmitBatch), and appends them as one batch.  A flush does no I/O (the
+// syncer writes + fsyncs, the replicators send), so batches here are small;
+// the fsync batching happens in the syncer, whose fsync latency is the
+// batching window — no artificial delay is added to the write latency.
 func (rn *RaftNode) flusher() {
 	defer close(rn.flusherDone)
 	for {
@@ -499,11 +568,13 @@ func (rn *RaftNode) flusher() {
 	}
 }
 
-// flushBatch appends every command in batch to the log under ONE rn.mu critical
-// section, persists the whole batch with ONE writeStateFile fsync (outside the
-// lock, so the heartbeat path is never blocked behind the fsync), and issues
-// ONE broadcastAppendEntries for the batch.  Each request is then signalled so
-// its Submit caller can wait for that entry's individual commit.
+// flushBatch appends every command in batch to the log under ONE rn.mu
+// critical section and enqueues their records for the syncer (one write(2) +
+// one fsync, outside the lock, shared with any other pending appends).  With
+// Options.Pipeline it also wakes the per-peer replicators at once, so the
+// followers' write+fsync overlaps the leader's own; without it the syncer
+// wakes them when that fsync completes (paced, pipeline.go).  Each request is
+// then signalled so its Submit caller can wait for that entry's commit.
 func (rn *RaftNode) flushBatch(batch []*submitReq) {
 	rn.mu.Lock()
 	if rn.role != RoleLeader {
@@ -514,32 +585,33 @@ func (rn *RaftNode) flushBatch(batch []*submitReq) {
 		}
 		return
 	}
+	firstNew := len(rn.ps.Log)
 	for _, r := range batch {
 		entry, ch := rn.appendEntryLocked(EntryNormal, r.command)
 		r.idx = entry.Index
 		r.ch = ch
 	}
-	psCopy := rn.copyStateLocked()
-	rn.maybeAdvanceCommit() // single-node clusters commit immediately
-	rn.mu.Unlock()
-
-	// Persist outside the lock: the slow fdatasync in writeStateFile must not
-	// block the heartbeat ticker (which also needs rn.mu) and delay heartbeats
-	// past the follower election timeout.  One fsync now covers the whole batch.
-	if err := rn.writeStateFile(psCopy); err != nil {
+	if err := rn.store.enqueue(rn.ps.Log[firstNew:]); err != nil {
+		// Store failed: undo the append.  Nobody has seen these entries — the
+		// replicators read the log under rn.mu, which we still hold.
+		rn.ps.Log = rn.ps.Log[:firstNew]
 		for _, r := range batch {
-			rn.removeWaiter(r.idx, r.ch)
+			delete(rn.waiters, r.idx)
 			r.err = fmt.Errorf("persist log: %w", err)
+		}
+		rn.mu.Unlock()
+		for _, r := range batch {
 			close(r.ready)
 		}
 		return
 	}
+	rn.kickSyncerLocked()
+	rn.kickReplicatorsOnAppendLocked()
+	rn.mu.Unlock()
 
-	// Arm the callers, then replicate once for the whole batch.
 	for _, r := range batch {
 		close(r.ready)
 	}
-	rn.broadcastAppendEntries()
 }
 
 // appendEntryLocked appends a new entry to the leader's log and registers a
@@ -558,25 +630,53 @@ func (rn *RaftNode) appendEntryLocked(typ EntryType, command []byte) (LogEntry, 
 	return entry, ch
 }
 
-// copyStateLocked returns a deep-enough copy of the persistent state for
-// out-of-lock persistence (the log slice is cloned so a later append/truncate
-// cannot race the encoder).  Must be called with rn.mu held.
-func (rn *RaftNode) copyStateLocked() persistentState {
-	return persistentState{
-		CurrentTerm: rn.ps.CurrentTerm,
-		VotedFor:    rn.ps.VotedFor,
-		Log:         append([]LogEntry(nil), rn.ps.Log...),
+// markDurableLocked records that the log through idx (an entry of term) has
+// been fsynced, and lets a leader count itself toward commit up to there.  The
+// term check skips a stale report: the entry was truncated (this node became a
+// follower and took a conflicting suffix) while the fsync ran.
+// Must be called with rn.mu held.
+func (rn *RaftNode) markDurableLocked(idx, term uint64) {
+	if idx <= rn.durableIndex || rn.logTerm(idx) != term {
+		return
+	}
+	rn.durableIndex = idx
+	if rn.role == RoleLeader {
+		rn.maybeAdvanceCommit()
 	}
 }
 
-// appendLocked appends a new entry to the leader's log, registers a commit
-// waiter for it, and returns a state copy for out-of-lock persistence.  Used by
-// the membership change path (changeConfig); the hot write path goes through
-// the group-commit flusher instead.
-// Must be called with rn.mu held and rn.role == RoleLeader.
-func (rn *RaftNode) appendLocked(typ EntryType, command []byte) (LogEntry, chan error, persistentState) {
-	entry, ch := rn.appendEntryLocked(typ, command)
-	return entry, ch, rn.copyStateLocked()
+// markDurableLocked's term check is sufficient by the Log Matching property:
+// if the entry at idx still has the term it had when the fsync began, every
+// entry up to idx is the one that was written before that fsync.
+
+// persistMetaLocked makes currentTerm/votedFor durable (no-op when unchanged).
+// Must be called with rn.mu held, before the node acts on a new term or vote.
+func (rn *RaftNode) persistMetaLocked() error {
+	err := rn.store.saveMeta(raftMeta{CurrentTerm: rn.ps.CurrentTerm, VotedFor: rn.ps.VotedFor})
+	if err != nil {
+		log.Printf("[raft] node=%s persist term/vote failed: %v", rn.id, err)
+	}
+	return err
+}
+
+// rewriteLogLocked replaces the log file with the in-memory log (compaction,
+// InstallSnapshot).  On success everything retained is durable.
+// Must be called with rn.mu held.
+func (rn *RaftNode) rewriteLogLocked() error {
+	if err := rn.store.rewrite(rn.ps.Log); err != nil {
+		log.Printf("[raft] node=%s rewrite log failed: %v", rn.id, err)
+		// The old file still holds the retained entries, but the in-memory
+		// log may now be shorter (InstallSnapshot discarded a conflicting
+		// suffix): never let durableIndex cover indices that will be reused.
+		if li := rn.lastLogIndex(); rn.durableIndex > li {
+			rn.durableIndex = li
+		}
+		rn.kickSyncerLocked()
+		return err
+	}
+	rn.durableIndex = rn.lastLogIndex()
+	rn.kickSyncerLocked() // parked follower replies may now be answerable
+	return nil
 }
 
 // waitApplied blocks until the entry at idx is applied (the applier signals
@@ -674,21 +774,36 @@ func (rn *RaftNode) Term() uint64 {
 	return rn.ps.CurrentTerm
 }
 
-// Stop shuts down the Raft node.  applyCh is deliberately never closed:
+// Pipeline reports whether pipelined replication (Options.Pipeline) is on.
+func (rn *RaftNode) Pipeline() bool { return rn.pipeline }
+
+// Stop shuts down the Raft node (idempotent).  applyCh is deliberately never closed:
 // notifyApplier may be sending concurrently (a close would race with the
 // non-blocking send), so the applier exits via rn.done instead.
-func (rn *RaftNode) Stop() {
+func (rn *RaftNode) Stop() { rn.stopOnce.Do(rn.stop) }
+
+func (rn *RaftNode) stop() {
+	rn.wgMu.Lock()
 	rn.stopped.Store(true)
+	rn.wgMu.Unlock()
 	close(rn.done)
 	rn.electionTimer.Stop()
 	<-rn.applierDone
 	<-rn.flusherDone
 	<-rn.tickerDone
 	// Close the transport first so in-flight RPCs fail fast, then wait for the
-	// background persist/broadcast goroutines — after this no goroutine can
-	// still be creating raft_state_*.tmp files in dataDir.
+	// background goroutines (replicators, elections) and the syncer, whose
+	// last run writes + fsyncs everything appended before Stop — after this no
+	// goroutine can still be writing raft files in dataDir.  An AppendEntries
+	// delivered after Stop began is refused and not acknowledged.
 	_ = rn.transport.Close()
 	rn.bgWG.Wait()
+	<-rn.syncerDone
+	rn.mu.Lock()
+	decided := rn.takeDecidedWaitersLocked() // all fail: stopped
+	_ = rn.store.close()
+	rn.mu.Unlock()
+	respondAll(decided)
 }
 
 // ── RPC handlers (called by Transport when a peer sends an RPC) ───────────────
@@ -715,6 +830,9 @@ func (rn *RaftNode) HandleRequestVote(args RequestVoteArgs) RequestVoteReply {
 	// A higher term always causes this server to become a follower.
 	if args.Term > rn.ps.CurrentTerm {
 		rn.becomeFollower(args.Term)
+		if rn.persistMetaLocked() != nil {
+			return reply // new term not durable: answer nothing for it
+		}
 	}
 
 	// Grant vote only if:
@@ -724,117 +842,22 @@ func (rn *RaftNode) HandleRequestVote(args RequestVoteArgs) RequestVoteReply {
 	logUpToDate := rn.logUpToDate(args.LastLogTerm, args.LastLogIndex)
 
 	if canVote && logUpToDate {
+		prev := rn.ps.VotedFor
 		rn.ps.VotedFor = args.CandidateID
-		_ = rn.saveState()
-		rn.resetElectionTimer()
-		reply.VoteGranted = true
-	}
-
-	reply.Term = rn.ps.CurrentTerm
-	return reply
-}
-
-// HandleAppendEntries processes an incoming AppendEntries RPC (heartbeat or replication).
-func (rn *RaftNode) HandleAppendEntries(args AppendEntriesArgs) AppendEntriesReply {
-	rn.mu.Lock()
-	defer rn.mu.Unlock()
-
-	reply := AppendEntriesReply{Term: rn.ps.CurrentTerm}
-
-	if args.Term < rn.ps.CurrentTerm {
-		return reply
-	}
-
-	// Valid leader contact — become/stay follower and reset timer.
-	if args.Term > rn.ps.CurrentTerm {
-		rn.becomeFollower(args.Term)
-	}
-	rn.role = RoleFollower
-	rn.currentRole.Store(int32(RoleFollower))
-	rn.LeaderID.Store(args.LeaderID)
-	rn.resetElectionTimer()
-
-	// Snapshot interaction: entries at or below lastIncludedIndex are already
-	// covered by our snapshot.  Drop the covered prefix and treat the snapshot
-	// as the virtual log head.
-	if args.PrevLogIndex < rn.lastIncludedIndex {
-		covered := rn.lastIncludedIndex - args.PrevLogIndex
-		if uint64(len(args.Entries)) <= covered {
-			// Everything in this RPC is already part of our snapshot.
-			reply.Success = true
-			reply.Term = rn.ps.CurrentTerm
-			rn.resetElectionTimer()
-			return reply
-		}
-		args.Entries = args.Entries[covered:]
-		args.PrevLogIndex = rn.lastIncludedIndex
-		args.PrevLogTerm = rn.lastIncludedTerm
-	}
-
-	// Consistency check: verify PrevLog matches our log.
-	if args.PrevLogIndex > 0 {
-		if args.PrevLogIndex > rn.lastLogIndex() {
-			reply.ConflictIndex = rn.lastLogIndex() + 1
-			return reply
-		}
-		if rn.logTerm(args.PrevLogIndex) != args.PrevLogTerm {
-			// Find first index of the conflicting term for the optimised retry.
-			reply.ConflictTerm = rn.logTerm(args.PrevLogIndex)
-			idx := args.PrevLogIndex
-			first := rn.logFirstIndex()
-			for idx > first && rn.logTerm(idx-1) == reply.ConflictTerm {
-				idx--
-			}
-			reply.ConflictIndex = idx
-			return reply
-		}
-	}
-
-	// Append any new entries, truncating conflicting ones.
-	logChanged := false
-	for i, entry := range args.Entries {
-		localIdx := args.PrevLogIndex + uint64(i) + 1
-		if localIdx <= rn.lastLogIndex() {
-			if rn.logTerm(localIdx) != entry.Term {
-				// Conflict — truncate from here.
-				rn.ps.Log = rn.ps.Log[:localIdx-rn.logFirstIndex()]
-				rn.ps.Log = append(rn.ps.Log, args.Entries[i:]...)
-				logChanged = true
-				break
-			}
-			// Already have this entry — skip.
+		// The vote must be on disk before it is granted (Raft Figure 2).
+		if rn.persistMetaLocked() != nil {
+			rn.ps.VotedFor = prev // disk still holds prev (atomic replace)
 		} else {
-			rn.ps.Log = append(rn.ps.Log, args.Entries[i:]...)
-			logChanged = true
-			break
+			rn.resetElectionTimer()
+			reply.VoteGranted = true
 		}
 	}
-	if logChanged {
-		// Config entries take effect when appended; truncation may also have
-		// removed the entry our current config came from.
-		rn.refreshConfigFromLog()
-	}
-	_ = rn.saveState()
 
-	// Advance commit index.
-	if args.LeaderCommit > rn.commitIndex {
-		newCommit := args.LeaderCommit
-		if rn.lastLogIndex() < newCommit {
-			newCommit = rn.lastLogIndex()
-		}
-		rn.commitIndex = newCommit
-		rn.notifyApplier()
-	}
-
-	reply.Success = true
 	reply.Term = rn.ps.CurrentTerm
-	// Second reset after saveState: increments electionGeneration so that
-	// any ticker goroutine that woke on the first reset's timer fire (and has
-	// been waiting for rn.mu during the slow saveState) sees a changed
-	// generation and skips the spurious election.
-	rn.resetElectionTimer()
 	return reply
 }
+
+// HandleAppendEntries / HandleAppendEntriesAsync: see pipeline.go.
 
 // ── Core Raft protocol ────────────────────────────────────────────────────────
 
@@ -851,8 +874,8 @@ func (rn *RaftNode) ticker() {
 
 		case <-rn.electionTimer.C:
 			// Snapshot the generation BEFORE acquiring the lock.  If
-			// resetElectionTimer is called while we wait (e.g. during a slow
-			// saveState in HandleAppendEntries), the generation will have
+			// resetElectionTimer is called while we wait (e.g. while
+			// another goroutine holds rn.mu), the generation will have
 			// incremented by the time we check below, and we discard the
 			// stale fire instead of starting a spurious election.
 			gen := rn.electionGeneration.Load()
@@ -860,20 +883,15 @@ func (rn *RaftNode) ticker() {
 			role := rn.role
 			rn.mu.Unlock()
 			if role != RoleLeader && !rn.removed.Load() && rn.electionGeneration.Load() == gen {
-				rn.bgWG.Add(1)
-				go func() {
-					defer rn.bgWG.Done()
-					rn.startElection()
-				}()
+				rn.spawn(rn.startElection)
 			}
 
 		case <-heartbeat.C:
 			rn.mu.Lock()
-			role := rn.role
-			rn.mu.Unlock()
-			if role == RoleLeader {
-				rn.broadcastAppendEntries()
+			if rn.role == RoleLeader {
+				rn.heartbeatLocked()
 			}
+			rn.mu.Unlock()
 		}
 	}
 }
@@ -889,9 +907,17 @@ func (rn *RaftNode) startElection() {
 
 	rn.ps.CurrentTerm++
 	rn.ps.VotedFor = rn.id
+	// Term + self-vote must be durable before soliciting votes.  On failure
+	// stay follower in the bumped term (the timer retries the election).
+	if rn.persistMetaLocked() != nil {
+		rn.resetElectionTimer()
+		rn.mu.Unlock()
+		return
+	}
 	rn.role = RoleCandidate
 	rn.currentRole.Store(int32(RoleCandidate))
-	_ = rn.saveState()
+	rn.LeaderID.Store("") // no known leader in the new term
+	rn.kickSyncerLocked() // fail follower replies parked in the old term
 
 	term := rn.ps.CurrentTerm
 	lastIdx := rn.lastLogIndex()
@@ -975,36 +1001,37 @@ func (rn *RaftNode) becomeLeader() {
 	rn.termStartIndex = noop.Index
 	rn.leaderReady.Store(false)
 
-	// Single-node configurations commit the no-op immediately.
-	rn.maybeAdvanceCommit()
-
-	// Copy state for out-of-lock persistence; persist and broadcast together.
-	psCopy := persistentState{
-		CurrentTerm: rn.ps.CurrentTerm,
-		VotedFor:    rn.ps.VotedFor,
-		Log:         append([]LogEntry(nil), rn.ps.Log...),
+	// Enqueue the no-op (log order); the syncer fsyncs it outside the lock
+	// and marks it durable (single-node configurations commit it there).
+	// The replicators started here ship it to the followers right away;
+	// they persist it themselves before acknowledging.
+	if err := rn.store.enqueue([]LogEntry{noop}); err != nil {
+		log.Printf("[raft] node=%s persist leader no-op failed: %v", rn.id, err)
 	}
-	rn.bgWG.Add(1)
-	go func() {
-		defer rn.bgWG.Done()
-		if rn.stopped.Load() {
-			return
-		}
-		_ = rn.writeStateFile(psCopy) // best-effort; quorum provides durability
-		rn.broadcastAppendEntries()
-	}()
+	rn.kickSyncerLocked()
+	rn.syncReplicatorsLocked()
 }
 
 // becomeFollower reverts this node to Follower with the given term.
 // Must be called with rn.mu held.
 func (rn *RaftNode) becomeFollower(term uint64) {
+	if term > rn.ps.CurrentTerm {
+		// The leader of the new term is unknown until it contacts us; a
+		// deposed leader must not keep naming itself (clients would get
+		// MOVED to a node that redirects them back).
+		rn.LeaderID.Store("")
+	}
 	rn.ps.CurrentTerm = term
 	rn.ps.VotedFor = ""
 	rn.role = RoleFollower
 	rn.currentRole.Store(int32(RoleFollower))
 	// Any Submit callers blocked on a commit will never be satisfied by us.
 	rn.failWaitersLocked(ErrNotLeader)
-	_ = rn.saveState()
+	rn.syncReplicatorsLocked() // a deposed leader stops replicating
+	rn.kickSyncerLocked()      // fail follower replies parked in the old term
+	// Persist the new term.  Callers that go on to answer an RPC re-check
+	// persistMetaLocked (a retry is a no-op when this succeeded).
+	_ = rn.persistMetaLocked()
 }
 
 // stepDownLocked demotes a leader to follower within the same term (used when
@@ -1015,93 +1042,7 @@ func (rn *RaftNode) stepDownLocked() {
 	rn.currentRole.Store(int32(RoleFollower))
 	rn.LeaderID.Store("")
 	rn.failWaitersLocked(ErrNotLeader)
-}
-
-// broadcastAppendEntries sends AppendEntries RPCs to all peers.
-// Called both for heartbeats (empty Entries) and log replication (non-empty).
-func (rn *RaftNode) broadcastAppendEntries() {
-	rn.mu.Lock()
-	if rn.role != RoleLeader {
-		rn.mu.Unlock()
-		return
-	}
-	peers := rn.peers
-	term := rn.ps.CurrentTerm
-	leaderCommit := rn.commitIndex
-	rn.mu.Unlock()
-
-	for _, peer := range peers {
-		rn.bgWG.Add(1)
-		go func(peer string) {
-			defer rn.bgWG.Done()
-			rn.mu.Lock()
-			if rn.role != RoleLeader {
-				rn.mu.Unlock()
-				return
-			}
-			nextIdx := rn.nextIndex[peer]
-			if nextIdx == 0 {
-				// Peer added after the last election — start at the log tail.
-				nextIdx = rn.lastLogIndex() + 1
-				rn.nextIndex[peer] = nextIdx
-			}
-
-			// The entries this peer needs were compacted into a snapshot —
-			// ship the snapshot instead (see snapshot.go).
-			if nextIdx <= rn.lastIncludedIndex {
-				rn.mu.Unlock()
-				rn.sendSnapshot(peer, term)
-				return
-			}
-
-			prevIdx := nextIdx - 1
-			prevTerm := rn.logTerm(prevIdx)
-
-			// Copy so a concurrent log truncation cannot race the encoder.
-			entries := append([]LogEntry(nil), rn.entriesFrom(nextIdx)...)
-			rn.mu.Unlock()
-
-			args := AppendEntriesArgs{
-				Term:         term,
-				LeaderID:     rn.id,
-				PrevLogIndex: prevIdx,
-				PrevLogTerm:  prevTerm,
-				Entries:      entries,
-				LeaderCommit: leaderCommit,
-			}
-			reply, err := rn.transport.SendAppendEntries(peer, args)
-			if err != nil {
-				return
-			}
-
-			rn.mu.Lock()
-			defer rn.mu.Unlock()
-
-			if reply.Term > rn.ps.CurrentTerm {
-				rn.becomeFollower(reply.Term)
-				return
-			}
-			if rn.role != RoleLeader || rn.ps.CurrentTerm != term {
-				return // stale response
-			}
-
-			if reply.Success {
-				newMatch := prevIdx + uint64(len(entries))
-				if newMatch > rn.matchIndex[peer] {
-					rn.matchIndex[peer] = newMatch
-					rn.nextIndex[peer] = newMatch + 1
-				}
-				rn.maybeAdvanceCommit()
-			} else {
-				// Back off using conflict hints.
-				if reply.ConflictIndex > 0 {
-					rn.nextIndex[peer] = reply.ConflictIndex
-				} else if rn.nextIndex[peer] > 1 {
-					rn.nextIndex[peer]--
-				}
-			}
-		}(peer)
-	}
+	rn.syncReplicatorsLocked()
 }
 
 // maybeAdvanceCommit checks whether a new quorum exists for a higher commit
@@ -1122,7 +1063,12 @@ func (rn *RaftNode) maybeAdvanceCommit() {
 		count := 0
 		for _, s := range rn.config.Servers {
 			if s == rn.id {
-				count++ // leader's own log always contains n
+				// The leader's log contains n, but it only counts once n is
+				// fsynced (durableIndex); the replicators ship entries
+				// before the leader's own fsync has finished.
+				if rn.durableIndex >= n {
+					count++
+				}
 			} else if rn.matchIndex[s] >= n {
 				count++
 			}
@@ -1401,66 +1347,67 @@ func (rn *RaftNode) resetElectionTimer() {
 
 // ── Persistence ───────────────────────────────────────────────────────────────
 
-func (rn *RaftNode) statePath() string {
-	return filepath.Join(rn.dataDir, "raft_state.gob")
-}
-
-// writeStateFile persists ps to disk atomically via a temp-file rename.
-// It may be called with rn.mu already released (Submit uses it this way to
-// avoid holding the lock across a slow fdatasync).
-func (rn *RaftNode) writeStateFile(ps persistentState) error {
-	rn.writeStateFileCalls.Add(1)
-	f, err := os.CreateTemp(rn.dataDir, "raft_state_*.tmp")
-	if err != nil {
-		return err
-	}
-	tmp := f.Name()
-	if err := gob.NewEncoder(f).Encode(ps); err != nil {
-		f.Close()
-		os.Remove(tmp)
-		return err
-	}
-	if err := f.Sync(); err != nil {
-		f.Close()
-		os.Remove(tmp)
-		return err
-	}
-	f.Close()
-	return os.Rename(tmp, rn.statePath())
-}
-
-func (rn *RaftNode) saveState() error {
-	return rn.writeStateFile(rn.ps) // caller holds rn.mu
-}
-
+// loadState opens the persistent store (raft_storage.go) — migrating a legacy
+// raft_state.gob if that is all there is — and installs term, vote and log.
+// Runs after loadSnapshot, before any goroutine starts.
 func (rn *RaftNode) loadState() error {
-	f, err := os.Open(rn.statePath())
-	if os.IsNotExist(err) {
-		// Fresh start — default state.
-		rn.ps = persistentState{Log: []LogEntry{}}
-		return nil
-	}
+	store, st, err := openLogStore(rn.dataDir)
 	if err != nil {
 		return err
 	}
-	defer f.Close()
-	if err := gob.NewDecoder(f).Decode(&rn.ps); err != nil {
-		return err
+	rn.store = store
+	rn.ps = persistentState{
+		CurrentTerm: st.meta.CurrentTerm,
+		VotedFor:    st.meta.VotedFor,
+		Log:         st.entries,
 	}
+	if rn.ps.Log == nil {
+		rn.ps.Log = []LogEntry{}
+	}
+	if st.gapFrom > rn.lastIncludedIndex {
+		return fmt.Errorf("corrupt raft log %s: entries after index %d were discarded by an index gap that the snapshot (index %d) does not cover",
+			store.logPath(), st.gapFrom, rn.lastIncludedIndex)
+	}
+
 	// Discard any log prefix already covered by the snapshot (a crash between
-	// the snapshot write and the truncated-state write leaves overlap; the
-	// snapshot file is authoritative for its range).
+	// the snapshot write and the log rewrite leaves overlap; the snapshot file
+	// is authoritative for its range).
+	needRewrite := st.gapFrom > 0
 	if rn.lastIncludedIndex > 0 && len(rn.ps.Log) > 0 {
 		first := rn.ps.Log[0].Index
 		if rn.lastIncludedIndex >= first {
 			cut := rn.lastIncludedIndex - first + 1
 			if cut >= uint64(len(rn.ps.Log)) {
-				rn.ps.Log = nil
+				rn.ps.Log = []LogEntry{}
 			} else {
 				rn.ps.Log = append([]LogEntry(nil), rn.ps.Log[cut:]...)
 			}
+			needRewrite = true
 		}
 	}
+	if len(rn.ps.Log) > 0 && rn.ps.Log[0].Index > rn.lastIncludedIndex+1 {
+		return fmt.Errorf("corrupt raft log %s: first entry %d does not follow the snapshot (index %d)",
+			store.logPath(), rn.ps.Log[0].Index, rn.lastIncludedIndex)
+	}
+
+	// currentTerm is never below the term of a log entry: meta is persisted
+	// before any entry of a new term is accepted.  Repair defensively if a
+	// damaged/restored dataDir says otherwise.
+	if lt := rn.lastLogTerm(); lt > rn.ps.CurrentTerm {
+		log.Printf("[raft] node=%s persisted term %d is below last log term %d — raising it",
+			rn.id, rn.ps.CurrentTerm, lt)
+		rn.ps.CurrentTerm, rn.ps.VotedFor = lt, ""
+		if err := rn.store.saveMeta(raftMeta{CurrentTerm: lt}); err != nil {
+			return err
+		}
+	}
+
+	if needRewrite {
+		if err := rn.store.rewrite(rn.ps.Log); err != nil {
+			return err
+		}
+	}
+	rn.durableIndex = rn.lastLogIndex()
 	return nil
 }
 

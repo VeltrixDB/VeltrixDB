@@ -13,6 +13,24 @@ Releases are cut automatically on every merge to `main` (GitHub release +
 
 ### Fixed
 
+- **Data loss on node failure with `--auto-rebalance=true` (the default).**
+  When a node was marked FAILED, every node ran `MigrateToNewOwners`, which
+  sent each key to its single ring owner and deleted it locally, outside the
+  raft log and ignoring the replication factor. A 3-node raft cluster loaded
+  with 20,000 keys kept 5,435 and 7,875 keys on the two survivors after its
+  leader was killed; the new leader answered "key not found" for the rest. A
+  replicated RF=3 cluster lost keys the same way. Now (CLAUDE.md invariant
+  62): in `--mode=raft` migration never runs — `--auto-rebalance` is a logged
+  no-op, `MigrateToNewOwners` returns `ErrMigrationRaftMode`, and inbound
+  `/transfer/keys` batches get HTTP 403; node state changes (FAILED /
+  RECOVERING / ACTIVE) never start a migration; and migration is RF-aware —
+  a node keeps every key it is one of the RF replicas of, copies keys to
+  replicas that newly need them after a membership change, and deletes a
+  key only when it left that key's replica set and every current replica
+  acknowledged it (with 3 nodes and RF=3 nothing moves). Pinned
+  (`@vecns/`, `@idxdef/`) and derived-key ordering rules are unchanged.
+  `TransferAgent.Stop` is now idempotent. Tests that expect keys to move
+  between two nodes now use RF=1.
 - **Key TTLs survive restarts.** The WAL carried no TTL, so after any restart
   (crash replay or clean-shutdown checkpoint) every TTL'd key — `PUTEX`, MPUT
   entries, TXN, NS puts, hash fields (`HSET` / `HEXPIRE`), CAS / INCR / DECR /
@@ -83,6 +101,55 @@ Releases are cut automatically on every merge to `main` (GitHub release +
 
 ### Performance
 
+- **Raft persistence is incremental.** Every raft flush used to gob-encode
+  and fsync the whole retained log into `raft_state.gob` (up to 8,192
+  entries, ~8 MB with 1 KB values), on followers even for heartbeats. The log
+  is now an append-only, CRC-checked `raft_log.dat` (one write + one fsync of
+  the new records per group-commit flush / AppendEntries) and term + vote a
+  small `raft_meta.dat` replaced atomically only when they change
+  (`consensus/raft_storage.go`). Bytes persisted per single-entry commit:
+  1,049 at 100 and at 8,085 retained entries (was 143 KB and 8.4 MB).
+  Local 3-node raft cluster (macOS laptop, Apple M5 Pro, 3 processes, YCSB
+  20 K records / 20 K ops, 16 threads, one run each): load 70 → 1,046
+  inserts/s (avg 229 → 15 ms), A 87 → 1,212 ops/s (update avg 355 → 25 ms),
+  B 769 → 6,795 ops/s, C 40.3 K → 50.4 K ops/s. Crash safety: torn tails are
+  truncated on load, a conflicting suffix is superseded by the first new
+  record (no truncate record), compaction rewrites the file atomically after
+  the snapshot is durable. The leader now counts itself toward a commit
+  quorum only once its own fsync covered the entry (a heartbeat could ship
+  entries before the group-commit fsync), and a follower whose persist fails
+  answers `Success=false` instead of acknowledging. **Upgrade:** an existing
+  `raft_state.gob` is migrated on first start (renamed to
+  `raft_state.gob.migrated`). **Rollback:** an older build cannot read the new
+  files — wipe the node's `--data` and let it re-sync from the leader, one
+  node at a time (docs/replication.md#persistence).
+- **Raft: follower fsync off the node lock, pipelined replication.** A
+  follower used to write AND fsync every AppendEntries that carried entries
+  while holding `rn.mu`, so it handled one request per fsync and blocked
+  heartbeats, votes and follower reads behind it; the leader's transport
+  allowed one RPC per peer at a time (a per-peer mutex held for the whole
+  round trip, a new gob encoder per RPC), and the leader shipped a batch only
+  after its own fsync. Now (`consensus/pipeline.go`): log records are queued
+  under `rn.mu` and one syncer goroutine per node writes + fsyncs them outside
+  it, sharing one fsync across every queued batch / AppendEntries; a follower
+  acknowledges entries only once they are durable (a heartbeat is answered at
+  once with `MatchIndex` = its durable prefix, never waiting for an fsync, and
+  a request whose entries were truncated while their fsync ran fails instead
+  of reporting a match); the leader keeps up to `DefaultPipelineWindow` (8)
+  AppendEntries in flight per follower with optimistic `nextIndex`, epoch-
+  based reset on rejection, and ships new entries before its own fsync; the
+  TCP transport multiplexes one ordered stream per peer (falls back to the old
+  framing against an older server). Laptop (3 local processes, 16 threads,
+  20 K records, medians of 2 runs): raft load 1,038 → 560 inserts/s, B 5,630 →
+  10,547 ops/s, A update p99 78 → 47 ms. The load regression is specific to
+  one shared drive with darwin's `F_FULLFSYNC` (see bench/compare/README.md);
+  with independent per-node 1 ms fsyncs (scratch model) load goes 3,015 →
+  5,630 inserts/s, p99 17 → 4 ms. Also fixed: a follower's commit index is
+  capped at the last entry the request verified (Figure 2) instead of its whole
+  log, which could commit a stale suffix from an older term; a node clears its
+  `LeaderID` when its term advances, so a deposed leader no longer answers
+  `MOVED` to itself (seen as a redirect loop after an election); a failed raft
+  log write is now sticky like a failed fsync; `RaftNode.Stop` is idempotent.
 - Quantized re-rank reads the candidates' full vectors with one parallel
   MultiGet instead of a Get each: GloVe-100 int8 at ef=64, p50 1.9 → 0.61 ms
   and p99 13.8 → 0.81 ms.

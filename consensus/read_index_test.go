@@ -63,7 +63,7 @@ func TestReadIndex_FollowerRejected(t *testing.T) {
 func TestWaitLeaderApplied_FailoverVisibility(t *testing.T) {
 	for round := 0; round < 5; round++ {
 		t.Run(fmt.Sprintf("round%d", round), func(t *testing.T) {
-			c := newSnapCluster(t, 3, Options{})
+			c := newSnapCluster(t, 3, testOpts(Options{}))
 			li := waitForStableLeader(c.nodes, 5*time.Second)
 			if li < 0 {
 				t.Fatal("no leader elected")

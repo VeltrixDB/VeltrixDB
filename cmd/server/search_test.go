@@ -268,6 +268,9 @@ func TestDistributedSearch_AfterRebalance(t *testing.T) {
 		t.Skip("multi-engine integration test")
 	}
 	cfg := cluster.DefaultClusterConfig()
+	// RF=1: one replica per key, so a join MOVES keys (with RF >= node
+	// count every node is a replica and a join only copies).
+	cfg.ReplicationFactor = 1
 	pm1 := cluster.NewPartitionMap(cfg)
 	if err := pm1.AddNode("node-1", "127.0.0.1", 7201); err != nil {
 		t.Fatal(err)

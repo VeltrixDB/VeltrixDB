@@ -298,10 +298,16 @@ func (pm *PartitionMap) GetNodeForKey(key string) (string, error) {
 func (pm *PartitionMap) GetReplicasForKey(key string) ([]string, error) {
 	pm.mu.RLock()
 	defer pm.mu.RUnlock()
+	return replicasOnRing(pm.Ring, pm.Nodes, pm.ReplicationFactor, key)
+}
 
-	hash := hashKey(key)
+// replicasOnRing is GetReplicasForKey over an explicit ring + member set, so
+// migration can evaluate the same placement for an earlier membership
+// (replicaPlacement). Node state is ignored on purpose: a FAILED node stays
+// a replica of its keys until it is removed from the membership.
+func replicasOnRing(ring *ConsistentHashRing, nodes map[string]*Node, rf int, key string) ([]string, error) {
 	// Ring successors in order, one entry per distinct physical node.
-	order, err := pm.Ring.GetNodeWithReplicas(hash, len(pm.Nodes))
+	order, err := ring.GetNodeWithReplicas(hashKey(key), len(nodes))
 	if err != nil {
 		return nil, err
 	}
@@ -309,14 +315,56 @@ func (pm *PartitionMap) GetReplicasForKey(key string) ([]string, error) {
 	// with the same rack-aware routine Rebalance uses.
 	nodeList := make([]*Node, 0, len(order))
 	for _, id := range order {
-		if n, ok := pm.Nodes[id]; ok {
+		if n, ok := nodes[id]; ok {
 			nodeList = append(nodeList, n)
 		}
 	}
 	if len(nodeList) == 0 {
 		return nil, fmt.Errorf("no known nodes on ring")
 	}
-	return pickReplicas(nodeList, 0, pm.ReplicationFactor), nil
+	return pickReplicas(nodeList, 0, rf), nil
+}
+
+// memberRacks snapshots the membership (every node in the map, whatever its
+// state) as node ID → rack.
+func (pm *PartitionMap) memberRacks() map[string]string {
+	pm.mu.RLock()
+	defer pm.mu.RUnlock()
+	out := make(map[string]string, len(pm.Nodes))
+	for id, n := range pm.Nodes {
+		out[id] = n.Rack
+	}
+	return out
+}
+
+// replicaPlacement answers GetReplicasForKey for a fixed membership
+// snapshot. MigrateToNewOwners builds one for the membership it last
+// migrated against and one for the current membership, and diffs them.
+type replicaPlacement struct {
+	ring  *ConsistentHashRing
+	nodes map[string]*Node
+	rf    int
+}
+
+func newReplicaPlacement(members map[string]string, vnodes, rf int) *replicaPlacement {
+	p := &replicaPlacement{ring: NewConsistentHashRing(vnodes), nodes: make(map[string]*Node, len(members)), rf: rf}
+	for id, rack := range members {
+		p.nodes[id] = &Node{ID: id, Rack: rack}
+		p.ring.AddNode(id)
+	}
+	return p
+}
+
+// replicas returns key's replica set, or nil for an empty membership.
+func (p *replicaPlacement) replicas(key string) []string {
+	if len(p.nodes) == 0 {
+		return nil
+	}
+	r, err := replicasOnRing(p.ring, p.nodes, p.rf, key)
+	if err != nil {
+		return nil
+	}
+	return r
 }
 
 // UpdateNodeState updates the state of a node
