@@ -2,7 +2,7 @@
 
 This document explains exactly what happens at each stage of a node's life in a VeltrixDB cluster — from joining to leaving, and from graceful shutdown to sudden crash.
 
-**What `cmd/server` does vs. the library.** A server builds its membership once, at startup, from `--peers id@host:port,...` (or `--seeds nodeID=host:port,...`): every listed node is `AddNode`d to the local partition map. There is no admin endpoint or command that adds, drains or removes a node at runtime, and gossip does not carry membership (`cluster/gossip.go`: nodes a digest names that the receiver does not know are ignored). In `--mode=raft` / `--mode=replicated`, `--auto-rebalance` (default true) subscribes to membership events and, after a 3 s debounce, runs `Rebalance` + `MigrateToNewOwners` (`cmd/server/rebalancer.go`). The join / drain / force-remove calls below (`AddNodeAndRebalance`, `RemoveNodeAndRebalance`, `ForceRemoveNode`, `RaftNode.AddServer`) are Go APIs in `cluster/` and `consensus/` for an embedding program; the server does not call them.
+**What `cmd/server` does vs. the library.** A server builds its membership once, at startup, from `--peers id@host:port,...` (or `--seeds nodeID=host:port,...`): every listed node is `AddNode`d to the local partition map. There is no admin endpoint or command that adds, drains or removes a node at runtime, and gossip does not carry membership (`cluster/gossip.go`: nodes a digest names that the receiver does not know are ignored). In `--mode=replicated`, `--auto-rebalance` (default true) subscribes to membership changes (a node added to or removed from the map) and, after a 3 s debounce, runs `Rebalance` + `MigrateToNewOwners` (`cmd/server/rebalancer.go`); node state changes (SUSPECT / FAILED / RECOVERING / ACTIVE) never start a migration. In `--mode=raft` the flag is a no-op: every node holds the full raft-replicated state, so the transfer agent is marked raft-managed, `MigrateToNewOwners` refuses (`ErrMigrationRaftMode`) and inbound `/transfer/keys` batches get HTTP 403 (invariant 62; before this, killing the leader of a loaded 3-node raft cluster deleted about two thirds of the keys on each survivor). Since a running server's membership never changes, in practice it never migrates. The join / drain / force-remove calls below (`AddNodeAndRebalance`, `RemoveNodeAndRebalance`, `ForceRemoveNode`, `RaftNode.AddServer`) are Go APIs in `cluster/` and `consensus/` for an embedding program; the server does not call them.
 
 ---
 
@@ -22,7 +22,7 @@ T=400 ms node-2 startElection():
          ├─ ps.CurrentTerm++    (term 2)
          ├─ ps.VotedFor = "node-2"
          ├─ role = Candidate
-         ├─ saveState() → raft_state.gob
+         ├─ persist term + vote → raft_meta.dat (before any RequestVote)
          ├─ resetElectionTimer()
          └─ Send RequestVote{term=2, lastLogIndex=X, lastLogTerm=Y}
                   to node-3 (and node-1, which may be dead)
@@ -42,7 +42,7 @@ T=401 ms node-2 becomeLeader():
          ├─ nextIndex[node-3] = lastLogIndex + 1
          ├─ matchIndex[node-3] = 0
          ├─ Append no-op entry (term=2)   ← Raft §5.4.2
-         └─ persist raft_state.gob, then broadcastAppendEntries()
+         └─ append no-op to raft_log.dat, fsync, then broadcastAppendEntries()
                                            ← sent at once, includes no-op
 
 T≈402 ms node-2's no-op entry ACKed by node-3 (quorum) — one round trip
@@ -60,7 +60,7 @@ T≈402 ms node-2's no-op entry ACKed by node-3 (quorum) — one round trip
 
 ### No Data Loss
 
-Any write that received an `OK` response from the old leader was committed by quorum — at least 2 of 3 nodes persisted it to `raft_state.gob`. The new leader will apply those entries before accepting new writes.
+Any write that received an `OK` response from the old leader was committed by quorum — at least 2 of 3 nodes fsynced it to `raft_log.dat`. The new leader will apply those entries before accepting new writes.
 
 Writes that received `MOVED` were not submitted. Writes that timed out or lost their connection may or may not have been committed. Clients with **at-least-once** semantics should retry with idempotent operations (use `SetIfNotExists` / `CompareAndSwap` for exactly-once semantics).
 
@@ -119,14 +119,17 @@ TransferAgent.MigrateToNewOwners()   [runs in background goroutine]
 ScanKeys() → enumerate all live keys on the node that owns ta
     │
     ▼
-For each key:
-    hash = fmix64(FNV-1a(RoutingKey(key)))   ← @vec/@txt/@idx keys route as their record
-    newOwner = ring.GetNode(hash)
-    if newOwner != local node: queue for newOwner
+For each key (placement = GetReplicasForKey: RF ring successors, rack-aware;
+              @vec/@txt/@idx keys route as their record):
+    now  = replicas under the current membership
+    prev = replicas under the agent's baseline membership (before node-4)
+    if local node ∈ now:  copy to now − prev (here: node-4, if it became a replica)
+    else:                 send to every member of now; delete locally only
+                          after all of them acknowledged
     (@vecns/ and @idxdef/ keys are copied to every destination, never moved)
 
     ▼
-Fan out to each new owner in parallel via HTTP:
+Fan out to each destination in parallel via HTTP:
     POST http://10.0.0.4:9005/transfer/keys
     Body: {src:"node-1", epoch:E, keys:[{k,v,ttl}, ...]}  (500 keys per batch)
     (HMAC-signed with --cluster-secret-file; a stale epoch gets 409)
@@ -135,10 +138,12 @@ Fan out to each new owner in parallel via HTTP:
 node-4 receives and puts each key into its local StorageEngine
     │
     ▼
-node-1 deletes successfully-migrated keys locally
+node-1 deletes the keys it is no longer a replica of, once every replica acked them
 ```
 
-**During migration**, the ring routes requests for re-owned keys to `node-4` as soon as it is added, but a key is only on `node-4` once its batch has been delivered: until then a read routed to `node-4` can miss it. `node-1` keeps its copy until the batch succeeds (failed batches are not deleted and are retried on the next migration).
+With RF=3, node-1 stops being a replica only of keys for which node-4 took one of the three slots from it; the rest are copied to node-4 and kept. (With 3 nodes and RF=3 every node is a replica of every key and nothing would ever move.)
+
+**During migration**, the ring routes requests for re-owned keys to `node-4` as soon as it is added, but a key is only on `node-4` once its batch has been delivered: until then a read routed to `node-4` can miss it. `node-1` keeps its copy until every replica acknowledged it (failed batches are not deleted and are retried on the next migration).
 
 ### Phase 4: Raft Group Expansion
 
@@ -181,8 +186,11 @@ Internally:
    └─ node-3's partitions reassigned to node-1 and node-2
 
 4. [background] node3TransferAgent.MigrateToNewOwners()
-   └─ Scan node-3's local keys → identify new owners → transfer
+   └─ Scan node-3's local keys → send each to every member of its current
+      replica set → delete it once all of them acknowledged
 ```
+
+The surviving members should also run `MigrateToNewOwners` (the auto-rebalancer does, on the "removed" event) so that replicas which inherited node-3's slots get copies from them too.
 
 **Critical**: The `TransferAgent` passed to `RemoveNodeAndRebalance` MUST be `node-3`'s own agent (`ta.localNodeID == "node-3"`); any other agent is rejected with an error. `nil` skips evacuation. Like node addition, this changes only the partition map it is called on — every node's map must drop node-3.
 
@@ -190,7 +198,7 @@ Internally:
 
 ```
 [transfer] evacuating node=node-3
-[transfer] migration done  moved=847291  errors=false
+[transfer] migration done  copied=0  moved=847291  kept-unacked=0  errors=false
 [transfer] evacuation complete node=node-3
 ```
 
@@ -245,7 +253,7 @@ Up to `MaxRecoveryRetries` (3) attempts are made. A failed attempt re-queues the
 
 ### RECOVERING → ACTIVE
 
-Every `RecoveryInterval` (5 s) the same worker pings each `RECOVERING` node (`promoteRecoveredNodes`, `cluster/failure_detection.go`). After `RecoveryConfirmations` (2) consecutive successful pings, with a heartbeat younger than `SuspectThreshold` (3 s), the node becomes `ACTIVE` (`veltrixdb_failure_detector_nodes_reactivated_total`); a failed ping resets the count. The transition triggers `Rebalance`, which assigns partitions to ACTIVE nodes only, so the node owns partitions again; in `cmd/server` the auto-rebalancer also sees the ACTIVE event and runs `Rebalance` + `MigrateToNewOwners` after its 3 s debounce. Search fan-out (`PartitionMap.SearchPeers`) skips only FAILED nodes, so a node is searched again as soon as it is RECOVERING. A RECOVERING node whose heartbeats stop is marked SUSPECT / FAILED by the heartbeat checker as usual.
+Every `RecoveryInterval` (5 s) the same worker pings each `RECOVERING` node (`promoteRecoveredNodes`, `cluster/failure_detection.go`). After `RecoveryConfirmations` (2) consecutive successful pings, with a heartbeat younger than `SuspectThreshold` (3 s), the node becomes `ACTIVE` (`veltrixdb_failure_detector_nodes_reactivated_total`); a failed ping resets the count. The transition triggers `Rebalance`, which assigns partitions to ACTIVE nodes only, so the node owns partitions again. No data moves: the node never left the ring or the membership, it kept its data, and the auto-rebalancer ignores state changes (before invariant 62 it ran `MigrateToNewOwners` on FAILED / RECOVERING / ACTIVE events, which deleted keys on the survivors). Search fan-out (`PartitionMap.SearchPeers`) skips only FAILED nodes, so a node is searched again as soon as it is RECOVERING. A RECOVERING node whose heartbeats stop is marked SUSPECT / FAILED by the heartbeat checker as usual.
 
 ### Crash Recovery on the Crashed Node
 
@@ -254,7 +262,8 @@ When `node-2` restarts:
 ```
 1. RaftNode starts (NewRaftNodeWithOptions)
    ├─ Restore raft_snapshot.gob if present (state machine + lastIncludedIndex/Term)
-   └─ loadState(): read raft_state.gob → (CurrentTerm, VotedFor, retained log tail)
+   └─ loadState(): raft_meta.dat → (CurrentTerm, VotedFor); replay raft_log.dat → retained
+      log tail (torn tail truncated; a legacy raft_state.gob is migrated first)
 
 2. StorageEngine starts → replayWAL()
    ├─ Open wal.log on each disk
@@ -286,8 +295,8 @@ When `node-2` restarts:
 
 7. Recovery worker, every RecoveryInterval (5 s): 2 consecutive successful
    pings + fresh heartbeat → UpdateNodeState("node-2", NodeStateActive)
-   └─ Rebalance: node-2 owns partitions again (auto-rebalancer migrates
-      keys after its 3 s debounce)
+   └─ Rebalance: node-2 owns partitions again (no data moves — state
+      changes never trigger migration, invariant 62)
 
 8. --mode=replicated only: each peer's ReplicationEngine had marked node-2
    FAILED on its first failed send; its recovery worker probes node-2 with
@@ -304,7 +313,7 @@ If `node-2` cannot be recovered (hardware is destroyed):
 pm.ForceRemoveNode("node-2", 256)
 ```
 
-This removes the node from the ring and rebalances partition assignments to `node-1` and `node-3`. No data evacuation — surviving replicas are the source of truth; restoring the replica count is left to the replication layer (`ForceRemoveNode` itself triggers no re-replication).
+This removes the node from the ring and rebalances partition assignments to `node-1` and `node-3`. No data evacuation — surviving replicas are the source of truth. `ForceRemoveNode` itself copies nothing; a `MigrateToNewOwners()` pass on each survivor afterwards (the auto-rebalancer runs one on the "removed" event) copies every key the survivor holds to replicas that newly need it, restoring the replica count where spare nodes exist. That pass deletes a key only on a survivor that left the key's replica set, and only after every current replica acknowledged it.
 
 ---
 
@@ -313,7 +322,7 @@ This removes the node from the ring and rebalances partition assignments to `nod
 When a crashed node comes back online after repair:
 
 ```
-1. raft_state.gob still present → node knows its last term and voted-for
+1. raft_meta.dat / raft_log.dat still present → node knows its last term, voted-for and log
 2. WAL replay rebuilds the index (last clean-shutdown checkpoint + every record after it)
 3. Node joins as Follower
 4. Leader sends missing AppendEntries to catch up the log

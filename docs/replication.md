@@ -25,8 +25,9 @@ Raft replicates every write as a log entry across all nodes in the Raft group be
 | Component | Role |
 |-----------|------|
 | `RaftNode` | Core Raft state machine per node |
-| `persistentState` | Survives crashes: `CurrentTerm`, `VotedFor`, `Log` |
-| `Transport` | gob-over-TCP layer for `RequestVote`, `AppendEntries` and `InstallSnapshot` RPCs |
+| `persistentState` + `logStore` | Survives crashes: `CurrentTerm`, `VotedFor` (`raft_meta.dat`), `Log` (append-only `raft_log.dat`) — `consensus/raft_storage.go` |
+| `Transport` | gob-over-TCP layer for `RequestVote`, `AppendEntries` and `InstallSnapshot` RPCs: one multiplexed stream per peer (requests in order, replies matched by ID), legacy one-RPC-per-round-trip framing against older servers — `consensus/transport.go` |
+| syncer / replicators | `consensus/pipeline.go`: one goroutine per node writes + fsyncs the queued log records; one goroutine per follower (on the leader) keeps a window of AppendEntries in flight |
 | `StateMachine` | Interface applied once a log entry commits — in the server, `raftFSM` (`cmd/server/raft_fsm.go`), a `SnapshotStateMachine` and `BatchStateMachine` over the `StorageEngine` |
 
 Each log entry's command is a gob-encoded `fsmCmd`. The op codes (`fsmOp`, persisted in the log, so new ones are only ever appended): `opPut`, `opDelete`, `opMultiPut`, `opCAS`, `opIncr`, `opDecr`, `opSetNX`, `opTxn`, `opNSPut`, `opNSDelete`, `opNSDrop`, `opHSet`, `opHDel`, `opHExpire`, `opVSet`, `opIdxCreate`, `opIdxDrop`, `opLPush`, `opRPush`, `opLPop`, `opRPop`, `opSAdd`, `opSRem`, `opVDel`. Ops that return a value (CAS, INCR, TXN, pops, …) get it back through a per-request result channel keyed by a node-salted request ID. Cluster membership changes are separate `EntryConfig` entries (`AddServer` / `RemoveServer`, `consensus/membership.go`).
@@ -41,19 +42,27 @@ Submit(command)           ← only succeeds on the leader; enqueues to submitCh
     │
     ▼
 flusher goroutine         ← group commit: drains up to 4096 pending Submits
-    ├─ Append every LogEntry{Term, Index, Command} under one rn.mu section
-    ├─ Persist log to raft_state.gob (writeStateFile: one fsync for the batch,
-    │                                 outside rn.mu, before replication)
+    ├─ under one rn.mu section: append every LogEntry{Term, Index, Command}
+    │  to the in-memory log and encode ONLY the new records into the
+    │  logStore write queue (queue order = log order = file order)
+    ├─ kick the syncer (and, with --raft-pipeline, every peer's replicator)
+    │  — nothing waits for disk
     │
-    ▼
-broadcastAppendEntries()  ← once per batch; one goroutine per peer, parallel
-    │
-    ├─ peer 2: AppendEntries RPC → ACK
-    ├─ peer 3: AppendEntries RPC → ACK  ← quorum (2 of 3)
-    │
-    ▼
-maybeAdvanceCommit()      ← advance commitIndex when quorum ACKs
-    │
+    ├──────────────────────────────┬───────────────────────────────────────┐
+    ▼                              ▼                                       ▼
+syncer (leader's own copy)     replicator, peer 2                      replicator, peer 3
+    ├─ one write(2) of the      ├─ 1 (default) or up to PipelineWindow  (same)
+    │  queue + one fsync,       │  (8, --raft-pipeline) entry-carrying
+    │  outside rn.mu            │  AppendEntries in flight, nextIndex
+    ├─ durableIndex = tail      │  advanced optimistically
+    │  (leader counts itself    └─ reply: matchIndex = reply.MatchIndex
+    │   only up to here)            (durable on the follower)
+    └─ default: wake the replicators (paced sending)
+    │                              │
+    └──────────────┬───────────────┘
+                   ▼
+maybeAdvanceCommit()      ← commitIndex = highest N of the current term held
+    │                        durably by a majority (leader: durableIndex)
     ▼
 applier goroutine         ← raftFSM.ApplyBatch / Apply → StorageEngine
     │                        (consecutive PUTs coalesce into one MultiPut)
@@ -61,26 +70,56 @@ applier goroutine         ← raftFSM.ApplyBatch / Apply → StorageEngine
 Submit() returns nil      ← client receives OK
 ```
 
+Concurrent batches share fsyncs on both sides — the syncer writes and syncs whatever is queued when it runs. When the replicators send depends on `--raft-pipeline`:
+
+**`--raft-pipeline=false` (the default): one AppendEntries in flight per follower, paced by the leader's fsync.** Appending does not wake the replicators; the syncer wakes them each time a leader fsync completes, and they send everything appended so far — including entries the leader's *next* fsync is still writing. A successful reply sends again at once only if no leader fsync is pending (otherwise that fsync's completion does it). This is the send pattern of the pre-2026-10 code (fsync, then broadcast the log tail), and it keeps each follower fsync covering a leader batch or more. Env `VELTRIX_RAFT_PIPELINE` sets the flag's default.
+
+**`--raft-pipeline=true`: pipelined, eager sending.** Every append and every reply wakes the replicators, so a batch ships the moment it is appended — the leader's own fsync and the followers' round trip + write + fsync **overlap** — and up to `DefaultPipelineWindow` (8) AppendEntries are outstanding per follower.
+
+**Why it is off by default.** Eager sending splits the stream into many small AppendEntries; every one costs a follower fsync. With one disk per node that is cheap and the overlap wins; with several nodes sharing one disk the extra flushes saturate it. Measured on one Mac (3 local processes, darwin `F_FULLFSYNC` ≈ 3.6 ms on a shared SSD, YCSB load, 20 K records, 16 threads): eager sending ~560–610 inserts/s (≈ 100 log fsyncs/s per node at ~7–8 ms each), paced sending ~1,050–1,100 (leader ≈ 135 fsyncs/s at ~3.8 ms, followers ≈ 78/s), which is the pre-2026-10 figure. Window 1 alone does not recover it (~575/s); the send trigger does — with paced sending even window 8 measured ~1,100. Pipelined mode did better on the read-heavy workload B (~10.5 K vs ~5.6 K ops/s on the same Mac) and in a model with independent per-node fsyncs (load 3.0 K → 5.6 K inserts/s), but it has not been measured on separate hosts. **Enable it** once a multi-host benchmark (bench/compare/README.md, "Raft pipeline") shows it ahead on your hardware — typically one NVMe per node on separate machines. Durability, commit rules and the wire protocol are identical in both modes, so nodes can be switched one at a time (a mixed cluster is fine).
+
+**Pipelining (both modes; window 1 when off).** Each replicator keeps up to its window of entry-carrying AppendEntries outstanding per follower, each at most `maxAppendEntries` (1024) entries / `maxAppendBytes` (4 MiB). The TCP transport delivers one peer's requests in send order over a single stream, and the follower appends them in that order, so a pipeline normally never sees a gap. Replies can return out of order (a heartbeat is answered while an earlier append still waits for its fsync); they are matched to their own request:
+
+- **Success** raises `matchIndex` to the reply's `MatchIndex` (never lowers it) and moves `nextIndex` past it.
+- **Rejection or transport error** in the current pipeline epoch resets the pipeline: `epoch++`, `nextIndex` = the follower's conflict hint (or the failed batch's first index), and the replicator *probes* — one request at a time, after every older request has been answered — until a Success. Rejections from an older epoch are ignored.
+- **A reply with a higher term** makes the leader step down; replies for an older term, or for a replicator that was replaced, are ignored.
+- **Heartbeats** (every 50 ms) bypass the window, so a follower whose fsync is slow still hears from the leader.
+- **InstallSnapshot**: a peer whose `nextIndex` is at or below the snapshot gets the snapshot only once its pipeline has drained; afterwards the pipeline restarts (probing) at `lastIncludedIndex + 1`.
+- **Membership**: a replicator starts when a peer enters the configuration (append time) and stops when it leaves or the node stops leading.
+
+A transport that does not implement `AsyncTransport` (test mocks) is driven through a per-peer FIFO that calls `SendAppendEntries` one request at a time.
+
 **Key invariant**: `Submit()` blocks on a per-index commit waiter that the applier signals after applying that entry, with a 5-second deadline (`submit timeout: entry N not committed within 5s`); losing leadership fails it with `ErrNotLeader`. The entry is only visible to clients after the state machine has applied it on the leader. The applier wakes on commit notifications and on a 1 ms ticker.
 
 ### The Write Path (Follower)
 
 ```
-HandleAppendEntries(args)
-    │
-    ├─ Verify args.Term >= currentTerm
-    ├─ Stay/become Follower, record LeaderID
-    ├─ resetElectionTimer()                ← first reset: prevent spurious election
+HandleAppendEntriesAsync(args, respond)   ← the RPC server calls it in arrival order
+    │  under rn.mu:
+    ├─ Verify args.Term >= currentTerm (a higher term is persisted first)
+    ├─ Stay/become Follower, record LeaderID, resetElectionTimer()
     ├─ Consistency check: args.PrevLogIndex/Term matches local log
-    ├─ Append new entries, truncate conflicts
-    ├─ saveState() → raft_state.gob        ← durable persist
-    ├─ Advance commitIndex if LeaderCommit > commitIndex
-    ├─ notifyApplier()                     ← wake applier goroutine
-    ├─ resetElectionTimer()                ← second reset: invalidates stale timer fire
-    └─ reply Success=true
+    ├─ Append new entries, truncate conflicts (durableIndex is lowered below
+    │  a truncation point); enqueue the new records; kick the syncer
+    ├─ commitIndex = min(LeaderCommit, index of the last entry of this request)
+    │  release rn.mu
+    ├─ entries already durable (or a heartbeat, see below) → respond now
+    └─ otherwise park the reply; the syncer answers it once durableIndex
+       covers the request's last entry
 ```
 
-The **two-phase timer reset** around `saveState()` is critical. On slow storage (CI runners, HDDs), `saveState()` can take 200+ ms. During that time the first timer may fire and the ticker goroutine will wait on `rn.mu`. The second `resetElectionTimer()` after `saveState()` increments the **generation counter**, causing the stale timer fire to be silently discarded rather than starting a spurious election.
+A follower **acknowledges an entry only after it is durable**. The syncer writes the queue and fsyncs outside `rn.mu` — heartbeats, RequestVote and further appends are served while it runs, and several AppendEntries that arrive during one fsync share the next one. A parked reply is decided by the syncer (or by any later event that changes the outcome):
+
+- `durableIndex ≥` the request's last index and that entry still has the term it had when accepted → `Success`, `MatchIndex` = that index;
+- the term changed since → `Success=false` with the new term (the old leader steps down);
+- the entry was truncated or replaced (a snapshot install discarded the log, …) → `Success=false` with a conflict hint — **never** a match for entries that are no longer in the log;
+- a failed write/fsync or `Stop` → `Success=false`.
+
+`markDurableLocked(idx, term)` re-checks that the entry at `idx` still has the term it had when the fsync began. By the Log Matching property that is enough: if a newer leader replaced entries while the fsync ran, the term at `idx` differs and the stale report is dropped; the new records wait for their own fsync.
+
+**Heartbeats never wait for an fsync.** A leader of this version sets `AppendEntriesArgs.WantMatch`; the follower answers a heartbeat at once with `MatchIndex = min(PrevLogIndex, durableIndex)` — its log matches the leader's through `PrevLogIndex`, but it only vouches for the durable part. A leader of an older build does not set `WantMatch` and treats `Success` as "durable through `PrevLogIndex + len(Entries)`"; for it the follower answers heartbeats only once that is true (and an older follower, which never sets `HasMatch`, is credited with exactly that), so a mixed-version cluster keeps the rule.
+
+The commit index a follower takes from the leader is capped at the last entry the request verified (Figure 2, step 5). Earlier builds capped it at the follower's whole log, which could commit a stale suffix from an older term that the request had not checked.
 
 ### Leader Election
 
@@ -134,15 +173,29 @@ The new leader persists the no-op and broadcasts it immediately, so it normally 
 
 ### Persistence
 
-Raft state (`CurrentTerm`, `VotedFor`, log entries) is persisted (gob) to `<dataDir>/raft_state.gob` using a **temp-file rename** pattern for atomicity. The server's Raft `dataDir` is `<--data>/raft` (the `--data` flag, even when `--data-dirs` is set).
+Raft state lives in the node's Raft `dataDir` — `<--data>/raft` in the server (the `--data` flag, even when `--data-dirs` is set) — in two files (`consensus/raft_storage.go`):
 
-```
-1. Write to raft_state_<random>.tmp
-2. f.Sync()         ← fsync
-3. os.Rename(tmp, raft_state.gob)  ← atomic on POSIX
-```
+| File | Holds | Written |
+|------|-------|---------|
+| `raft_log.dat` | 8-byte header (`VXRL`, version 1), then one record per entry: `[len u32][crc32c u32][term u64, index u64, type u8, command]` | appended by the syncer: one `write(2)` of everything queued + one fsync per round (a round covers every group-commit batch or AppendEntries queued before it started) |
+| `raft_meta.dat` | `CurrentTerm`, `VotedFor` (CRC-checked) | temp file → fsync → rename → directory fsync, only when term or vote changes |
+| `raft_snapshot.gob` | state-machine snapshot + last included index/term + configuration | temp file → fsync → rename → directory fsync, on compaction / InstallSnapshot |
 
-If the process crashes mid-write, the old `raft_state.gob` is untouched. The new file is only visible after the rename succeeds. The whole log is rewritten on each persist, which is why snapshots matter.
+The cost of a commit is the new records plus one fsync, whatever the length of the retained log. Before 2026-10 every flush gob-encoded and fsynced the **whole** retained log into `raft_state.gob` (up to 8,192 entries — about 8 MB per flush with ~1 KB YCSB values), which held a local 3-node raft YCSB load to ~58 inserts/s; `TestRaftPersist_BytesPerFlushIndependentOfLogLength` pins the new behaviour (1,049 bytes per single-entry flush at 100 and at 8,085 entries; the old format wrote 143 KB and 8.4 MB).
+
+What is durable before what:
+
+- **Entries.** Log records are encoded into the write queue under `rn.mu`, so the file order is the log order; the syncer's `write(2)` and fsync run outside the lock (on APFS a `write(2)` blocks while an `F_FULLFSYNC` of the same file runs, so it must not sit under `rn.mu` either). A follower acknowledges entries only once they are durable (see the follower write path); the leader counts itself toward a commit quorum only up to `durableIndex` — the last index its own fsync covered — so entries shipped to followers before the leader's fsync finishes cannot commit on the strength of an unsynced leader copy.
+- **Failed write or fsync** is sticky: the store refuses every later write until the node restarts (after a failed fsync the kernel may have dropped the dirty pages). A follower drops its non-durable suffix from memory and answers `Success=false`; a leader keeps its log (its entries may already be on followers, and an index must never be reused for a different entry of the same term) and fails the `Submit` calls it cannot vouch for with `persist log: …` — they may still commit through the followers.
+- **Term and vote** are written before the node acts on them: before granting a vote, before soliciting votes, and before answering an RPC that raised its term. If the write fails the vote is not granted and the RPC is not acknowledged.
+- **Truncation.** There is no truncate record: replay treats a record whose index is ≤ the last replayed index as "drop everything from this index, then append". A follower that overwrites a conflicting suffix therefore supersedes it with the first new record; a crash before that record is complete leaves the old suffix, i.e. the state before the AppendEntries, which was never acknowledged.
+- **Torn tail.** Replay stops at the first record with a short read, an impossible length or a CRC mismatch; the file is truncated to the last good record and fsynced before anything is appended (otherwise later records would sit behind the garbage and be lost on the next restart).
+- **Compaction.** After the snapshot file is durable, `raft_log.dat` is rewritten to the retained suffix (temp → fsync → rename → dir fsync). A crash in between leaves the longer file; its snapshot-covered prefix is dropped on load (and the file rewritten).
+- On load `CurrentTerm` is raised to the last log term if it is lower (cannot happen with the write order above; it guards a damaged or hand-restored directory).
+
+**Migration from `raft_state.gob`.** A `dataDir` that has the old whole-state `raft_state.gob` and no `raft_meta.dat` is converted on startup: `raft_log.dat` first, `raft_meta.dat` last (the commit point — a crash before it simply re-runs the migration from the old file), then `raft_state.gob` is renamed to `raft_state.gob.migrated`. The log prints `[raft] migrated …`. Nothing else is needed.
+
+**Rollback.** A build from before this change does not read `raft_log.dat` / `raft_meta.dat`. Started on a migrated directory it finds no `raft_state.gob` and comes up at term 0 with an empty log — it can then vote twice in a term and forget entries it acknowledged, so **do not just start the old binary on the directory**. To downgrade a node: stop it, delete its whole `--data` directory (Raft state and storage engine — re-applying the log onto existing storage would re-run non-idempotent ops such as INCR), start the older build with the same `--node-id` / `--peers`, and let it catch up from the leader (InstallSnapshot or log replay). Do it one node at a time with a healthy leader and the other two nodes up. Renaming `raft_state.gob.migrated` back is only safe if the node has accepted no entry and no term change since the upgrade, which you normally cannot know.
 
 Once the retained log reaches `SnapshotThreshold` entries (default 8192) and the state machine implements `SnapshotStateMachine` (the server's `raftFSM` does), the applied prefix is replaced by a snapshot in `<dataDir>/raft_snapshot.gob` (same temp-file + fsync + rename pattern). On restart the snapshot is restored before the log tail is replayed; a follower that needs compacted entries receives one single-shot `InstallSnapshot` RPC. Limits of the server snapshot: it is the whole live keyspace as key/value pairs, capped at 256 MB (a larger one is skipped with `snapshot too large ... skipping compaction`, and the log keeps growing), and TTLs are not preserved — restored keys become immortal.
 
@@ -152,9 +205,12 @@ Raft state is separate from the storage engine's own WAL, which each node replay
 
 | Constant | Value | Why |
 |----------|-------|-----|
-| `electionTimeoutMin` | 400 ms | Must exceed `saveState()` worst-case duration (~200 ms on CI) plus margin |
+| `electionTimeoutMin` | 400 ms | Heartbeats no longer wait behind a follower fsync; still well above the 50 ms heartbeat |
 | `electionTimeoutMax` | 800 ms | Spread reduces collision probability in 3-node clusters |
-| `heartbeatInterval` | 50 ms | Must be << `electionTimeoutMin`; leader sends heartbeat every 50 ms |
+| `heartbeatInterval` | 50 ms | Must be << `electionTimeoutMin`; leader sends heartbeat every 50 ms (outside the pipeline window) |
+| `DefaultPipelineWindow` | 8 | Entry-carrying AppendEntries in flight per follower with `--raft-pipeline` (`Options.PipelineWindow`); 1 without it (the default) |
+| `maxAppendEntries` / `maxAppendBytes` | 1024 / 4 MiB | Upper bound of one AppendEntries |
+| `rpcCallTimeout` | 5 s | An unanswered request fails, its stream is closed and re-dialled |
 
 ---
 
@@ -309,3 +365,10 @@ The two layers are alternatives, not a stack: `buildCoordinator` builds either a
 ```
 
 Raft mode gives **linearizable writes**; reads are local (possibly stale on followers) unless `--linearizable-reads`. Replicated mode gives **eventual consistency** by default, or N-copy durability before the ACK with `quorum`/`strong`.
+
+### Partition migration and the two modes
+
+Partition migration (`TransferAgent.MigrateToNewOwners`, `docs/partitioning.md`) writes and deletes keys on the local engine directly, outside both the Raft log and the replication stream, so it is restricted (invariant 62):
+
+- **`--mode=raft`: never.** Every node applies the whole log and holds every key. `cmd/server` marks the transfer agent raft-managed: `--auto-rebalance` is a no-op (logged at startup), `MigrateToNewOwners` returns `ErrMigrationRaftMode` without touching data, and inbound `/transfer/keys` batches are refused with HTTP 403. Raft membership changes go through `RaftNode.AddServer` / `RemoveServer`; a new member is filled by `AppendEntries` / `InstallSnapshot`, not by migration. Before this rule, killing the leader of a 3-node raft cluster loaded with 20,000 keys left the survivors with 5,435 and 7,875 keys: every node had sent each key to its single ring owner and deleted it locally.
+- **`--mode=replicated`: only on membership changes, and RF-aware.** A node keeps every key it is one of the RF replicas of (`GetReplicasForKey`), copies a key to replicas that newly need it, and deletes a key only when it is no longer among the key's replicas and every current replica acknowledged it. A node failure or recovery is a state change, not a membership change, and moves nothing — catching a recovered replica up is the replication engine's job (Replica Recovery above). With 3 nodes and RF=3 nothing ever moves. Note that the server's replication engine sends every write to every peer, so in `cmd/server` every replicated node holds every key regardless of RF; and the server's membership is static, so its auto-rebalancer never actually migrates.

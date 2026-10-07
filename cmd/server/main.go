@@ -245,9 +245,16 @@ func main() {
 	linReadsFlag := flag.Bool("linearizable-reads", false,
 		"Raft mode: serve GET through the ReadIndex fence (quorum-confirmed, never stale).\n"+
 			"\tCosts one heartbeat round-trip per read; followers redirect to the leader.")
+	raftPipeline := flag.Bool("raft-pipeline", envBool("VELTRIX_RAFT_PIPELINE", false),
+		"Raft mode: pipelined replication (env VELTRIX_RAFT_PIPELINE). Default false.\n"+
+			"\tfalse: one AppendEntries in flight per follower, sent once per leader fsync.\n"+
+			"\ttrue: up to 8 in flight, sent before the leader's own fsync — faster when every\n"+
+			"\tnode has its own disk, slower when nodes share one (3 local nodes on a Mac:\n"+
+			"\t~600 vs ~1,050 loads/s). Durability is the same. Off until measured on separate hosts.")
 	autoRebalance := flag.Bool("auto-rebalance", true,
-		"In distributed modes, automatically rebalance the partition ring and migrate\n"+
-			"\tkeys to their new owners when nodes join, leave, or fail.")
+		"Replicated mode: when a node is added to or removed from the membership, rebalance\n"+
+			"\tthe ring and copy keys to their new RF replicas (a key leaves a node only after\n"+
+			"\tevery replica acked it). Node failure/recovery moves nothing. No-op in --mode=raft.")
 	searchFanoutFlag := flag.Bool("search-fanout", true,
 		"In distributed modes, run vector / text / hybrid searches on every node and\n"+
 			"\tmerge (needed once a rebalance has partitioned the keys). false = local only.")
@@ -647,6 +654,8 @@ func main() {
 			tlsKey:      *clusterTLSKey,
 			tlsCA:       *clusterTLSCA,
 			mutual:      *clusterMTLS,
+
+			raftPipeline: *raftPipeline,
 		})
 		if cerr != nil {
 			log.Fatalf("cluster setup: %v", cerr)
@@ -658,6 +667,9 @@ func main() {
 	coord.pm = pm
 	if coord.localID == "" {
 		coord.localID = *nodeID
+	}
+	if *raftPipeline && deploy != modeRaft {
+		log.Printf("[server] --raft-pipeline has no effect outside --mode=raft")
 	}
 	if *linReadsFlag {
 		if deploy != modeRaft {
@@ -714,12 +726,11 @@ func main() {
 		for _, pr := range peers {
 			pm.SetNodeTransferAddr(pr.id, deriveAddr(pr.clientAddr, offTransfer))
 		}
-		if *autoRebalance {
-			stopRebalancer := startAutoRebalancer(pm, ta, *nodeID)
-			defer stopRebalancer()
+		// Raft mode: migration disabled outright (invariant 62).
+		stopRebalancer := setupRebalancer(deploy, pm, ta, *nodeID, *autoRebalance)
+		defer stopRebalancer()
+		if *autoRebalance && deploy != modeRaft {
 			log.Printf("[rebalance] auto-rebalance enabled  transfer=%s  debounce=%s", tAddr, rebalanceDebounce)
-		} else {
-			log.Printf("[rebalance] auto-rebalance disabled (--auto-rebalance=false); transfer agent listening on %s", tAddr)
 		}
 	}
 
@@ -3596,4 +3607,19 @@ func printBanner(addr, nodeID, dataDir string, diskPaths []string) {
 		fmt.Printf("  data    : %s\n", dataDir)
 	}
 	fmt.Println()
+}
+
+// envBool reads a boolean environment variable used as a flag default
+// (1/0/true/false/…, strconv.ParseBool); unset or empty gives def, anything
+// else is a startup error.
+func envBool(name string, def bool) bool {
+	v := os.Getenv(name)
+	if v == "" {
+		return def
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		log.Fatalf("config: %s=%q is not a boolean", name, v)
+	}
+	return b
 }

@@ -520,10 +520,19 @@ term/leader, peers, partition epoch, and per-replica replication lag.
   `@vecns/` namespace settings are copied to every node rather than moved.
 - Raft reads: local by default; linearizable via `--linearizable-reads`
   (ReadIndex fence).
-- **Auto-rebalance is wired** (`cmd/server/rebalancer.go`): membership
-  events (join/leave/fail) trigger ring rebalance + physical key migration
-  through the TransferAgent (transfer HTTP listener on clientPort+5;
-  disable with `--auto-rebalance=false`).
+- Raft replication: one AppendEntries in flight per follower, sent once per
+  leader fsync (default); `--raft-pipeline` (env `VELTRIX_RAFT_PIPELINE`)
+  keeps up to 8 in flight and sends before the leader's fsync. Off by
+  default because it measured slower with nodes sharing one disk and is not
+  yet measured on separate hosts (docs/replication.md).
+- **Auto-rebalance is wired** (`cmd/server/rebalancer.go`), replicated mode
+  only: membership changes (node added / removed) trigger ring rebalance +
+  RF-aware key migration through the TransferAgent (transfer HTTP listener
+  on clientPort+5; disable with `--auto-rebalance=false`). A key is copied
+  to replicas that newly need it and deleted on a node only when that node
+  left the key's replica set and every replica acknowledged it. Node state
+  changes (failure / recovery) never migrate, and raft mode never migrates
+  at all (every node holds the full state machine) — invariant 62.
 - Cross-region replication: `cmd/repl-ship` tails `/admin/cdc` live and,
   with `--checkpoint`, replays missed writes (including deletes) through the
   durable `/admin/changes` catch-up feed on restart — zero-loss at

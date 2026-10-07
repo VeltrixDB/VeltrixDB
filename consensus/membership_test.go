@@ -36,7 +36,7 @@ func configServers(n *RaftNode) []string {
 // quorum participant — with one original follower partitioned, commits
 // require the new node's acknowledgement (3 of 4).
 func TestMembership_AddServer(t *testing.T) {
-	c := newSnapCluster(t, 3, Options{})
+	c := newSnapCluster(t, 3, testOpts(Options{}))
 	if waitForStableLeader(c.nodes, 5*time.Second) < 0 {
 		t.Fatal("no stable leader")
 	}
@@ -47,7 +47,7 @@ func TestMembership_AddServer(t *testing.T) {
 	// Start the 4th node (bootstrap peers = the existing cluster).
 	newID := t.Name() + "-node-3"
 	sm4 := &mockSnapSM{}
-	node4, err := NewRaftNodeWithOptions(newID, c.ids, t.TempDir(), sm4, c.hub.forNode(newID), Options{})
+	node4, err := NewRaftNodeWithOptions(newID, c.ids, t.TempDir(), sm4, c.hub.forNode(newID), testOpts(Options{}))
 	if err != nil {
 		t.Fatalf("new node: %v", err)
 	}
@@ -109,7 +109,7 @@ func TestMembership_AddServer(t *testing.T) {
 // receiving entries, and the shrunken cluster (quorum 2 of 2) keeps
 // committing.
 func TestMembership_RemoveServer(t *testing.T) {
-	c := newSnapCluster(t, 3, Options{})
+	c := newSnapCluster(t, 3, testOpts(Options{}))
 	li := waitForStableLeader(c.nodes, 5*time.Second)
 	if li < 0 {
 		t.Fatal("no stable leader")
@@ -159,7 +159,7 @@ func TestMembership_RemoveServer(t *testing.T) {
 // leading until the removal commits, then steps down; the remaining servers
 // elect a new leader.
 func TestMembership_LeaderSelfRemoval(t *testing.T) {
-	c := newSnapCluster(t, 3, Options{})
+	c := newSnapCluster(t, 3, testOpts(Options{}))
 	if waitForStableLeader(c.nodes, 5*time.Second) < 0 {
 		t.Fatal("no stable leader")
 	}
@@ -225,7 +225,7 @@ func TestMembership_LeaderSelfRemoval(t *testing.T) {
 // TestMembership_RejectConcurrentChange: a second configuration change is
 // rejected while the first is still uncommitted.
 func TestMembership_RejectConcurrentChange(t *testing.T) {
-	c := newSnapCluster(t, 3, Options{})
+	c := newSnapCluster(t, 3, testOpts(Options{}))
 	li := waitForStableLeader(c.nodes, 5*time.Second)
 	if li < 0 {
 		t.Fatal("no stable leader")

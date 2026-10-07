@@ -18,6 +18,9 @@ func TestAutoRebalancer_MigratesOnNodeJoin(t *testing.T) {
 	}
 
 	cfg := cluster.DefaultClusterConfig()
+	// RF=1: one replica per key, so a join MOVES keys (with RF >= node
+	// count every node is a replica and a join only copies).
+	cfg.ReplicationFactor = 1
 
 	// Node 1: the pre-existing node holding all keys.
 	pm1 := cluster.NewPartitionMap(cfg)

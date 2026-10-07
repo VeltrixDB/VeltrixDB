@@ -4,6 +4,7 @@ go 1.25.0
 
 require (
 	github.com/VeltrixDB/veltrixdb v0.0.0
+	github.com/gocql/gocql v0.0.0-20181124151448-70385f88b28b
 	github.com/magiconair/properties v1.8.0
 	github.com/pingcap/go-ycsb v1.0.3
 )
@@ -11,7 +12,6 @@ require (
 require (
 	github.com/HdrHistogram/hdrhistogram-go v1.1.2 // indirect
 	github.com/aerospike/aerospike-client-go v1.35.2 // indirect
-	github.com/gocql/gocql v0.0.0-20181124151448-70385f88b28b // indirect
 	github.com/golang/snappy v0.0.4 // indirect
 	github.com/google/go-cmp v0.7.0 // indirect
 	github.com/hailocab/go-hostpool v0.0.0-20160125115350-e80d13ce29ed // indirect

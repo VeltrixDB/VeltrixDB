@@ -88,7 +88,11 @@ func TestTransferAuth_SignedRequestsOnly(t *testing.T) {
 // TestTransferAuth_MigrationSigned: key migration between two agents sharing
 // a secret still works (sendBatches signs its requests).
 func TestTransferAuth_MigrationSigned(t *testing.T) {
-	pm := NewPartitionMap(DefaultClusterConfig())
+	// RF=1: each key has one replica, so keys owned by dst move (with RF >=
+	// node count every node is a replica and keys are only copied).
+	cfg := DefaultClusterConfig()
+	cfg.ReplicationFactor = 1
+	pm := NewPartitionMap(cfg)
 	_ = pm.AddNode("src", "127.0.0.1", 7311)
 	secret := []byte("migration-secret-0123456789")
 	srcStore, dstStore := newMemStore(), newMemStore()

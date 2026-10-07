@@ -5,8 +5,8 @@ package consensus
 // When the retained log reaches Options.SnapshotThreshold entries and the
 // state machine implements SnapshotStateMachine, the applier goroutine
 // captures a snapshot at lastApplied, persists it to
-// <dataDir>/raft_snapshot.gob with the same atomic temp-file + fsync + rename
-// discipline as writeStateFile, and truncates the applied log prefix.
+// <dataDir>/raft_snapshot.gob (atomic temp-file + fsync + rename), truncates
+// the applied log prefix, and rewrites raft_log.dat to the retained suffix.
 // lastIncludedIndex/Term then act as the "virtual log head" for AppendEntries
 // consistency checks and election up-to-date comparisons (see the log helpers
 // in raft.go).
@@ -74,8 +74,9 @@ func (rn *RaftNode) snapshotPath() string {
 	return filepath.Join(rn.dataDir, "raft_snapshot.gob")
 }
 
-// writeSnapshotFile persists snap atomically: temp file → fsync → rename.
-// Same durability discipline as writeStateFile.
+// writeSnapshotFile persists snap atomically: temp file → fsync → rename →
+// directory fsync (the rename must be durable before the log is rewritten
+// without the covered prefix).
 func (rn *RaftNode) writeSnapshotFile(snap snapshotFile) error {
 	f, err := os.CreateTemp(rn.dataDir, "raft_snapshot_*.tmp")
 	if err != nil {
@@ -93,7 +94,11 @@ func (rn *RaftNode) writeSnapshotFile(snap snapshotFile) error {
 		return err
 	}
 	f.Close()
-	return os.Rename(tmp, rn.snapshotPath())
+	if err := os.Rename(tmp, rn.snapshotPath()); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	return syncDir(rn.dataDir)
 }
 
 // readSnapshotFile loads the persisted snapshot.  ok=false means no snapshot
@@ -216,7 +221,9 @@ func (rn *RaftNode) takeSnapshot(ssm SnapshotStateMachine) {
 		return
 	}
 
-	// Truncate the covered prefix and persist the shrunken log.
+	// Truncate the covered prefix and rewrite the log file to the retained
+	// suffix (one O(retained) rewrite per compaction; a failure leaves the
+	// longer file, whose covered prefix loadState drops).
 	rn.mu.Lock()
 	if idx > rn.lastIncludedIndex {
 		first := rn.logFirstIndex()
@@ -232,7 +239,7 @@ func (rn *RaftNode) takeSnapshot(ssm SnapshotStateMachine) {
 		rn.lastIncludedTerm = term
 		rn.baseConfig = cfg.clone()
 		rn.baseConfigIndex = cfgIdx
-		_ = rn.saveState()
+		_ = rn.rewriteLogLocked()
 		log.Printf("[raft] node=%s snapshot taken  idx=%d term=%d retained_log=%d",
 			rn.id, idx, term, len(rn.ps.Log))
 	}
@@ -240,7 +247,8 @@ func (rn *RaftNode) takeSnapshot(ssm SnapshotStateMachine) {
 }
 
 // sendSnapshot ships the persisted snapshot to a follower whose nextIndex
-// predates the log start.  Called from broadcastAppendEntries without rn.mu.
+// predates the log start.  Called from the peer's replicator (pipeline.go)
+// without rn.mu, once that peer's pipeline has drained.
 // snapInFlight ensures at most one in-flight InstallSnapshot per peer.
 func (rn *RaftNode) sendSnapshot(peer string, term uint64) {
 	rn.mu.Lock()
@@ -313,6 +321,9 @@ func (rn *RaftNode) HandleInstallSnapshot(args InstallSnapshotArgs) InstallSnaps
 	}
 	if args.Term > rn.ps.CurrentTerm {
 		rn.becomeFollower(args.Term)
+		if rn.persistMetaLocked() != nil {
+			return reply
+		}
 	}
 	rn.role = RoleFollower
 	rn.currentRole.Store(int32(RoleFollower))
@@ -369,7 +380,7 @@ func (rn *RaftNode) HandleInstallSnapshot(args InstallSnapshotArgs) InstallSnaps
 	rn.baseConfig = args.Config.clone()
 	rn.baseConfigIndex = args.ConfigIndex
 	rn.refreshConfigFromLog()
-	_ = rn.saveState()
+	_ = rn.rewriteLogLocked()
 	rn.resetElectionTimer() // second reset: the restore above may have been slow
 
 	log.Printf("[raft] node=%s installed snapshot from %s  idx=%d term=%d retained_log=%d",

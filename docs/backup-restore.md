@@ -495,7 +495,7 @@ Check these after every backup run:
 
 | Item | Why Excluded | Recovery |
 |------|-------------|----------|
-| Raft state (`raft_state.gob`, `raft_snapshot.gob`) | Cluster state; not needed for single-node restore | Recreated on startup |
+| Raft state (`raft_log.dat`, `raft_meta.dat`, `raft_snapshot.gob`; `raft_state.gob` before 2026-10) | Cluster state; not needed for single-node restore | Recreated on startup |
 | In-memory LIRS cache | Volatile by design | Cache warms up after restart |
 | Bloom filters | Rebuilt from index on startup | Automatic |
 | Segment file (`seg_active.dat`) | Superseded by WAL+VLog | Not needed |

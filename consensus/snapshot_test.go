@@ -112,7 +112,7 @@ func TestSnapshot_TakenTruncatedAndRestart(t *testing.T) {
 	dir := t.TempDir()
 	hub := newMockTransport()
 	sm := &mockSnapSM{}
-	node, err := NewRaftNodeWithOptions(id, nil, dir, sm, hub.forNode(id), Options{SnapshotThreshold: 8})
+	node, err := NewRaftNodeWithOptions(id, nil, dir, sm, hub.forNode(id), testOpts(Options{SnapshotThreshold: 8}))
 	if err != nil {
 		t.Fatalf("NewRaftNodeWithOptions: %v", err)
 	}
@@ -171,7 +171,7 @@ func TestSnapshot_TakenTruncatedAndRestart(t *testing.T) {
 	// must be restored and the log tail replayed.
 	sm2 := &mockSnapSM{}
 	hub2 := newMockTransport()
-	node2, err := NewRaftNodeWithOptions(id, nil, dir, sm2, hub2.forNode(id), Options{SnapshotThreshold: 8})
+	node2, err := NewRaftNodeWithOptions(id, nil, dir, sm2, hub2.forNode(id), testOpts(Options{SnapshotThreshold: 8}))
 	if err != nil {
 		t.Fatalf("restart: %v", err)
 	}
@@ -211,7 +211,7 @@ func TestSnapshot_TakenTruncatedAndRestart(t *testing.T) {
 // catch up via InstallSnapshot — verify it receives the snapshot and the full
 // state.
 func TestSnapshot_InstallSnapshotCatchUp(t *testing.T) {
-	c := newSnapCluster(t, 3, Options{SnapshotThreshold: 6})
+	c := newSnapCluster(t, 3, testOpts(Options{SnapshotThreshold: 6}))
 
 	if waitForStableLeader(c.nodes, 5*time.Second) < 0 {
 		t.Fatal("no stable leader")

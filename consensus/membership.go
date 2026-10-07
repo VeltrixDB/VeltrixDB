@@ -87,6 +87,8 @@ func (rn *RaftNode) setConfig(cfg Configuration, index uint64) {
 	}
 	rn.peers = peers
 	rn.removed.Store(!cfg.contains(rn.id))
+	// A leader starts / stops per-peer replicators for added / removed peers.
+	rn.syncReplicatorsLocked()
 }
 
 // refreshConfigFromLog re-derives the effective configuration: the latest
@@ -171,7 +173,8 @@ func (rn *RaftNode) RemoveServer(id string) error {
 }
 
 // changeConfig appends one EntryConfig entry produced by mutate and waits for
-// it to commit.  Mirrors Submit's persist-outside-the-lock discipline.
+// it to commit.  Mirrors flushBatch: the record is enqueued under rn.mu, the
+// syncer writes + fsyncs it outside the lock while the replicators ship it.
 func (rn *RaftNode) changeConfig(mutate func(Configuration) (Configuration, bool)) error {
 	rn.mu.Lock()
 	if rn.role != RoleLeader {
@@ -194,20 +197,21 @@ func (rn *RaftNode) changeConfig(mutate func(Configuration) (Configuration, bool
 		rn.mu.Unlock()
 		return fmt.Errorf("encode configuration: %w", err)
 	}
-	entry, ch, psCopy := rn.appendLocked(EntryConfig, cmd)
-	// The new configuration takes effect NOW (append time, dissertation §4.1).
+	entry, ch := rn.appendEntryLocked(EntryConfig, cmd)
+	if err := rn.store.enqueue([]LogEntry{entry}); err != nil {
+		rn.ps.Log = rn.ps.Log[:len(rn.ps.Log)-1] // nobody has seen it yet
+		delete(rn.waiters, entry.Index)
+		rn.mu.Unlock()
+		return fmt.Errorf("persist log: %w", err)
+	}
+	// The new configuration takes effect NOW (append time, dissertation §4.1);
+	// setConfig starts a replicator for an added peer.
 	rn.setConfig(newCfg, entry.Index)
 	log.Printf("[raft] node=%s config change appended idx=%d servers=%v",
 		rn.id, entry.Index, newCfg.Servers)
-	rn.maybeAdvanceCommit()
+	rn.kickSyncerLocked()
+	rn.kickReplicatorsOnAppendLocked()
 	rn.mu.Unlock()
-
-	if err := rn.writeStateFile(psCopy); err != nil {
-		rn.removeWaiter(entry.Index, ch)
-		return fmt.Errorf("persist log: %w", err)
-	}
-
-	go rn.broadcastAppendEntries()
 
 	return rn.waitApplied(entry.Index, ch)
 }

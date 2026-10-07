@@ -68,15 +68,17 @@ func (rn *RaftNode) ReadIndex(timeout time.Duration) (uint64, error) {
 	acks := int64(1) // self
 	acked := make(chan struct{}, len(peers))
 	for _, peer := range peers {
-		rn.bgWG.Add(1)
-		go func(peer string) {
-			defer rn.bgWG.Done()
+		peer := peer
+		rn.spawn(func() {
+			// WantMatch: the follower answers at once, without waiting for an
+			// in-flight fsync (only the term matters here).
 			args := AppendEntriesArgs{
 				Term:         term,
 				LeaderID:     rn.id,
 				PrevLogIndex: lastIdx,
 				PrevLogTerm:  prevTerm,
 				LeaderCommit: commit,
+				WantMatch:    true,
 			}
 			reply, err := rn.transport.SendAppendEntries(peer, args)
 			if err != nil {
@@ -92,7 +94,7 @@ func (rn *RaftNode) ReadIndex(timeout time.Duration) (uint64, error) {
 			}
 			atomic.AddInt64(&acks, 1)
 			acked <- struct{}{}
-		}(peer)
+		})
 	}
 
 	for atomic.LoadInt64(&acks) < int64(quorum) {

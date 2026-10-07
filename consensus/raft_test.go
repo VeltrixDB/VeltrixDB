@@ -202,7 +202,8 @@ func newTestCluster(t *testing.T, n int) ([]*RaftNode, *mockTransport) {
 
 		dir := t.TempDir()
 		sm := &mockSM{}
-		node, err := NewRaftNode(ids[i], peers, dir, sm, transport)
+		node, err := NewRaftNodeWithOptions(ids[i], peers, dir, sm, transport,
+			testOpts(Options{SnapshotThreshold: DefaultSnapshotThreshold}))
 		if err != nil {
 			t.Fatalf("NewRaftNode(%s): %v", ids[i], err)
 		}
@@ -406,7 +407,7 @@ func TestRaft_TermAdvancement(t *testing.T) {
 	transport := newMockTransport()
 	dir := t.TempDir()
 	sm := &mockSM{}
-	node, err := NewRaftNode("stale-ta", []string{}, dir, sm, transport)
+	node, err := newTestNode("stale-ta", []string{}, dir, sm, transport)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -448,7 +449,7 @@ func TestRaft_PersistenceOnRestart(t *testing.T) {
 			}
 		}
 		sm := &mockSM{}
-		n, err := NewRaftNode(nodeIDs[i], peers, t.TempDir(), sm, transport)
+		n, err := newTestNode(nodeIDs[i], peers, t.TempDir(), sm, transport)
 		if err != nil {
 			t.Fatalf("NewRaftNode(%s): %v", nodeIDs[i], err)
 		}
@@ -497,7 +498,7 @@ func TestRaft_PersistenceOnRestart(t *testing.T) {
 	// Restart only the leader node from its persisted dataDir.
 	transport2 := newMockTransport()
 	sm2 := &mockSM{}
-	node2, err := NewRaftNode(leaderID, leaderPeers, leaderDir, sm2, transport2)
+	node2, err := newTestNode(leaderID, leaderPeers, leaderDir, sm2, transport2)
 	if err != nil {
 		t.Fatalf("restart NewRaftNode: %v", err)
 	}
