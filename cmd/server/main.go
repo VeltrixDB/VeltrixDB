@@ -179,6 +179,13 @@ func main() {
 	pprofAddr := flag.String("pprof-addr", "",
 		"Serve CPU/heap/goroutine/trace profiles (pprof format) on this address (e.g. 127.0.0.1:6060). Empty (default) = off.\n"+
 			"\tOn its own mux, never the metrics port: profiles expose internals.")
+	pprofMutexFraction := flag.Int("pprof-mutex-fraction", 0,
+		"With --pprof-addr: sample 1 in N mutex contention events for /debug/pprof/mutex\n"+
+			"\t(runtime.SetMutexProfileFraction). 0 (default) = off, so that profile stays empty; 5–100 is typical.")
+	pprofBlockRate := flag.Int("pprof-block-rate", 0,
+		"With --pprof-addr: record blocking events of at least this many nanoseconds for\n"+
+			"\t/debug/pprof/block (runtime.SetBlockProfileRate). 0 (default) = off; 10000 (10 µs) is a\n"+
+			"\treasonable start. Costs CPU on every blocking operation while on — enable for a diagnosis, not permanently.")
 	adminToken := flag.String("admin-token", os.Getenv("VELTRIX_ADMIN_TOKEN"), "Bearer token required for /admin/* endpoints (env VELTRIX_ADMIN_TOKEN).\n\tWhen empty, /admin/* only accepts loopback connections; /metrics, /healthz and /readyz are always unauthenticated.")
 	dataDir := flag.String("data", "./veltrixdb-data", "Single data directory (WAL + segments). Ignored when --data-dirs is set.")
 	dataDirs := flag.String("data-dirs", "", "Comma-separated NVMe mount paths, one per disk.\n\tExample: --data-dirs=/mnt/nvme0,/mnt/nvme1,...,/mnt/nvme7\n\tEach disk gets its own segment writer and compaction goroutine.\n\tEach disk also gets its own WAL and VLog. Overrides --data when set.")
@@ -467,7 +474,10 @@ func main() {
 	var engineReady atomic.Bool
 	var engineForHealth atomic.Value // *storage.StorageEngine, set after init
 	if *pprofAddr != "" {
+		enableContentionProfiles(*pprofMutexFraction, *pprofBlockRate)
 		go servePprof(*pprofAddr)
+	} else if *pprofMutexFraction != 0 || *pprofBlockRate != 0 {
+		log.Printf("[pprof] --pprof-mutex-fraction / --pprof-block-rate ignored: --pprof-addr is not set")
 	}
 
 	healthMux := http.NewServeMux()

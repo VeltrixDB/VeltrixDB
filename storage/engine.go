@@ -977,6 +977,11 @@ func (se *StorageEngine) get(key string, mode getMode) (_ []byte, needIO bool, _
 		span.SetAttribute("key.size", len(key))
 	}
 
+	// Hash once and reuse it for cache routing, index routing, the bloom
+	// probe and the striped read counters. Each of those used to hash the
+	// key independently.
+	h := fnv64a(key)
+
 	start := time.Now()
 	defer func() {
 		// A GetNoIO that stops for disk records nothing: GetAfterNoIO records
@@ -984,7 +989,7 @@ func (se *StorageEngine) get(key string, mode getMode) (_ []byte, needIO bool, _
 		if needIO {
 			return
 		}
-		se.metrics.Reads.Add(1)
+		se.metrics.Reads.AddAt(h, 1)
 		elapsed := time.Since(start)
 		ns := elapsed.Nanoseconds()
 		se.metrics.ObserveReadLatency(elapsed.Seconds())
@@ -1032,10 +1037,6 @@ func (se *StorageEngine) get(key string, mode getMode) (_ []byte, needIO bool, _
 		}
 	}()
 
-	// Hash once and reuse it for cache routing, index routing and the bloom
-	// probe. Each of those used to hash the key independently.
-	h := fnv64a(key)
-
 	// Step 1: LIRS cache.
 	var (
 		value []byte
@@ -1063,12 +1064,12 @@ func (se *StorageEngine) get(key string, mode getMode) (_ []byte, needIO bool, _
 	}
 	if hit {
 		if mode != getAfterNoIO { // GetNoIO already counted this key's cache miss
-			se.metrics.CacheHits.Add(1)
+			se.metrics.CacheHits.AddAt(h, 1)
 		}
 		return value, false, nil
 	}
 	if mode != getAfterNoIO {
-		se.metrics.CacheMisses.Add(1)
+		se.metrics.CacheMisses.AddAt(h, 1)
 	}
 
 	// Step 2: Index Vault. The shardedIndex.get() call already does a bloom

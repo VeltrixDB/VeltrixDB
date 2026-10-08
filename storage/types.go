@@ -253,13 +253,13 @@ type EvictionMetrics struct {
 
 type StorageMetrics struct {
 	Writes              *atomic.Uint64
-	Reads               *atomic.Uint64
+	Reads               *StripedCounter // bumped by every Get — striped, see striped_counter.go
 	Deletes             *atomic.Uint64
 	WritesLatencyNs     *atomic.Int64
 	ReadsLatencyNs      *atomic.Int64
 	DeletesLatencyNs    *atomic.Int64
-	CacheHits           *atomic.Uint64
-	CacheMisses         *atomic.Uint64
+	CacheHits           *StripedCounter
+	CacheMisses         *StripedCounter
 	BloomFilterFalsePos *atomic.Uint64
 	BloomFilterSkipped  *atomic.Uint64 // negative Gets shortcut by the bloom filter
 	CompactionRuns      *atomic.Uint64
@@ -367,13 +367,13 @@ type VLogStats struct {
 func newStorageMetrics() *StorageMetrics {
 	return &StorageMetrics{
 		Writes:              &atomic.Uint64{},
-		Reads:               &atomic.Uint64{},
+		Reads:               &StripedCounter{},
 		Deletes:             &atomic.Uint64{},
 		WritesLatencyNs:     &atomic.Int64{},
 		ReadsLatencyNs:      &atomic.Int64{},
 		DeletesLatencyNs:    &atomic.Int64{},
-		CacheHits:           &atomic.Uint64{},
-		CacheMisses:         &atomic.Uint64{},
+		CacheHits:           &StripedCounter{},
+		CacheMisses:         &StripedCounter{},
 		BloomFilterFalsePos: &atomic.Uint64{},
 		BloomFilterSkipped:  &atomic.Uint64{},
 		CompactionRuns:      &atomic.Uint64{},

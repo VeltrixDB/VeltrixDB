@@ -482,7 +482,17 @@ jobs:
       - name: storage tests with cgo enabled
         env:
           VELTRIXDB_URING_BRIDGE: "on"
-        run: CGO_ENABLED=1 go test -timeout 300s -count=1 ./storage/...
+        run: |
+          set -o pipefail
+          CGO_ENABLED=1 go test -timeout 300s -count=1 ./storage/... 2>&1 | tee "$RUNNER_TEMP/storage-cgo.log"
+
+      # The engines log thousands of lines, so a failing test's "--- FAIL" (or
+      # a crash) is buried far above the log's tail. Print just those parts.
+      - name: storage cgo failure summary
+        if: failure()
+        run: |
+          grep -n -E -B2 -A30 -- '--- FAIL|^panic:|signal: |fatal error|SIGSEGV|SIGABRT|test timed out' \
+            "$RUNNER_TEMP/storage-cgo.log" | tail -400 || echo "no failure marker in the log"
 
       - name: full build via scripts/build.sh
         run: VERSION=ci ./scripts/build.sh --output /tmp/dist

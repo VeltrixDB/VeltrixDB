@@ -270,6 +270,7 @@ Other commands: `replication` (from `/admin/cluster`), `cache`, `wal`,
 | `-net` | `go` | Network front-end: `go` \| `cpp` \| `uring` \| `poll` (C++ front-ends are opt-in, experimental, binary subset only, standalone without `-auth-config`) |
 | `-net-threads` | NumCPU | Event loops for the C++ front-end |
 | `-pprof-addr` | — (off) | CPU/heap/trace profiles on a separate listener |
+| `-pprof-mutex-fraction` / `-pprof-block-rate` | `0` (off) | With `-pprof-addr`: fill `/debug/pprof/mutex` (sample 1 in N contention events) and `/debug/pprof/block` (events ≥ N ns); both profiles are empty without them |
 | `-encrypt-at-rest` | `false` | AES-256-GCM (32-byte key via `VELTRIXDB_ENCRYPTION_KEY`, base64, or `-encryption-key-path`) |
 | `-tls-cert` / `-tls-key` / `-tls-ca` | — | TLS certificate and key; `-tls-ca` requires client certs (mTLS) |
 | `-tls-addr` | `:9443` | TLS listener, separate from `-addr`; active only with `-tls-cert` and `-tls-key` |

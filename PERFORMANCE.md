@@ -161,6 +161,9 @@ the Go and C++ front-ends alike.
 
 ```bash
 ./veltrixdb --pprof-addr 127.0.0.1:6060   # CPU / heap / trace profiles, separate listener, off by default
+# add contention profiles for a diagnosis (both empty unless enabled; block costs CPU while on):
+./veltrixdb --pprof-addr 127.0.0.1:6060 --pprof-mutex-fraction 10 --pprof-block-rate 10000
+go tool pprof http://127.0.0.1:6060/debug/pprof/mutex
 ```
 
 ---
