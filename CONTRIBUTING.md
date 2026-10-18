@@ -43,6 +43,10 @@ go run ./cmd/server -addr :9000 -data ./dev-data -cache 256
 ./scripts/bench.sh
 ```
 
+`make help` lists shortcuts for all of this (`make build`, `make run`,
+`make cluster-up`, `make bench-quick`, `make bench-ycsb`, …); see
+[QUICKSTART.md](QUICKSTART.md).
+
 For the full C++ build, CMake plus the io_uring layer (Linux only):
 ```bash
 # Requires liburing, GCC/Clang with C++20 support

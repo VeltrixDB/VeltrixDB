@@ -6,6 +6,7 @@ Technical documentation for VeltrixDB internals.
 
 | Document | What It Covers |
 |----------|---------------|
+| [../QUICKSTART.md](../QUICKSTART.md) | Install, run a local 3-node cluster, benchmark (`make help`) |
 | [../ARCHITECTURE.md](../ARCHITECTURE.md) | **Start here** — system diagram, write/read path sequences, shard routing, durability, admission control, GC tiers, the real C++ boundary |
 | [storage.md](storage.md) | How data is stored: sharding, WAL, VLog, Index Vault, LIRS cache, defragmentation, crash recovery |
 | [replication.md](replication.md) | Raft consensus replication + async Replication Engine; consistency levels; replica recovery; anti-entropy; tombstone watermarks |

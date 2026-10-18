@@ -11,6 +11,18 @@ Releases are cut automatically on every merge to `main` (GitHub release +
 
 ## [Unreleased]
 
+### Documentation
+
+- **One-command install and benchmarks.** New `Makefile`
+  (`make help`): build, run, a local 3-node cluster
+  (`cluster-up` / `cluster-status` / `cluster-down`, raft or replicated,
+  `scripts/local-cluster.sh`), `bench-quick` (`scripts/quick-bench.sh`: a
+  throwaway server, four phases, one table with throughput / P50 / P99 /
+  errors), `bench-ycsb` (YCSB against a throwaway node, no Docker),
+  `bench-ycsb-cluster`, `bench`, `bench-compare` and `bench-gcp` /
+  `bench-gcp-dry-run`. [QUICKSTART.md](QUICKSTART.md) walks through each,
+  plus Kubernetes and how to read laptop numbers.
+
 ### Performance
 
 - **Read counters no longer share one cache line.** `Reads`, `CacheHits` and

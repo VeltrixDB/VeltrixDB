@@ -37,6 +37,12 @@ and Cassandra client libraries, which the database itself does not need).
 
 ## Running it
 
+Shortcuts from the repository root: `make bench-ycsb` (a throwaway local
+node with `START=0 DBS=veltrixdb`, no Docker), `make bench-ycsb-cluster`
+(the 3-node cluster from `make cluster-up`), `make bench-compare` (this
+script with its defaults) and `make bench-gcp PROJECT=…`
+(`gcp-multihost.sh`; `make bench-gcp-dry-run` prints the commands only).
+
 ```bash
 # On the machine under test (Linux, NVMe), with Docker and Go ≥ 1.25:
 export BENCH_DATA=/mnt/nvme0/bench BENCH_CPUS=8 BENCH_MEM=16g

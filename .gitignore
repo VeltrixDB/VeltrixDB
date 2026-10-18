@@ -14,3 +14,8 @@ raft*/
 # Python bytecode
 __pycache__/
 *.pyc
+
+# Makefile / scripts/local-cluster.sh output
+/bin/
+/.local-cluster/
+/.local-ycsb/

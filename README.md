@@ -17,6 +17,9 @@ docker run -p 9000:9000 ghcr.io/veltrixdb/veltrixdb:latest
 echo -e "PUT hello world\nGET hello\nPING" | nc localhost 9000
 ```
 
+**New here? [QUICKSTART.md](QUICKSTART.md)** covers install, a local 3-node
+cluster and every benchmark, one command each (`make help`).
+
 ---
 
 ## Benchmark numbers
@@ -121,9 +124,20 @@ echo -e "PUT hello world\nGET hello\nPING" | nc localhost 9000
 
 ```bash
 # Build from source (macOS and Linux; CGO_ENABLED=0 for a pure-Go build)
-go build ./...
-go run ./cmd/server -addr :9000 -data ./dev-data -cache 256
+make build        # → bin/veltrixdb, bin/veltrix (CLI), bin/loadtest
+make run          # one node on 127.0.0.1:9000, data in ./dev-data
+# (plain Go works too: go run ./cmd/server -addr :9000 -data ./dev-data -cache 256)
 ```
+
+```bash
+# 3-node cluster on this machine, and benchmarks — each one command
+make cluster-up              # raft on :9000/:9010/:9020 (MODE=replicated for the other mode)
+make bench-quick             # ~1 min: MPUT, durable PUT, GET, mixed — one table
+make bench-ycsb              # YCSB A/B/C/F against a throwaway node, no Docker
+make bench-ycsb-cluster      # YCSB against the running 3-node cluster
+```
+
+Every target, what it needs and how to read the numbers: [QUICKSTART.md](QUICKSTART.md).
 
 ```bash
 # 8-disk production setup
@@ -530,6 +544,7 @@ See [docs/redis-comparison.md](docs/redis-comparison.md) for a full feature-by-f
 
 | | |
 |--|--|
+| [QUICKSTART.md](QUICKSTART.md) | Install, local 3-node cluster and every benchmark, one command each |
 | [ARCHITECTURE.md](ARCHITECTURE.md) | System design: sharding, write path, read path, admission control |
 | [PERFORMANCE.md](PERFORMANCE.md) | Tuning guide for your specific workload |
 | [BENCHMARKING.md](BENCHMARKING.md) | Bench harness, reference numbers, pass/fail gates |

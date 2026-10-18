@@ -18,6 +18,14 @@ not derivable from reading the code alone.
 ## Key Commands
 
 ```bash
+# Shortcuts (Makefile; `make help`). QUICKSTART.md is the user-facing guide.
+make build | run | test-short
+make cluster-up [MODE=replicated] | cluster-status | cluster-down | cluster-clean   # scripts/local-cluster.sh: ports 9000/9010/9020, metrics +4
+make bench-quick         # scripts/quick-bench.sh: throwaway server, MPUT/PUT/GET/mixed, one table
+make bench-ycsb          # throwaway node on :9400 + bench/compare START=0 DBS=veltrixdb (no Docker)
+make bench-ycsb-cluster  # bench/compare NODES=3 against `make cluster-up`
+make bench-gcp PROJECT=… # bench/compare/gcp-multihost.sh (real VMs; bench-gcp-dry-run creates nothing)
+
 # Full build: C++ io_uring engine + Go binary + tarball (Linux, Go 1.19+)
 VERSION=1.0.0 ./scripts/build.sh --output ./dist
 
