@@ -1592,6 +1592,14 @@ Commands:
   checkpoint          Force WAL checkpoint on all disks
   backup DEST_DIR     Trigger full backup to DEST_DIR (a path on the server)
   version             Engine + schema version
+  cluster members     Cluster membership: members, roles (voter / learner), version
+  cluster add-node ID@HOST:PORT
+                      Add a node online (HOST:PORT = its client --addr). Raft: added as
+                      a learner, promoted to voter once caught up. Start the new node
+                      first with --join (docs/node-lifecycle.md)
+  cluster remove-node ID [--force]
+                      Remove a node online. Replicated: it is drained first (--force
+                      skips that for a dead node). Raft: a removed leader steps down
 
 Flags:
   --addr         Admin/metrics HTTP address  (default 127.0.0.1:2112)
@@ -1614,6 +1622,8 @@ Examples:
   veltrix get mykey
   veltrix backup /mnt/backup/2026-05-22
   veltrix checkpoint
+  veltrix cluster add-node n4@10.0.0.14:9000
+  veltrix cluster remove-node n2
   veltrix --addr 10.0.0.5:2112 --admin-token "$TOKEN" status
 `
 
@@ -1630,6 +1640,8 @@ type config struct {
 	durationSec int
 	rawJSON     bool
 	noColor     bool
+	force       bool // cluster remove-node: skip the drain (dead node, replicated mode)
+	waitMs      int  // cluster add-node / remove-node: server-side wait
 }
 
 // parseArgs parses flags that may sit before, between or after positional
@@ -1653,6 +1665,8 @@ func parseArgs(args []string, stderr io.Writer) (config, []string, error) {
 	fs.BoolVar(&c.rawJSON, "json", false, "Print raw JSON")
 	fs.BoolVar(&c.noColor, "no-color", false, "Disable ANSI colours")
 	fs.StringVar(&c.prefix, "prefix", "", "Key prefix for cdc-tail")
+	fs.BoolVar(&c.force, "force", false, "cluster remove-node: remove a dead node without draining it (replicated mode)")
+	fs.IntVar(&c.waitMs, "wait-ms", 0, "cluster add-node / remove-node: how long the server waits (catch-up / drain)")
 
 	var pos []string
 	for {
@@ -1784,6 +1798,8 @@ func run(argv []string) int {
 		return fail(cmdBackup(c.adminAddr, rest[0]))
 	case "version":
 		return fail(cmdVersion(c.adminAddr))
+	case "cluster":
+		return cmdCluster(c, rest, fail, usage)
 	case "help":
 		fmt.Fprint(out, usageText)
 		return 0

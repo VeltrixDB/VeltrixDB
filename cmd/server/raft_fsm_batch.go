@@ -32,6 +32,7 @@ import (
 // mismatch reach the client through the per-request result channel, not here),
 // non-nil only for an undecodable command.
 func (f *raftFSM) ApplyBatch(commands [][]byte) []error {
+	f.waitApplyReady()
 	results := make([]error, len(commands))
 	cmds := make([]fsmCmd, len(commands))
 	decoded := make([]bool, len(commands))
@@ -57,12 +58,16 @@ func (f *raftFSM) ApplyBatch(commands [][]byte) []error {
 				j++
 			}
 			reqs := make([]storage.MultiPutRequest, 0, j-i)
+			// Each PUT keeps its own raft time (invariant 66): the run's
+			// boundaries differ between nodes, its commands' times do not.
+			times := make([]storage.ApplyTime, 0, j-i)
 			for k := i; k < j; k++ {
 				reqs = append(reqs, storage.MultiPutRequest{
 					Key: cmds[k].Key, Value: cmds[k].Value, TTL: cmds[k].TTL,
 				})
+				times = append(times, f.engine.NextRaftApplyTime(cmds[k].Ts))
 			}
-			errs := f.engine.MultiPut(reqs)
+			errs := f.engine.MultiPutAt(reqs, times)
 			for k := i; k < j; k++ {
 				var e error
 				if k-i < len(errs) {

@@ -43,6 +43,10 @@ go run ./cmd/server -addr :9000 -data ./dev-data -cache 256
 ./scripts/bench.sh
 ```
 
+`make help` lists shortcuts for all of this (`make build`, `make run`,
+`make cluster-up`, `make bench-quick`, `make bench-ycsb`, …); see
+[QUICKSTART.md](QUICKSTART.md).
+
 For the full C++ build, CMake plus the io_uring layer (Linux only):
 ```bash
 # Requires liburing, GCC/Clang with C++20 support
@@ -139,7 +143,7 @@ For large changes, consider opening a draft PR early to get feedback on the appr
 ## Areas actively looking for contribution
 
 - **RESP protocol compatibility** — the single most-requested feature. Implementing a RESP3 layer so Redis clients work without code changes.
-- **Raft snapshots at scale** — snapshots exist (`consensus/snapshot.go`, `raftFSM.Snapshot`), but they gob-encode the whole keyspace into one in-memory blob, ship it in a single InstallSnapshot message and do not preserve TTLs. Chunked / streaming snapshots are needed for large datasets.
+- **Raft snapshots at scale** — snapshots stream to disk and transfer in chunks (`consensus/snapshot.go`, `cmd/server/raft_snapshot.go`, CLAUDE.md invariant 64). Open: a node with a snapshot restores its whole engine from it on every start (O(keys) reads), which a durable applied index in the engine would avoid; multi-host measurements of catch-up time.
 - **Client SDK improvements** — the SDKs live in the separate Veltrixdb-client repository ([clients/README.md](clients/README.md)); connection pool tuning, timeout handling and retry logic are open.
 - **Documentation** — tutorials, getting-started guides, and runbooks are always useful.
 

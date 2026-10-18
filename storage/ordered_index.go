@@ -48,7 +48,6 @@ import (
 	"runtime"
 	"sync"
 	"sync/atomic"
-	"time"
 )
 
 // oiMaxLevel bounds the skiplist height.  With p = 0.25 the expected number
@@ -348,7 +347,7 @@ var ErrOrderedIndexDisabled = errors.New("ordered index disabled (StorageConfig.
 // ORDER note in the file header.  An expired key is lazily tombstoned here
 // exactly as on the Get index path (which also removes it from this index).
 func (se *StorageEngine) scanLive(key string) ([]byte, bool) {
-	nowUs := time.Now().UnixMicro()
+	nowUs := se.decisionNowUs()
 	shard, _ := se.index.shardFor(key)
 	shard.mu.RLock()
 	entry, exists := shard.entries.get(key, fnv64a(key))
@@ -359,7 +358,11 @@ func (se *StorageEngine) scanLive(key string) ([]byte, bool) {
 		return nil, false
 	}
 	if expired {
-		se.index.markTombstone(key, nowUs)
+		// Tombstoned only when expired at the raft clock too, and only if
+		// still the entry seen (raft_clock.go).
+		if cut := se.expiryCutoffUs(); entry.IsExpired(cut) {
+			se.index.markExpired(key, cut, nowUs)
+		}
 		se.cache.Evict(key)
 		return nil, false
 	}

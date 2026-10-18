@@ -29,22 +29,24 @@ spec:
               Check veltrixdb_storage_read_latency_seconds histogram for root cause.
 
         # ── VLog GC stalled ───────────────────────────────────────────────────
+        # The paused counter is per node, the garbage ratio per disk: match
+        # them on the scrape target (a plain "and" never matched — the disk
+        # label differs).
         - alert: VeltrixDBVLogGCStalled
           expr: |
-            (
-              rate(veltrixdb_vlog_gc_skipped_paused_total[5m]) > 0
-            ) and (
-              veltrixdb_vlog_garbage_ratio > 0.5
-            )
+            max by (instance, node) (veltrixdb_vlog_garbage_ratio) > 0.5
+              and on (instance)
+            rate(veltrixdb_vlog_gc_skipped_paused_total[5m]) > 0
           for: 5m
           labels:
             severity: warning
           annotations:
             summary: "VeltrixDB VLog GC paused on {{ $labels.node }}"
             description: >
-              VLog GC is paused because the read latency EWMA is above 20 ms and the garbage ratio
-              is {{ $value | humanizePercentage }}. GC will auto-resume 4 min after
-              reads return to normal. Check read latency immediately.
+              VLog GC is paused because the read latency EWMA is above 20 ms, and the
+              worst disk's garbage ratio is {{ $value | humanizePercentage }}. GC resumes
+              4 min after reads return to normal (and bypasses the pause at 65% garbage).
+              Check veltrixdb_storage_read_latency_seconds.
 
         # ── VLog corruption ───────────────────────────────────────────────────
         - alert: VeltrixDBVLogReadErrors
@@ -57,8 +59,8 @@ spec:
             summary: "VeltrixDB VLog read errors on {{ $labels.node }}"
             description: >
               VLog GC is encountering read errors (bad magic or CRC). This indicates
-              possible VLog corruption on disk {{ $labels.disk }}. Run
-              'veltrix-admin check --data-dirs <dirs>' offline immediately.
+              possible VLog corruption (the counter is per node; the server log names
+              the disk). Run 'veltrix-admin check --data-dirs <dirs>' offline immediately.
 
         # ── Cache hit rate low ────────────────────────────────────────────────
         - alert: VeltrixDBLowCacheHitRate
@@ -165,13 +167,244 @@ spec:
               GC is behind ('veltrix-admin compact'); otherwise add capacity.
 
         # ── Process restart ───────────────────────────────────────────────────
+        # process_start_time_seconds is served since the Go / process
+        # collectors were registered (before that this rule could never fire).
+        # The "and on (instance)" keeps other Go services' process metrics out.
         - alert: VeltrixDBProcessRestarted
           expr: |
-            increase(process_start_time_seconds{job="veltrixdb"}[5m]) > 0
+            (time() - process_start_time_seconds) < 300
+              and on (instance) veltrixdb_cluster_nodes_total
           labels:
             severity: info
           annotations:
             summary: "VeltrixDB process restarted on {{ $labels.node }}"
             description: >
-              The VeltrixDB process on {{ $labels.node }} restarted in the last 5 minutes.
-              Check WAL replay logs for errors.
+              The VeltrixDB process on {{ $labels.node }} started less than 5 minutes ago
+              (also fires on a first start). Check the WAL replay and search rebuild logs.
+
+    - name: veltrixdb.search
+      interval: 30s
+      rules:
+
+        # ── Search index rebuild stuck ────────────────────────────────────────
+        # Searches are refused while search_ready == 0 (unless
+        # --search-allow-partial). The loaded count stays 0 while the rebuild
+        # scans for keys, so the window is generous.
+        - alert: VeltrixDBSearchRebuildStuck
+          expr: |
+            veltrixdb_search_ready == 0
+              and on (instance)
+            changes(veltrixdb_search_rebuild_loaded_keys[30m]) == 0
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "VeltrixDB search index rebuild not progressing on {{ $labels.node }}"
+            description: >
+              Vector / text / hybrid searches on {{ $labels.node }} are refused and the
+              rebuild has loaded no new keys for 30 minutes. Check the "[search] rebuild"
+              log lines; a restart repeats the rebuild from the start.
+
+        # ── Partial search results ────────────────────────────────────────────
+        - alert: VeltrixDBSearchPartialResults
+          expr: |
+            increase(veltrixdb_search_partial_total[10m]) > 0
+          labels:
+            severity: warning
+          annotations:
+            summary: "VeltrixDB answered searches without every peer ({{ $labels.node }})"
+            description: >
+              {{ $value | humanize }} search(es) in 10 minutes were answered without one or
+              more peers because --search-allow-partial is set: their results may be
+              missing matches. The "[search] partial" log lines name the peers.
+
+        # ── Searches failing for cluster reasons ──────────────────────────────
+        # reason="other" (bad query, unknown namespace) is a client error and
+        # is left out.
+        - alert: VeltrixDBSearchErrors
+          expr: |
+            sum by (instance, node, kind, reason) (
+              rate(veltrixdb_search_errors_total{reason=~"rebuilding|incomplete"}[5m])
+            ) > 0
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "VeltrixDB {{ $labels.kind }} searches failing ({{ $labels.reason }}) on {{ $labels.node }}"
+            description: >
+              {{ $value | humanize }}/s {{ $labels.kind }} searches fail with reason
+              {{ $labels.reason }}: "rebuilding" = the node's index rebuild is still running,
+              "incomplete" = a peer did not answer the fan-out within --search-timeout-ms.
+
+        # ── Search latency ────────────────────────────────────────────────────
+        - alert: VeltrixDBSearchHighLatency
+          expr: |
+            histogram_quantile(0.99,
+              sum by (instance, node, kind, le) (rate(veltrixdb_search_latency_seconds_bucket[5m]))
+            ) > 1
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "VeltrixDB {{ $labels.kind }} search P99 > 1 s on {{ $labels.node }}"
+            description: >
+              P99 {{ $labels.kind }} search latency is {{ $value | humanizeDuration }}
+              (fan-out included). Check peer health, --search-timeout-ms and the ef / k values
+              clients send.
+
+    # Raft metrics exist only in --mode=raft; these rules are inert elsewhere.
+    - name: veltrixdb.raft
+      interval: 30s
+      rules:
+
+        # ── Snapshot captures failing ────────────────────────────────────────
+        - alert: VeltrixDBRaftSnapshotCaptureFailing
+          expr: |
+            increase(veltrixdb_raft_snapshot_capture_failures_total[30m]) > 3
+              and increase(veltrixdb_raft_snapshot_captures_total[30m]) == 0
+          labels:
+            severity: warning
+          annotations:
+            summary: "VeltrixDB raft snapshot captures failing on {{ $labels.node }}"
+            description: >
+              {{ $labels.node }} had {{ $value }} failed snapshot captures in 30 minutes and
+              none succeeded, so its raft log is not being compacted. Check the
+              "[raft] node=... snapshot capture failed" log lines and free space in the data dir.
+
+        # ── Snapshot transfers to a follower failing (fires on the leader) ────
+        - alert: VeltrixDBRaftSnapshotTransferFailing
+          expr: |
+            increase(veltrixdb_raft_snapshot_transfer_failures_total[30m]) > 3
+              and increase(veltrixdb_raft_snapshot_sent_total[30m]) == 0
+          labels:
+            severity: warning
+          annotations:
+            summary: "VeltrixDB raft snapshot transfers from {{ $labels.node }} failing"
+            description: >
+              {{ $labels.node }} (leader) failed {{ $value }} InstallSnapshot transfers in 30
+              minutes without completing one: a follower that needs a snapshot is not catching
+              up. Check the leader's "[raft] ... snapshot ... peer=" log lines ("NOT sending
+              snapshot … upgrade peer" means a v1.16 follower whose snapshot is over 256 MB),
+              and the follower's log.
+
+        # ── Snapshot install / restore failing (fires on the follower) ────────
+        - alert: VeltrixDBRaftSnapshotInstallFailing
+          expr: |
+            increase(veltrixdb_raft_snapshot_install_failures_total[30m]) > 0
+              or increase(veltrixdb_raft_snapshot_restore_failures_total[15m]) > 0
+          labels:
+            severity: warning
+          annotations:
+            summary: "VeltrixDB raft snapshot install failing on {{ $labels.node }}"
+            description: >
+              {{ $labels.node }} rejected or failed to install a snapshot from the leader, or a
+              state-machine restore attempt failed (it is retried, and the node serves no
+              usable state until one succeeds). Check its "[raft] ... snapshot" log lines,
+              disk space and disk errors.
+
+        # ── Backstop: log not compacted ───────────────────────────────────────
+        # Catches what the counters above cannot: captures that never start.
+        - alert: VeltrixDBRaftSnapshotsNotCompacting
+          expr: |
+            veltrixdb_raft_log_retained_entries > 4 * veltrixdb_raft_snapshot_threshold_entries
+              and veltrixdb_raft_snapshot_threshold_entries > 0
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: "VeltrixDB raft log not compacted on {{ $labels.node }}"
+            description: >
+              {{ $labels.node }} retains {{ $value }} log entries, over 4x the snapshot
+              threshold, for 15 minutes: snapshot captures are failing or not starting.
+              Check the "[raft] ... snapshot" log lines and free space in the data dir.
+
+        # ── Apply lag ─────────────────────────────────────────────────────────
+        - alert: VeltrixDBRaftApplyLag
+          expr: |
+            veltrixdb_raft_commit_index - veltrixdb_raft_applied_index > 10000
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "VeltrixDB raft apply lagging on {{ $labels.node }}"
+            description: >
+              {{ $value }} committed entries are not yet applied on {{ $labels.node }}.
+              Reads served there are stale by that much.
+
+        # ── Leader churn ──────────────────────────────────────────────────────
+        - alert: VeltrixDBRaftTermChurn
+          expr: |
+            changes(veltrixdb_raft_term[15m]) > 3
+          labels:
+            severity: warning
+          annotations:
+            summary: "VeltrixDB raft term changed {{ $value }} times in 15 min on {{ $labels.node }}"
+            description: >
+              Repeated elections: check network latency between nodes and fsync latency
+              on the raft log's disk.
+
+        # ── No leader ─────────────────────────────────────────────────────────
+        - alert: VeltrixDBRaftNoLeader
+          expr: |
+            sum by (job) (veltrixdb_raft_is_leader) < 1
+          for: 1m
+          labels:
+            severity: critical
+          annotations:
+            summary: "VeltrixDB raft cluster ({{ $labels.job }}) has no leader"
+            description: >
+              No scraped node reports itself leader for a minute: writes are failing.
+              Check that a majority of nodes is up and can reach each other.
+
+    # Replication-engine metrics exist only in --mode=replicated; these rules
+    # are inert elsewhere.
+    - name: veltrixdb.replication
+      interval: 30s
+      rules:
+
+        # ── Full resync / delete gap ──────────────────────────────────────────
+        # A replica was behind by more than the tombstone retention
+        # (2 × GCGracePeriodSec): it was resynced from the whole change feed,
+        # and deletes whose tombstones were already reaped could not be sent —
+        # the key may survive on that replica.
+        - alert: VeltrixDBReplicationDeleteGap
+          expr: |
+            increase(veltrixdb_replication_full_resyncs_total[15m]) > 0
+              or veltrixdb_replication_replicas_delete_gap > 0
+          labels:
+            severity: critical
+          annotations:
+            summary: "VeltrixDB replica fully resynced with a possible delete gap ({{ $labels.node }})"
+            description: >
+              {{ $labels.node }} resynced a replica from its whole change feed, or has a replica
+              flagged with a delete gap: deletes made while that replica was away may be missing
+              on it. The ERROR log line "FULL RESYNC" names the replica, and
+              GET /admin/cluster shows replication[].delete_gap. Rebuild that replica from a
+              healthy node to be sure.
+
+        # ── Recovery state not persisted ──────────────────────────────────────
+        - alert: VeltrixDBReplicationStatePersistErrors
+          expr: |
+            increase(veltrixdb_replication_state_persist_errors_total[15m]) > 0
+          labels:
+            severity: warning
+          annotations:
+            summary: "VeltrixDB cannot write replication_state.json on {{ $labels.node }}"
+            description: >
+              Writes of the per-replica acknowledgement watermarks are failing. After a restart
+              the replicas would be caught up from older (stale) watermarks — safe, but slower —
+              and an unreadable file means a full resync. Check disk space and errors on --data.
+
+        # ── Replica not caught up ─────────────────────────────────────────────
+        - alert: VeltrixDBReplicationResyncPending
+          expr: |
+            veltrixdb_replication_replicas_resync_pending > 0
+          for: 30m
+          labels:
+            severity: warning
+          annotations:
+            summary: "VeltrixDB replica catch-up pending for 30 min ({{ $labels.node }})"
+            description: >
+              {{ $value }} replica(s) of {{ $labels.node }} missed writes that only the change
+              feed can supply and have not finished catching up — usually a replica that is
+              still down. GET /admin/cluster shows replication[].state and resync_pending.

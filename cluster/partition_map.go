@@ -142,6 +142,12 @@ type ClusterConfig struct {
 	MaxMetadataSize     uint64
 }
 
+// AllNodesRF is a placement replication factor meaning "every member holds
+// every key".  cmd/server uses it for --mode=replicated, whose replication
+// engine sends every write to every member and serves reads locally, so the
+// partition map's placement (and therefore MigrateToNewOwners) must match.
+const AllNodesRF = 1 << 16
+
 // DefaultClusterConfig returns sensible defaults
 func DefaultClusterConfig() *ClusterConfig {
 	return &ClusterConfig{
@@ -495,6 +501,9 @@ func (pm *PartitionMap) Rebalance(partitionCount uint32) error {
 // racked and rackless clusters both get deterministic placement.
 func pickReplicas(nodeList []*Node, start, rf int) []string {
 	n := len(nodeList)
+	if rf > n {
+		rf = n // AllNodesRF (and any RF above the member count): every node
+	}
 	replicas := make([]string, 0, rf)
 	seen := make(map[string]bool, rf)
 	usedRacks := make(map[string]bool, rf)

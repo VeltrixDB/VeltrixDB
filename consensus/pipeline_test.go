@@ -407,6 +407,8 @@ type chaosTransport struct {
 	maxDelay time.Duration
 	closed   atomic.Bool
 	wg       sync.WaitGroup
+
+	dupChunks atomic.Uint64 // duplicate snapshot chunks delivered
 }
 
 func (c *chaosTransport) roll() (delay time.Duration, dropReq, dropResp bool) {
@@ -497,6 +499,37 @@ func (v *chaosView) SendInstallSnapshot(peer string, args InstallSnapshotArgs) (
 		return InstallSnapshotReply{}, errChaos
 	}
 	return n.HandleInstallSnapshot(args), nil
+}
+
+// SendInstallSnapshotChunk delivers a chunk after a random delay, drops
+// requests and replies at random, and sometimes delivers a duplicate of the
+// chunk again later (after newer chunks: duplication + reordering).
+func (v *chaosView) SendInstallSnapshotChunk(peer string, args InstallSnapshotChunkArgs) (InstallSnapshotChunkReply, error) {
+	c := v.c
+	delay, dReq, dResp := c.roll()
+	time.Sleep(delay / 4)
+	n := c.target(v.self, peer)
+	if n == nil || dReq || c.closed.Load() {
+		return InstallSnapshotChunkReply{}, errChaos
+	}
+	if delay > c.maxDelay/2 && len(args.Data) > 0 {
+		dup := args
+		dup.Data = append([]byte(nil), args.Data...)
+		c.wg.Add(1)
+		go func() {
+			defer c.wg.Done()
+			time.Sleep(c.maxDelay)
+			if t := c.target(v.self, peer); t != nil && !c.closed.Load() {
+				c.dupChunks.Add(1)
+				t.HandleInstallSnapshotChunk(dup)
+			}
+		}()
+	}
+	r := n.HandleInstallSnapshotChunk(args)
+	if dResp {
+		return InstallSnapshotChunkReply{}, errChaos
+	}
+	return r, nil
 }
 
 func (v *chaosView) Close() error { return nil }

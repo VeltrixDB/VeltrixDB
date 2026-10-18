@@ -11,7 +11,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"net"
+	"math/rand"
 	"os"
 	"os/exec"
 	"strconv"
@@ -28,26 +28,12 @@ import (
 // bases already handed out are avoided so per-node port blocks never overlap.
 func reserveBlock(t *testing.T, used map[int]bool) int {
 	t.Helper()
-	for tries := 0; tries < 200; tries++ {
-		base := freePort(t)
-		clash := false
-		for off := 0; off <= 5; off++ {
-			if used[base+off] {
-				clash = true
-				break
-			}
-		}
-		if clash {
-			continue
-		}
+	for tries := 0; tries < 1000; tries++ {
+		// Non-ephemeral range: see testPortLo in helpers_test.go.
+		base := testPortLo + rand.Intn(testPortHi-testPortLo-5)
 		ok := true
-		for off := 1; off <= 5; off++ {
-			l, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", base+off))
-			if err != nil {
-				ok = false
-				break
-			}
-			l.Close()
+		for off := 0; off <= 5 && ok; off++ {
+			ok = !used[base+off] && portFree(base+off)
 		}
 		if !ok {
 			continue

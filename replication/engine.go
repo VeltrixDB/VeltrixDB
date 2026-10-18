@@ -111,8 +111,24 @@ type ReplicationMetrics struct {
 	ReplicaRecoveries atomic.Uint64
 	// CatchUpGaps counts recoveries that could not replay everything the
 	// replica missed (retained ops were evicted and no catch-up source is
-	// configured).  Always 0 in cmd/server, which sets a catch-up source.
+	// configured), or whose catch-up started from a watermark older than
+	// ReplicationConfig.TombstoneRetention (deletes whose tombstones were
+	// reaped cannot be sent).  Every increment is logged as an ERROR.
 	CatchUpGaps atomic.Uint64
+	// FullResyncs counts catch-ups that streamed the whole change feed
+	// because the replica's watermark was older than TombstoneRetention or
+	// the persisted recovery state was unreadable.
+	FullResyncs atomic.Uint64
+	// StatePersists / StatePersistErrors count writes of the durable recovery
+	// state (ReplicationConfig.StatePath).
+	StatePersists      atomic.Uint64
+	StatePersistErrors atomic.Uint64
+	// ReplicasResyncPending / ReplicasDeleteGap are gauges refreshed by the
+	// lag monitor: replicas whose change-feed catch-up is pending or running
+	// (ReplicaLagInfo.ResyncPending), and replicas flagged with a delete gap
+	// since this node started (ReplicaLagInfo.DeleteGap).
+	ReplicasResyncPending atomic.Int64
+	ReplicasDeleteGap     atomic.Int64
 }
 
 // VersionVector is a per-node logical clock map.
@@ -183,6 +199,21 @@ type ReplicationConfig struct {
 	// catch-up from the CatchUpFunc source on recovery.  Zero means
 	// defaultMaxRetainedOps (100000).
 	MaxRetainedOps int
+
+	// StatePath, when set, makes per-replica recovery state durable (see
+	// state.go): each replica's acknowledgement watermark is written there
+	// at most once per lag-monitor tick (1 s) and on Close, and on startup a
+	// replica with a persisted watermark is caught up from the change feed
+	// before it returns to SYNC.  Empty keeps the state in memory only (a
+	// primary restart then forgets what a down replica had not acked).
+	StatePath string
+	// TombstoneRetention is how long the catch-up source is guaranteed to
+	// still carry deletes (cmd/server: 2 × GCGracePeriodSec, the bound after
+	// which a tombstone is reaped even if a replica has not acked it).  A
+	// replica whose catch-up would start further back than this gets a full
+	// resync (the whole change feed) and is flagged: deletes whose
+	// tombstones were reaped cannot be replayed.  Zero disables the check.
+	TombstoneRetention time.Duration
 }
 
 const (
@@ -258,6 +289,15 @@ type ReplicationEngine struct {
 
 	catchUp   CatchUpFunc       // optional; guarded by mu
 	watermark WatermarkObserver // optional; guarded by mu
+
+	// Durable recovery state (state.go).  loaded / stateCorrupt are set once
+	// by initState and read under mu by AddReplica.
+	loaded           map[string]persistedReplica
+	stateCorrupt     bool
+	markGen          atomic.Uint64    // bumped per watermark snapshot (watermarksLocked)
+	persistMu        sync.Mutex       // serialises state-file writes
+	lastPersisted    map[string]int64 // guarded by persistMu
+	lastPersistedGen uint64           // guarded by persistMu
 }
 
 // pendingOp is one retained write and the set of replicas that acked it.  It
@@ -306,11 +346,23 @@ type ReplicaInfo struct {
 	// resyncFromNs (the oldest dropped op's timestamp).
 	needsResync  bool
 	resyncFromNs int64
+	// catchingUpFromNs is resyncFromNs of the catch-up in progress (0 when
+	// none): the flag is cleared when the catch-up starts, but until it
+	// succeeds the watermark must stay at its start.
+	catchingUpFromNs int64
+	// deleteGap: a catch-up started from further back than
+	// TombstoneRetention, so deletes may be missing on this replica.
+	// Sticky for the life of the process; logged as an ERROR when set.
+	deleteGap bool
+	// freshMember: added by a membership change (AddMemberReplica) — its
+	// first catch-up streams the whole feed by design, which is not a
+	// delete gap (it never held any of this node's keys).
+	freshMember bool
 }
 
 // NewReplicationEngine creates a new replication engine
 func NewReplicationEngine(nodeID string, config *ReplicationConfig) *ReplicationEngine {
-	return &ReplicationEngine{
+	re := &ReplicationEngine{
 		localNodeID:   nodeID,
 		config:        config,
 		writeQueue:    make(chan *WriteOperation, 10000),
@@ -321,6 +373,8 @@ func NewReplicationEngine(nodeID string, config *ReplicationConfig) *Replication
 		pendingWrites: make(map[uint64]*pendingOp),
 		clients:       make(map[string]ReplicaTransport),
 	}
+	re.initState()
+	return re
 }
 
 // Start begins the replication engine
@@ -366,6 +420,13 @@ func (re *ReplicationEngine) maxRetained() int {
 		return re.config.MaxRetainedOps
 	}
 	return defaultMaxRetainedOps
+}
+
+func (re *ReplicationEngine) tombstoneRetention() time.Duration {
+	if re.config != nil {
+		return re.config.TombstoneRetention
+	}
+	return 0
 }
 
 func (re *ReplicationEngine) batchSize() int {
@@ -522,6 +583,25 @@ func (re *ReplicationEngine) AddReplica(nodeID, address string, port int) error 
 // AddReplicaWithReplPort is like AddReplica but lets the caller specify the
 // dedicated replication port explicitly (non-zero).
 func (re *ReplicationEngine) AddReplicaWithReplPort(nodeID, address string, port, replPort int) error {
+	if err := re.addReplica(nodeID, address, port, replPort); err != nil {
+		return err
+	}
+	// Record the new replica durably and give tombstone GC its watermark
+	// before anything can be reaped (a persisted watermark below a tombstone
+	// keeps it).
+	now := time.Now()
+	re.mu.RLock()
+	marks, gen := re.watermarksLocked(now.UnixNano())
+	obs := re.watermark
+	re.mu.RUnlock()
+	re.persistStateIfChanged(marks, gen)
+	if obs != nil {
+		obs(nodeID, (marks[nodeID]-int64(watermarkMargin))/1000)
+	}
+	return nil
+}
+
+func (re *ReplicationEngine) addReplica(nodeID, address string, port, replPort int) error {
 	re.mu.Lock()
 	defer re.mu.Unlock()
 
@@ -529,7 +609,7 @@ func (re *ReplicationEngine) AddReplicaWithReplPort(nodeID, address string, port
 		return fmt.Errorf("replica %s already exists", nodeID)
 	}
 
-	re.replicaStates[nodeID] = &ReplicaInfo{
+	r := &ReplicaInfo{
 		NodeID:        nodeID,
 		Address:       address,
 		Port:          port,
@@ -538,6 +618,23 @@ func (re *ReplicationEngine) AddReplicaWithReplPort(nodeID, address string, port
 		SyncedAt:      time.Now().UnixNano(),
 		lastAckAt:     time.Now().UnixNano(),
 	}
+	// A replica this node knew before a restart may have missed writes made
+	// before it: it starts FAILED with a catch-up from its persisted
+	// watermark, which the recovery worker serves at its first tick.
+	if p, ok := re.loaded[nodeID]; ok || re.stateCorrupt {
+		from := p.WatermarkNs
+		if re.stateCorrupt || from <= 0 {
+			from = 1 // unknown: the whole change feed
+		}
+		r.State = ReplicaStateFailed
+		r.needsResync = true
+		r.resyncFromNs = from
+		r.backoff = re.probeInterval()
+		r.nextProbeAt = 0
+		log.Printf("[repl] replica %s: catch-up from persisted watermark %s before it returns to SYNC",
+			nodeID, time.Unix(0, from).UTC().Format(time.RFC3339Nano))
+	}
+	re.replicaStates[nodeID] = r
 
 	// Create a TCP replication client.  Convention: replication port = storage port + 1.
 	if replPort == 0 {
@@ -661,6 +758,8 @@ func (re *ReplicationEngine) GetReplicaLag() map[string]ReplicaLagInfo {
 			LagNs:         replica.LagNs.Load(),
 			LastAckAt:     replica.lastAckAt,
 			NextProbeAt:   nextProbe(replica),
+			ResyncPending: replica.needsResync || replica.catchingUpFromNs != 0,
+			DeleteGap:     replica.deleteGap,
 		}
 	}
 	return lag
@@ -675,6 +774,13 @@ type ReplicaLagInfo struct {
 	LagNs         int64 // age of the oldest write the replica has not acked
 	LastAckAt     int64 // UnixNano of the last successful ack (AddReplica time before the first)
 	NextProbeAt   int64 // UnixNano of the next reconnect probe; 0 unless FAILED
+	// ResyncPending: the replica missed writes that are no longer retained
+	// (evicted, or made before this node restarted) and its change-feed
+	// catch-up has not completed yet.
+	ResyncPending bool
+	// DeleteGap: a catch-up had to start further back than
+	// TombstoneRetention, so deletes may be missing on the replica.
+	DeleteGap bool
 }
 
 func nextProbe(r *ReplicaInfo) int64 {
@@ -1134,18 +1240,47 @@ func (re *ReplicationEngine) recoverReplica(r *ReplicaInfo) {
 
 	if needResync {
 		if src != nil {
+			from := since - int64(catchUpSkew)
+			full := false
+			if ret := re.tombstoneRetention(); ret > 0 && from < time.Now().UnixNano()-int64(ret) {
+				// The change feed no longer carries every delete made since
+				// `from`: stream all of it, and say so loudly — a delete whose
+				// tombstone was reaped cannot be replayed.
+				full = true
+				from = 0
+			}
 			// Clear the flag first: ops dropped while the catch-up runs set
-			// it again, with their own (later) timestamp.
+			// it again, with their own (later) timestamp.  The watermark stays
+			// at `since` (catchingUpFromNs) until the catch-up succeeds.
 			re.mu.Lock()
 			r.needsResync = false
+			r.catchingUpFromNs = since
+			if r.freshMember {
+				full = false // initial copy to a new member, not a gap
+				from = 0
+			}
+			if full {
+				r.deleteGap = true
+			}
 			re.mu.Unlock()
-			err := src(since-int64(catchUpSkew), func(ops []*WriteOperation) error {
+			if full {
+				re.metrics.FullResyncs.Add(1)
+				re.metrics.CatchUpGaps.Add(1)
+				log.Printf("[repl] ERROR replica %s: last acknowledged write %s is older than the tombstone retention (%s) — FULL RESYNC from the whole change feed; deletes whose tombstones were already reaped cannot be replayed, so keys deleted here may survive on %s (rebuild it from a healthy node to be sure)",
+					r.NodeID, time.Unix(0, since).UTC().Format(time.RFC3339), re.tombstoneRetention(), r.NodeID)
+			}
+			err := src(from, func(ops []*WriteOperation) error {
 				return re.deliver(r, ops)
 			})
+			re.mu.Lock()
+			r.catchingUpFromNs = 0
 			if err != nil {
-				re.mu.Lock()
 				re.flagResyncLocked(r, since)
-				re.mu.Unlock()
+			} else {
+				r.freshMember = false
+			}
+			re.mu.Unlock()
+			if err != nil {
 				re.recoveryFailed(r, fmt.Errorf("catch-up: %w", err))
 				return
 			}
@@ -1218,48 +1353,67 @@ func (re *ReplicationEngine) backgroundLagMonitor() {
 	}
 }
 
-// updateLag computes, per replica, the age of the oldest write it has not
-// acked (LagNs) and its watermark — every write with an earlier timestamp is
-// on the replica — and publishes the aggregates and the watermarks.
-func (re *ReplicationEngine) updateLag(now time.Time) {
-	nowNs := now.UnixNano()
-	type wm struct {
-		id string
-		us int64
+// watermarksLocked returns, per replica, its acknowledgement watermark in
+// Unix ns: every write this node originated with an earlier timestamp is on
+// the replica.  It is the timestamp of the oldest retained op the replica has
+// not acked, of the oldest op it missed that is no longer retained
+// (needsResync), or of the start of a catch-up in progress — or nowNs when it
+// is caught up.  Caller holds re.mu (read or write).
+//
+// gen orders snapshots for persistStateIfChanged.
+func (re *ReplicationEngine) watermarksLocked(nowNs int64) (marks map[string]int64, gen uint64) {
+	gen = re.markGen.Add(1)
+	marks = make(map[string]int64, len(re.replicaStates))
+	for id, r := range re.replicaStates {
+		w := nowNs
+		if r.needsResync && r.resyncFromNs < w {
+			w = r.resyncFromNs
+		}
+		if r.catchingUpFromNs != 0 && r.catchingUpFromNs < w {
+			w = r.catchingUpFromNs
+		}
+		marks[id] = w
 	}
-	var marks []wm
-
-	re.mu.RLock()
-	oldest := make(map[string]int64, len(re.replicaStates))
 	for _, p := range re.pendingWrites {
-		for id := range re.replicaStates {
+		for id, w := range marks {
 			if _, ok := p.acked[id]; ok {
 				continue
 			}
-			if cur, ok := oldest[id]; !ok || p.op.Timestamp < cur {
-				oldest[id] = p.op.Timestamp
+			if p.op.Timestamp < w {
+				marks[id] = p.op.Timestamp
 			}
 		}
 	}
+	return marks, gen
+}
+
+// updateLag computes, per replica, the age of the oldest write it has not
+// acked (LagNs) and its watermark (watermarksLocked), publishes the
+// aggregates and the watermarks (minus watermarkMargin) and persists the
+// watermarks when they changed (StatePath).
+func (re *ReplicationEngine) updateLag(now time.Time) {
+	nowNs := now.UnixNano()
+
+	re.mu.RLock()
+	marks, gen := re.watermarksLocked(nowNs)
 	var totalLagBytes uint64
 	var maxLag int64
-	var failed, syncPending int64
+	var failed, syncPending, resyncPending, deleteGap int64
 	for id, r := range re.replicaStates {
 		totalLagBytes += r.LagBytes.Load()
+		if r.needsResync || r.catchingUpFromNs != 0 {
+			resyncPending++
+		}
+		if r.deleteGap {
+			deleteGap++
+		}
 		switch r.State {
 		case ReplicaStateFailed:
 			failed++
 		case ReplicaStateSync_Pending:
 			syncPending++
 		}
-		behindSince := nowNs
-		if ts, ok := oldest[id]; ok && ts < behindSince {
-			behindSince = ts
-		}
-		if r.needsResync && r.resyncFromNs < behindSince {
-			behindSince = r.resyncFromNs
-		}
-		lag := nowNs - behindSince
+		lag := nowNs - marks[id]
 		if lag < 0 {
 			lag = 0
 		}
@@ -1267,7 +1421,6 @@ func (re *ReplicationEngine) updateLag(now time.Time) {
 		if lag > maxLag {
 			maxLag = lag
 		}
-		marks = append(marks, wm{id: id, us: (behindSince - int64(watermarkMargin)) / 1000})
 	}
 	obs := re.watermark
 	re.mu.RUnlock()
@@ -1276,11 +1429,16 @@ func (re *ReplicationEngine) updateLag(now time.Time) {
 	re.metrics.ReplicaLagNs.Store(maxLag)
 	re.metrics.ReplicasFailed.Store(failed)
 	re.metrics.ReplicasSyncPending.Store(syncPending)
+	re.metrics.ReplicasResyncPending.Store(resyncPending)
+	re.metrics.ReplicasDeleteGap.Store(deleteGap)
 	if obs != nil {
-		for _, m := range marks {
-			obs(m.id, m.us)
+		for id, w := range marks {
+			obs(id, (w-int64(watermarkMargin))/1000)
 		}
 	}
+	// Caught-up replicas report nowNs, which changes every tick; persisting
+	// that is what keeps a restart's catch-up window at about one tick.
+	re.persistStateIfChanged(marks, gen)
 }
 
 // StartReplicationServer starts a ReplicationServer on listenAddr that applies
@@ -1316,7 +1474,9 @@ func (re *ReplicationEngine) Close() error {
 	for _, c := range re.clients {
 		c.Close()
 	}
+	marks, gen := re.watermarksLocked(time.Now().UnixNano())
 	re.mu.Unlock()
+	re.persistStateIfChanged(marks, gen)
 	return nil
 }
 

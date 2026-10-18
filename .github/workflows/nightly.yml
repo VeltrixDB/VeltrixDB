@@ -4,6 +4,11 @@ name: Nightly hardening
 #   real-embeddings  recall gates on GloVe-100 (100K real word vectors)
 #   search-soak      concurrent vector/text writes + searches vs an oracle
 #   crash-chaos      SIGKILL mid-write, restart, every acknowledged write visible
+#   jepsen           3-node raft / replicated clusters under kill / pause /
+#                    snapshot-crash / partition faults, histories checked
+#                    (tests/jepsen/README.md), with and without --raft-pipeline
+#   upgrade          rolling upgrade / downgrade against the v1.16 tag
+#                    (tests/upgrade/README.md)
 #   perf-tables      adaptive group commit and vector memory tables (no gates)
 #   kv-soak          scripts/soak.sh (manual runs only: set kv_soak_hours)
 
@@ -18,6 +23,9 @@ on:
       chaos_cycles:
         description: "crash/restart cycles"
         default: "10"
+      jepsen_duration:
+        description: "Jepsen workload per test (Go duration)"
+        default: "5m"
       kv_soak_hours:
         description: "hours of scripts/soak.sh (0 = skip)"
         default: "0"
@@ -125,6 +133,127 @@ jobs:
         with:
           name: crash-chaos-output
           path: /tmp/chaos.txt
+          retention-days: 14
+
+  # Jepsen-style consistency tests (tests/jepsen/README.md). The seed is the
+  # run number, so a failure's fault schedule can be replayed locally with
+  # VELTRIX_JEPSEN_SEED=<run number> (timing is not reproducible).
+  #
+  # Partition hook: GitHub-hosted runners give the runner user passwordless
+  # sudo, so the iptables commands from the README run as root through
+  # `sudo -n` and the nemesis adds the `partition` fault. On loopback a port
+  # rule only drops connections TO the node, so this is an asymmetric
+  # partition (README, Limitations).
+  jepsen:
+    name: "Jepsen (raft pipeline=${{ matrix.pipeline }})"
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        pipeline: ["0", "1"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.21"
+          cache: true
+      - name: build server
+        run: CGO_ENABLED=0 go build -o /tmp/veltrixdb ./cmd/server
+      - name: mount tmpfs for test scratch
+        run: |
+          sudo mkdir -p /mnt/veltrix-tmp
+          sudo mount -t tmpfs -o size=2G,mode=1777 tmpfs /mnt/veltrix-tmp
+      - name: check the partition hook can run as root
+        run: sudo -n iptables -S INPUT >/dev/null
+      - name: jepsen
+        env:
+          TMPDIR: /mnt/veltrix-tmp # invariant 40: step level, never job level
+          VELTRIX_SERVER_BIN: /tmp/veltrixdb
+          VELTRIX_RAFT_PIPELINE: ${{ matrix.pipeline }}
+          VELTRIX_JEPSEN_DURATION: ${{ inputs.jepsen_duration || '5m' }}
+          VELTRIX_JEPSEN_SEED: ${{ github.run_number }}
+          VELTRIX_JEPSEN_OUT: /tmp/jepsen-out
+          VELTRIX_JEPSEN_PARTITION_CMD: >-
+            for p in $NODE_RAFT_PORT $NODE_REPL_PORT; do
+            sudo -n iptables -I INPUT -i lo -p tcp --dport $p -j DROP -m comment --comment jepsen;
+            done
+          VELTRIX_JEPSEN_HEAL_CMD: >-
+            sudo -n iptables -S INPUT | grep jepsen | sed s/^-A/-D/ |
+            while read r; do sudo -n iptables $r; done
+        run: |
+          set -o pipefail
+          CGO_ENABLED=0 go test ./tests/jepsen/ -v -count=1 -timeout 60m 2>&1 | tee /tmp/jepsen.txt
+          { echo "### Jepsen (pipeline=${VELTRIX_RAFT_PIPELINE}, seed=${VELTRIX_JEPSEN_SEED})"; echo '```'; grep -E '^\s*(--- |ok|FAIL|PASS)' /tmp/jepsen.txt | tail -60; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      - name: heal any partition left behind
+        if: always()
+        run: |
+          sudo -n iptables -S INPUT | grep jepsen | sed s/^-A/-D/ | while read r; do sudo -n iptables $r; done || true
+      # Harness self-check: the negative control must FIND a violation
+      # (stale reads from resumed followers). It passes when it does.
+      - name: negative control (harness self-check)
+        if: matrix.pipeline == '0'
+        env:
+          TMPDIR: /mnt/veltrix-tmp
+          VELTRIX_SERVER_BIN: /tmp/veltrixdb
+          VELTRIX_JEPSEN_NEGATIVE: "1"
+          VELTRIX_JEPSEN_DURATION: 1m
+          VELTRIX_JEPSEN_SEED: ${{ github.run_number }}
+          VELTRIX_JEPSEN_OUT: /tmp/jepsen-out
+        run: |
+          set -o pipefail
+          CGO_ENABLED=0 go test ./tests/jepsen/ -v -count=1 -timeout 15m \
+            -run TestJepsenNegativeControl_StaleReads 2>&1 | tee /tmp/jepsen-negative.txt
+      - if: failure()
+        run: cp /tmp/jepsen*.txt /tmp/jepsen-out/ 2>/dev/null || true
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: jepsen-out-pipeline-${{ matrix.pipeline }}
+          path: /tmp/jepsen-out
+          retention-days: 14
+
+  # Rolling upgrade / downgrade between the v1.16 tag and this checkout
+  # (tests/upgrade/README.md). The harness builds v1.16 with `git archive`,
+  # so the checkout needs the tags (fetch-depth: 0).
+  upgrade:
+    name: "Upgrade / downgrade vs v1.16"
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.21"
+          cache: true
+      - name: mount tmpfs for test scratch
+        run: |
+          sudo mkdir -p /mnt/veltrix-tmp
+          sudo mount -t tmpfs -o size=2G,mode=1777 tmpfs /mnt/veltrix-tmp
+      - name: upgrade tests
+        env:
+          TMPDIR: /mnt/veltrix-tmp # invariant 40: step level, never job level
+          VELTRIX_UPGRADE_TEST: "1"
+          VELTRIX_UPGRADE_WORKDIR: /mnt/veltrix-tmp/upgrade
+        run: |
+          set -o pipefail
+          git tag -l v1.16 | grep -q v1.16
+          CGO_ENABLED=0 go test ./tests/upgrade/ -v -count=1 -timeout 40m 2>&1 | tee /tmp/upgrade.txt
+          { echo "### Upgrade / downgrade vs v1.16"; echo '```'; grep -E '^\s*(--- |ok|FAIL|PASS)' /tmp/upgrade.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      # A failing test keeps its data dirs and node logs under the work dir;
+      # upload the logs and the test output, not the data.
+      - if: failure()
+        run: |
+          mkdir -p /tmp/upgrade-out
+          cp /tmp/upgrade.txt /tmp/upgrade-out/ 2>/dev/null || true
+          cd /mnt/veltrix-tmp/upgrade 2>/dev/null && find . -path '*/logs/*' -exec cp --parents {} /tmp/upgrade-out/ \; || true
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: upgrade-out
+          path: /tmp/upgrade-out
           retention-days: 14
 
   perf-tables:

@@ -50,22 +50,26 @@ func (rn *RaftNode) ReadIndex(timeout time.Duration) (uint64, error) {
 		rn.mu.Unlock()
 		return 0, ErrLeadershipUnconfirmed
 	}
-	peers := append([]string(nil), rn.peers...)
+	peers := append([]string(nil), rn.voterPeers...) // learners do not count
 	quorum := rn.quorumSize()
+	selfVotes := int64(0)
+	if rn.config.contains(rn.id) {
+		selfVotes = 1 // a leader removing itself does not count itself
+	}
 	commit := rn.commitIndex
 	lastIdx := rn.lastLogIndex()
 	prevTerm := rn.logTerm(lastIdx)
 	rn.mu.Unlock()
 
 	// Single-node cluster: the leader IS the quorum.
-	if quorum <= 1 {
+	if quorum <= 1 && selfVotes == 1 {
 		return readIdx, rn.waitAppliedUntil(readIdx, deadline)
 	}
 
 	// Quorum heartbeat round.  Any reply whose term does not exceed ours
 	// acknowledges our leadership for this round (Success is irrelevant — a
 	// log-lagging follower still recognises the leader).
-	acks := int64(1) // self
+	acks := selfVotes
 	acked := make(chan struct{}, len(peers))
 	for _, peer := range peers {
 		peer := peer

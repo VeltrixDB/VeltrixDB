@@ -180,6 +180,13 @@ func (se *StorageEngine) CheckSearchReady() error {
 // Returns the number of vectors and text documents loaded. Corrupt entries
 // are skipped with a log line rather than failing the whole rebuild.
 func (se *StorageEngine) RebuildSearchIndexes() (vectors, docs int, err error) {
+	se.searchRebuildMu.Lock()
+	defer se.searchRebuildMu.Unlock()
+	return se.rebuildSearchIndexesLocked()
+}
+
+// rebuildSearchIndexesLocked is RebuildSearchIndexes; se.searchRebuildMu held.
+func (se *StorageEngine) rebuildSearchIndexesLocked() (vectors, docs int, err error) {
 	defer se.searchRebuild.pending.Store(false)
 	se.searchRebuild.loaded.Store(0)
 	for _, k := range se.scanKeysWithPrefix(vectorNSConfigPrefix) {

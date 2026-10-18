@@ -54,16 +54,23 @@ func (se *StorageEngine) BeginTxn() *Txn {
 }
 
 // KeyVersion returns the optimistic-concurrency version token for key — the
-// value a client passes back to Txn.SetIf (and the TXN wire command).  It is
-// the key's WriteTimestampUs, matching the check in Commit.  Returns 0 when
-// the key is absent, tombstoned, or TTL-expired — so "expect 0" expresses
-// "commit only if the key still does not exist".
+// value a client passes back to Txn.SetIf (and the TXN wire command), and
+// exactly what Commit compares it with (versionToken).  It is the key's
+// WriteTimestampUs: in raft mode the raft-clock stamp of the command that
+// last wrote it, the same on every node and across restarts, snapshot
+// installs and rebuilds from the log — LegacyVersion (1) for a key last
+// written before the raft clock started; elsewhere the local write time.
+// Returns 0 when the key is absent, tombstoned, or TTL-expired — so
+// "expect 0" expresses "commit only if the key still does not exist".  It is
+// monotonic per key: every later write of the key gets a larger one
+// (raft_clock.go, invariant 66).
 func (se *StorageEngine) KeyVersion(key string) uint64 {
 	entry, _, ok := se.index.get(key)
-	if !ok || entry.IsTombstone() || entry.IsExpired(time.Now().UnixMicro()) {
+	if !ok {
 		return 0
 	}
-	return uint64(entry.WriteTimestampUs)
+	_, floor := se.RaftClock()
+	return versionToken(entry, time.Now().UnixMicro(), floor)
 }
 
 // Set stages key=value in the transaction. ttl < 0 means no TTL.
@@ -108,19 +115,20 @@ func (t *Txn) Commit() error {
 		return errors.New("transaction already committed")
 	}
 
-	// Phase 1: validate all SetIf guards under shard read locks.
+	// Phase 1: validate all SetIf guards under shard read locks.  The live
+	// version is KeyVersion's token, judged at the decision time — inside
+	// raft Apply the command's time, so every node decides alike
+	// (raft_clock.go).  An expired key counts as absent (version 0), as in
+	// KeyVersion; it used to count as live until something tombstoned it.
+	nowUs := t.se.decisionNowUs()
+	_, floor := t.se.RaftClock()
 	for _, op := range t.writes {
 		if !op.hasExpected {
 			continue
 		}
-		entry, _, ok := t.se.index.get(op.key)
 		var liveVersion uint64
-		if ok && !entry.IsTombstone() {
-			// IndexEntry doesn't expose a per-key version directly; we use
-			// WriteTimestampUs as a strict-monotonic stand-in. SetIf callers
-			// pass the WriteTimestampUs they read; concurrent writers would
-			// have advanced it.
-			liveVersion = uint64(entry.WriteTimestampUs)
+		if entry, _, ok := t.se.index.get(op.key); ok {
+			liveVersion = versionToken(entry, nowUs, floor)
 		}
 		if liveVersion != op.expectedVersion {
 			return ErrTxnConflict

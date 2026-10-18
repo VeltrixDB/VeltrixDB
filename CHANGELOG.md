@@ -11,6 +11,18 @@ Releases are cut automatically on every merge to `main` (GitHub release +
 
 ## [Unreleased]
 
+### Documentation
+
+- **One-command install and benchmarks.** New `Makefile`
+  (`make help`): build, run, a local 3-node cluster
+  (`cluster-up` / `cluster-status` / `cluster-down`, raft or replicated,
+  `scripts/local-cluster.sh`), `bench-quick` (`scripts/quick-bench.sh`: a
+  throwaway server, four phases, one table with throughput / P50 / P99 /
+  errors), `bench-ycsb` (YCSB against a throwaway node, no Docker),
+  `bench-ycsb-cluster`, `bench`, `bench-compare` and `bench-gcp` /
+  `bench-gcp-dry-run`. [QUICKSTART.md](QUICKSTART.md) walks through each,
+  plus Kubernetes and how to read laptop numbers.
+
 ### Performance
 
 - **Read counters no longer share one cache line.** `Reads`, `CacheHits` and
@@ -22,14 +34,322 @@ Releases are cut automatically on every merge to `main` (GitHub release +
   12.0M/s (+11%), writes unchanged within noise. Prometheus and
   `/admin/stats` values are unchanged.
 
+### Changed
+
+- **Raft snapshots have no size cap and are streamed and chunked.** A
+  snapshot over 256 MB used to be skipped (`snapshot too large ... skipping
+  compaction`), after which the raft log grew in memory and on disk without
+  bound. Snapshots are now streamed to `raft_snapshot.dat` (checksummed
+  records, header and trailer; `raft_snapshot.gob` is migrated on start)
+  and sent to followers in 2 MB chunks (`--raft-snapshot-chunk-kb`) that
+  survive lost, duplicated and reordered messages, a leader change, and a
+  newer snapshot replacing the file mid-transfer. The follower restores
+  without holding the raft lock, keeps answering heartbeats, and does not
+  start elections while it installs. CLAUDE.md invariant 64.
+- **A snapshot capture no longer stalls writes for the whole keyspace
+  scan.** The capture runs beside Apply and holds the apply lock only to
+  re-read the keys written in its last moments. 1,000,000 keys: slowest
+  write during a capture 2.76 s → 28 ms (Apply fence 0.2–0.3 ms); a
+  follower catching up through InstallSnapshot 42 s → 2.6 s.
+- **Mixed-version clusters:** a v1.16 follower still receives the old
+  single-shot InstallSnapshot when the snapshot fits its 256 MB limit
+  (otherwise the leader logs `NOT sending snapshot … upgrade peer`); a v1.16
+  leader's InstallSnapshot is accepted. Upgrade followers first, the leader
+  last, and the next node only after the restarted one has applied a fresh
+  write. Single-shot snapshots carry no TTLs: a v1.16 follower loses them,
+  and so does a new follower installing a v1.16 leader's snapshot; v1.16's
+  restore also never deletes, so keys deleted while a v1.16 follower lagged
+  survive on it — upgrade lagging v1.16 followers before they need a
+  snapshot. Downgrade to v1.16: a node with no `raft_snapshot.dat` starts as
+  it is; a node with one must be wiped and re-synced (v1.16 refuses it with
+  `corrupt raft log … does not follow the snapshot (index 0)`); v1.14 and
+  older always need the wipe. docs/replication.md#persistence,
+  docs/node-lifecycle.md#rolling-upgrade.
+- A node with a snapshot restores its engine from it on every start (reads
+  every key; writes only what changed since the snapshot) — this is what
+  makes an interrupted install safe to redo.
+
 ### Added
 
+- **Online cluster membership: add and remove nodes without restarting the
+  cluster.** `GET` / `POST /admin/cluster/members`, `DELETE
+  /admin/cluster/members/{id}` (admin auth) and `veltrix cluster members |
+  add-node id@host:port | remove-node id [--force]`; any node forwards a
+  change to the raft leader / replicated-mode coordinator over the transfer
+  listener (HMAC with the cluster secret). New flags `--join` (start empty and
+  ask to be added), `--advertise-addr`, `--force-new-cluster` (dangerous,
+  disaster recovery). Runbook: docs/node-lifecycle.md; CLAUDE.md invariant 67.
+  - **Raft**: a node is added as a *learner* (replicated to through entries or
+    chunked InstallSnapshot, never counted toward a quorum, so an empty or
+    slow newcomer cannot stall commits) and promoted to voter by the leader
+    once a catch-up round ends within 1 s. A `--join` node starts with an
+    empty configuration: it never campaigns and votes for nobody until a
+    leader adds it. Changes serialise (`409` while one is uncommitted) and are
+    refused up front without a reachable quorum (`503`). A removed leader
+    steps down once its removal commits. The configuration carries each
+    member's client address, so every node updates its raft transport, MOVED
+    redirects, `TOPOLOGY` and partition map. Raft mode still moves no keys.
+  - **Pre-vote**: an election starts with a pre-vote round that members
+    refuse for a non-member, for a stale log, and while they hear from a
+    leader. A removed, partitioned or not-yet-promoted node no longer
+    increments its term, so it can no longer depose a working leader when it
+    returns (before, any partitioned follower forced an election on rejoin).
+  - **Replicated**: membership is a versioned document every node persists
+    (`<--data>/cluster_membership.json`); changes run on one coordinator (the
+    lowest member ID), are pushed to every member and pulled by members that
+    missed them (at startup, before any replica is registered, and every
+    10 s). A new member gets each member's own writes through the replication
+    catch-up path and every key through the RF-aware migration (placement RF
+    = every member, matching the replication engine); migrated copies are
+    applied put-if-absent and marked as peer writes. A node is drained before
+    it is removed: it refuses writes until every write it originated is
+    acknowledged by every replica; then it is removed and sends its keys to
+    the remaining members, deleting each only after all of them acknowledged
+    it. A removed node refuses writes, also after a restart.
+  - **Persisted membership wins over `--peers`** in both modes once a change
+    was made online (raft: config entries in the log and the snapshot
+    header). A raft snapshot whose configuration is just the bootstrap
+    `--peers` list no longer overrides `--peers` on restart (it used to,
+    silently ignoring a changed `--peers` after the first snapshot).
+  - A failed replicated-mode migration (destination still starting, stale
+    epoch) is retried with backoff instead of only on the next membership
+    event.
+
+- **`/metrics` serves the Go, process, search and raft metrics.** The
+  server's private registry held only the VeltrixDB collector, so there were
+  no `go_*` or `process_*` series, and the shipped restart alert (which reads
+  `process_start_time_seconds`) could never fire. New series:
+  - `go_*` and `process_*` (labelled `node`). `process_*` is Linux only;
+    macOS serves `process_start_time_seconds` alone.
+  - The hardware collector the Grafana dashboards read
+    (`veltrixdb_runtime_*`, `_process_*`, `_system_*`, `_disk_*`). It existed
+    but was never registered.
+  - `veltrixdb_search_requests_total` / `_errors_total{reason}` /
+    `_latency_seconds` per `kind` (vector, text, hybrid), plus
+    `_partial_total` (`--search-allow-partial`), `_ready`, rebuild progress,
+    and vector and text document counts. Per-namespace vector series are
+    capped at 64 namespaces.
+  - In raft mode: `veltrixdb_raft_term`, `_is_leader`, `_commit_index`,
+    `_applied_index`, `_log_retained_entries`, and the
+    `RaftNode.SnapshotStatus()` snapshot counters (captures, installs,
+    chunks sent / received, legacy sends, last capture / fence / size).
+
+  Recording a search allocates nothing, and a scrape of a fresh node takes
+  about 8 ms. See docs/monitoring.md.
+- **Alerts** in `monitoring/prometheus-rules.yaml` (24 rules; the Helm
+  chart's `prometheusRule.extendedAlerts` groups match):
+  - search: rebuild stuck, partial results, `rebuilding` / `incomplete`
+    errors, P99 over 1 s
+  - raft: snapshot captures failing, snapshot transfers failing (leader),
+    snapshot install / restore failing (follower) — read from the new
+    counters below — plus log not compacted as a backstop, apply lag, term
+    churn, no leader
+  - replication: full resync / delete gap (critical), `replication_state.json`
+    write errors, replica catch-up pending for 30 minutes
+
+  `TestMetricsEndpoint` starts a raft and a replicated server and fails if a
+  rule names a metric that neither serves.
+- **Snapshot failure counters**: `RaftNode.SnapshotStatus()` gains
+  `CaptureFailures`, `SnapshotsSent`, `TransferFailures`,
+  `InstallFailures` and `RestoreFailures`, exported as
+  `veltrixdb_raft_snapshot_capture_failures_total`, `_sent_total`,
+  `_transfer_failures_total`, `_install_failures_total` and
+  `_restore_failures_total`.
+- **Replication recovery metrics**: `veltrixdb_replication_full_resyncs_total`,
+  `_catchup_gaps_total`, `_state_persists_total`,
+  `_state_persist_errors_total`, and the gauges `_replicas_resync_pending` /
+  `_replicas_delete_gap`; `GET /admin/cluster` shows `resync_pending` and
+  `delete_gap` per replica.
+- **Jepsen-style consistency harness** (`tests/jepsen`, standard library
+  only): 3-node raft and replicated clusters of real server processes, 8
+  clients, a nemesis (SIGKILL, SIGSTOP, crash mid-InstallSnapshot, and
+  iptables partitions through a hook on Linux), and checkers — per-key
+  linearizability (Wing & Gong search with memoisation and a shrinker to a
+  minimal failing history), counters, sets, read validity and copy counts. A
+  negative control must find stale reads. Runs nightly
+  (`.github/workflows/nightly.yml`, `jepsen`, with and without
+  `--raft-pipeline`, partitions enabled). See tests/jepsen/README.md.
+- **Rolling-upgrade tests** (`tests/upgrade`, `VELTRIX_UPGRADE_TEST=1`):
+  real v1.16 and current-build processes on the same data dirs — raft
+  rolling upgrades with and without snapshots, mixed-version snapshot
+  transfers in both directions, replicated rolling upgrade, standalone
+  upgrade and downgrade (clean and SIGKILL), raft downgrade with and without
+  a wipe. Runs nightly (`upgrade` job). They found the v1.16 snapshot TTL
+  loss on upgrade (fixed above) and the downgrade corrections in
+  docs/replication.md and docs/node-lifecycle.md.
+- `--raft-snapshot-threshold` (default 8192, env
+  `VELTRIX_RAFT_SNAPSHOT_THRESHOLD`) and `--raft-snapshot-chunk-kb` (default
+  2048, env `VELTRIX_RAFT_SNAPSHOT_CHUNK_KB`).
+- `RaftNode.SnapshotStatus()` (consensus): snapshot index, captures,
+  installs, last Apply stall, chunk counters, failure counters.
 - `--pprof-mutex-fraction N` and `--pprof-block-rate NS` (with
   `--pprof-addr`): turn on the runtime's mutex and block profiling, so
   `/debug/pprof/mutex` and `/debug/pprof/block` are no longer always empty.
   Both default to 0 (off).
 
 ### Fixed
+
+- **A raft follower now answers a rejected MPUT with `MOVED`.** A batch
+  write (MPUT — which also carries every TTL'd PUT from the SDKs) sent to a
+  follower returned per-entry ERR bytes, so the client got no leader address.
+  The whole batch is rejected with one redirect, so it is now answered with
+  the `[0x01][len]["MOVED <addr> <leaderId>"]` error frame every other op uses
+  (`TestMPut_RedirectsOnNonLeader`). All six SDKs already raise that frame as
+  their MOVED error.
+
+- **Raft: a chunked snapshot transfer to an unreachable follower retried
+  forever with the snapshot file and capabilities it started with.** A
+  follower restarted as an older version (no chunk support) never got the
+  single-shot snapshot it needed, and a follower that was away through
+  several compactions first received a stale snapshot. The transfer now
+  restarts when the follower's capabilities changed or, before any chunk was
+  accepted, when a newer snapshot exists. (A leader change used to restart it
+  as a side effect; with pre-vote a returning follower no longer forces one.)
+
+- **Raft: SETIF / guarded TXN diverged the replicas.** The version token
+  (`VER` / `GETVER`, compared by `SETIF`) was each node's own write
+  timestamp, so a guarded TXN applied through the log held on the node whose
+  token the client had read and failed on the others; a node rebuilt from the
+  log gave every key a new version. The leader now stamps every command with
+  its clock and each node applies it at the derived raft time
+  `max(Ts, previous + 1)`: versions are the same on every node, monotonic per
+  key, and survive restarts, snapshot installs and rebuilds. Relative TTLs
+  become the same deadline everywhere, and every expiry decision in Apply
+  (SETNX, CAS, INCR, `SETIF` expecting 0, list / hash ops) is taken at that
+  time; the TTL scanner and reads never tombstone ahead of it. Also: Apply
+  waits for the engine's WAL replay, namespace quotas are checked by the
+  leader before submitting (not per node in Apply), the TTL scanner and the
+  tombstone reaper no longer act on a key rewritten since they scanned it
+  (all modes), and a TXN guard treats an expired key as absent, as `VER`
+  does. Wire format unchanged. Mixed-version clusters: a command from a
+  v1.16 leader applies as before; keys last written before the upgrade read
+  version 1 on every node; do not rely on `SETIF` until every node is
+  upgraded. CLAUDE.md invariant 66, docs/replication.md.
+
+- **Data loss: every write made after a runtime WAL checkpoint was lost on a
+  crash restart (all releases, v1.0–v1.16).** `POST /admin/checkpoint`, every
+  online backup (`POST /admin/backup`, `veltrix backup`) and
+  `CheckpointManager` renamed the compacted checkpoint over `wal.log` while
+  the WAL flusher kept its file descriptor on the old, now unlinked inode.
+  Writes were acknowledged after an fdatasync of that orphaned file, so on
+  standalone and replicated nodes every write acknowledged after an online
+  backup or `/admin/checkpoint` was gone after a crash, power loss or SIGKILL
+  — until the next clean restart, whose shutdown checkpoint rebuilt `wal.log`
+  from the index and hid the problem. In replicated mode the node's catch-up
+  feed was rebuilt from the same WAL, so a crashed node also lost those writes
+  as a source for its replicas' catch-up. Raft mode recovered them from the
+  raft log. Reproduced by `TestLiveCheckpoint_WritesAfterCheckpointSurviveRestart`
+  (195 of 480 keys lost per crash variant before the fix). A runtime checkpoint
+  now fences the WAL in its flusher, waits for writes in flight to reach the
+  index, builds the compacted records with writes flowing, carries the WAL
+  written meanwhile into the new file and swaps the flusher onto it between
+  two group-commit batches (`storage/wal_checkpoint_live.go`); the rename is
+  the commit point and the old `wal.log` is untouched until then. The write
+  stall is that last swap only (tail since the previous copy, one fdatasync,
+  rename, directory fsync); `StorageEngine.LastCheckpointStats` reports it.
+  Online backups now copy only that checkpoint's compacted records (not the
+  live `wal.log`) and record its fence version as `engine_version`; the PITR
+  archiver follows the file swap.
+- **Raft: a checkpoint taken right after a crash-restart that cut records
+  dropped all its records at the next start.** The checkpoint was written at
+  the engine version, which right after a cutting open equals the upper bound
+  of the cut's dead range, so the next open discarded every checkpointed
+  record (clean shutdown with no write in between → empty engine). Checkpoints
+  are now written at the newest applied-index marker's own version.
+- **Raft: re-upgrading a node that ran v1.16 after a no-wipe downgrade no
+  longer double-applies its log.** v1.16 installs the applied-index marker as
+  a live key and its clean-shutdown checkpoint rewrites it at its own version;
+  the new build trusted that stale copy and re-applied every entry v1.16 had
+  applied (INCRs doubled). The marker now embeds its record's version (format
+  2) and a rewritten copy is not trusted: the node resets and applies its log
+  once, or restores its snapshot. Every record of the reserved key is dropped
+  from the keyspace, and a v1.16 snapshot's copy is skipped on restore. No
+  wipe is needed before re-upgrading (`TestRaftDowngradeReupgradeIncr`, real
+  v1.16 binary).
+- **Raft: a restarted node no longer applies its log a second time.** Raft
+  persisted the log but not the applied index, so every restart re-applied the
+  retained log (or the tail after the snapshot) over an engine that already
+  held it: INCR / DECR counters doubled (INCR ×10 then a clean restart → 20),
+  list pushes repeated, version-guarded TXNs failed their guard, relative TTLs
+  restarted, and in a rolling restart each node ended with different counters.
+  The engine now appends an applied-index marker to its WAL after each applied
+  run (no extra fsync), and in `--mode=raft` WAL replay stops at the newest
+  one, so the engine holds exactly the entries ≤ that index and raft skips
+  them; a crash mid-entry rolls the entry back as a whole and it is applied
+  again once. Upgrading a node whose data has no marker: with a snapshot, the
+  snapshot is restored and the tail applied; without one, the engine is reset
+  and the whole log applied once — never replayed over the old state. No WAL
+  format change; an older build ignores the marker (CLAUDE.md invariant 65,
+  docs/replication.md#applied-index-exactly-once-apply-across-restarts).
+- **Raft: a node with a snapshot restarts without the O(keys) restore.** The
+  startup restore from `raft_snapshot.dat` is skipped when the engine's applied
+  index is at or past the snapshot and no restore is marked in progress (an
+  install marks itself durably before touching the engine, so an interrupted
+  one is still redone). Single node, snapshot of 1,000,000 × 128 B keys
+  (Apple-silicon laptop, APFS): raft start 1.62 s / 1.91 s → 78 ms / 145 ms
+  (two runs); engine WAL replay (~1.9–2.8 s) is unchanged.
+- **Raft upgrade from v1.16: TTLs inside a v1.16 snapshot are no longer
+  dropped.** The first start of an upgraded node restored `raft_snapshot.gob`
+  (which has no TTLs) and rewrote every key immortal, though the engine's WAL
+  still had the expiry; the next snapshot made the loss permanent. A key whose
+  value the engine already holds now keeps its own expiry.
+
+- **Replicated mode: a replica that was down while its primary restarted no
+  longer loses the writes and deletes made before the restart.** The per-op
+  retention buffer and per-replica acks were in memory only, so the restarted
+  primary took the replica as caught up. Each replica's acknowledgement
+  watermark is now persisted (`<--data>/replication_state.json`, written at
+  most once per second, never per write) and a replica with a persisted
+  watermark is caught up from the change feed before it returns to SYNC.
+  Along the way: a clean shutdown kept no tombstones, so deletes vanished from
+  the catch-up feed — the checkpoint now keeps the tombstones a replica still
+  needs; the catch-up re-sent keys the node had merely received from peers, so
+  a returning node pushed its stale copies back and undid deletes — writes
+  applied from a peer are now marked (`FlagReplicaApplied`, in the WAL) and
+  never re-sent; the catch-up scanned the index before the startup WAL replay
+  finished; and it re-scanned and re-sorted the whole index per 1,000-key
+  page (now one pass, `StorageEngine.ScanChanges`). A replica behind by more
+  than 2 × `GCGracePeriodSec` is fully resynced and flagged with an ERROR
+  (`FULL RESYNC`): a delete whose tombstone was reaped cannot be replayed.
+  Upgrade note: the first start of this build has no state file and takes
+  every replica as caught up, as before. Tests:
+  `tests/integration/replicated_recovery_test.go`,
+  `replication/state_test.go`, `storage/replication_recovery_test.go`.
+
+- **Two alert rules could not fire as written.** `VeltrixDBVLogGCStalled`
+  used `and` between a per-node counter and the per-disk garbage ratio,
+  which never match on labels; it now compares the target's worst disk.
+  `VeltrixDBProcessRestarted` read a metric the server did not export,
+  through `increase()` on a gauge and a `job="veltrixdb"` selector. It now
+  fires while `process_start_time_seconds` is less than 5 minutes old. The
+  GC read-error alert no longer quotes a `disk` label that the counter does
+  not have.
+
+- **Raft followers diverged after an InstallSnapshot.** Restore only wrote
+  the snapshot's key/value pairs over the follower's engine, so every key
+  deleted on the leader while the follower was behind (including the
+  vectors, text documents and `@idx/` entries of deleted records) survived
+  on the follower forever. Restore now makes the follower's keyspace exactly
+  the snapshot's and rebuilds its search indexes from it
+  (`TestRaftSnapshot_FollowerCatchUpWithDeletes` fails on v1.16).
+- **Raft snapshots dropped TTLs.** Restored keys became immortal; the
+  snapshot now carries each key's absolute expiry (µs), restores it exactly
+  and skips keys that expired in between.
+- **Secondary-index definitions were not part of a raft snapshot**, so a
+  follower caught up by InstallSnapshot stopped maintaining `@idx/` entries
+  for new writes; they are now carried and restored.
+- A log compaction that ran concurrently with appends could leave a
+  single-node raft leader unable to commit them (the rewrite made them
+  durable without advancing the commit index).
+- **Flaky tests.** `TestGroupCommit_AdaptiveGates` failed 2/4 under load
+  (absolute lone-writer P50 and single fixed-then-adaptive runs): it now
+  gates the pacer's flush decisions exactly and its wall-clock claims only
+  relative to fixed mode, with retries. Integration-test servers took
+  ephemeral ports that other sockets could grab before the server bound them
+  (`TestRaftClusterFailover`, 2/40 under load: `bind: address already in
+  use`); they now draw ports below every OS's ephemeral range.
+  `TestMetricsEndpoint` picks its metrics port inside the server's reserved
+  port block for the same reason.
 
 - **Data loss on node failure with `--auto-rebalance=true` (the default).**
   When a node was marked FAILED, every node ran `MigrateToNewOwners`, which
@@ -57,10 +377,11 @@ Releases are cut automatically on every merge to `main` (GitHub release +
   header) or carries an 11th text field; TTL-free records are unchanged.
   Replay restores the TTL and tombstones keys already expired; checkpoints,
   backups and PITR archives carry it. **Rollback:** builds without this change
-  stop replay at the first TTL'd record and drop everything after it — before
-  downgrading, run once with the new `--wal-format=text-legacy` and stop
-  cleanly (TTL'd keys become immortal on the older build). See
-  docs/DR_RUNBOOK.md §8.
+  (v1.13 and older) stop replay at the first TTL'd record and drop everything
+  after it — before downgrading to one of them, run once with the new
+  `--wal-format=text-legacy` and stop cleanly (TTL'd keys become immortal on
+  the older build). v1.14 and later read these records directly and need no
+  step. See docs/DR_RUNBOOK.md §8.
 - **`veltrix` CLI**: `status` reports readiness from the `/readyz` status code.
   Before, it searched the body for `ok` while `/readyz` answers `ready`, so it
   always printed NOT READY. `cdc-tail` now decodes the server's
@@ -138,9 +459,9 @@ Releases are cut automatically on every merge to `main` (GitHub release +
   entries before the group-commit fsync), and a follower whose persist fails
   answers `Success=false` instead of acknowledging. **Upgrade:** an existing
   `raft_state.gob` is migrated on first start (renamed to
-  `raft_state.gob.migrated`). **Rollback:** an older build cannot read the new
-  files — wipe the node's `--data` and let it re-sync from the leader, one
-  node at a time (docs/replication.md#persistence).
+  `raft_state.gob.migrated`). **Rollback:** an older build (v1.14 and older)
+  cannot read the new files — wipe the node's `--data` and let it re-sync
+  from the leader, one node at a time (docs/replication.md#persistence).
 - **Raft: follower fsync off the node lock, pipelined replication.** A
   follower used to write AND fsync every AppendEntries that carried entries
   while holding `rn.mu`, so it handled one request per fsync and blocked

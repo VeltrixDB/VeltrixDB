@@ -21,9 +21,11 @@ package main
 //     from the membership, and comes back through RECOVERING → ACTIVE with
 //     its data. Only real membership changes (added / removed) do.
 //
-// A failed migration is retried on the next membership event (keys whose
-// replicas did not all acknowledge them are never deleted, and the agent's
-// baseline membership is not advanced, so a retry re-sends).
+// A failed migration is retried with backoff (rebalanceRetryMin doubling to
+// rebalanceRetryMax) and on the next membership event (keys whose replicas
+// did not all acknowledge them are never deleted, and the agent's baseline
+// membership is not advanced, so a retry re-sends) — a node added online may
+// still be starting, or briefly refuse batches with a stale epoch.
 
 import (
 	"log"
@@ -33,6 +35,11 @@ import (
 )
 
 const rebalanceDebounce = 3 * time.Second
+
+var (
+	rebalanceRetryMin = 5 * time.Second
+	rebalanceRetryMax = time.Minute
+)
 
 // setupRebalancer applies the per-mode rules to a node's transfer agent and,
 // when allowed and enabled, starts the auto-rebalancer. Returns a stop
@@ -68,6 +75,7 @@ func startAutoRebalancer(pm *cluster.PartitionMap, ta *cluster.TransferAgent, lo
 	go func() {
 		var timer *time.Timer
 		var fire <-chan time.Time
+		retry := time.Duration(0)
 		for {
 			select {
 			case <-done:
@@ -82,6 +90,7 @@ func startAutoRebalancer(pm *cluster.PartitionMap, ta *cluster.TransferAgent, lo
 				}
 				log.Printf("[rebalance] membership event node=%s type=%s — scheduling rebalance",
 					ev.NodeID, ev.Type)
+				retry = 0
 				if timer == nil {
 					timer = time.NewTimer(rebalanceDebounce)
 					fire = timer.C
@@ -103,8 +112,16 @@ func startAutoRebalancer(pm *cluster.PartitionMap, ta *cluster.TransferAgent, lo
 				}
 				start := time.Now()
 				if err := ta.MigrateToNewOwners(); err != nil {
-					log.Printf("[rebalance] migration incomplete (will retry on next event): %v", err)
+					if retry == 0 {
+						retry = rebalanceRetryMin
+					} else if retry *= 2; retry > rebalanceRetryMax {
+						retry = rebalanceRetryMax
+					}
+					log.Printf("[rebalance] migration incomplete (retry in %s): %v", retry, err)
+					timer = time.NewTimer(retry)
+					fire = timer.C
 				} else {
+					retry = 0
 					log.Printf("[rebalance] rebalance + migration done in %s", time.Since(start).Round(time.Millisecond))
 				}
 			}

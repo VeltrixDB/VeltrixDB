@@ -32,7 +32,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"time"
 )
 
 // fieldIndexDefsFile is the JSON meta file (in the first data dir) that
@@ -283,7 +282,7 @@ func (se *StorageEngine) backfillFieldIndex() {
 
 // scanKeysWithPrefix returns all live internal keys with the given prefix.
 func (se *StorageEngine) scanKeysWithPrefix(prefix string) []string {
-	nowUs := time.Now().UnixMicro()
+	nowUs := se.decisionNowUs() // raft Apply: the command's time
 	var keys []string
 	for i := range se.index.shards {
 		shard := &se.index.shards[i]

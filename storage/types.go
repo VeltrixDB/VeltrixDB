@@ -25,14 +25,21 @@ const vlogHeaderBytes = 24
 // ── Index entry flags ────────────────────────────────────────────────────────
 
 const (
-	FlagTombstone        uint8 = 0x01 // record is deleted
-	FlagCompressed       uint8 = 0x02 // value stored with zstd compression
-	FlagEncrypted        uint8 = 0x04 // value is encrypted at rest
-	FlagHasTTL           uint8 = 0x08 // TTLExpiryUs is a valid absolute deadline
-	FlagReadRepairNeeded uint8 = 0x10 // replica is lagging; trigger read repair
-	FlagPinned           uint8 = 0x20 // never evict this entry from Index Vault
-	FlagPacked           uint8 = 0x40 // VLog record is packed (multiple records share a 4 KB block)
-	FlagTiered           uint8 = 0x80 // value has been demoted to cold tier; DiskOffset holds tier handle hash
+	FlagTombstone  uint8 = 0x01 // record is deleted
+	FlagCompressed uint8 = 0x02 // value stored with zstd compression
+	FlagEncrypted  uint8 = 0x04 // value is encrypted at rest
+	FlagHasTTL     uint8 = 0x08 // TTLExpiryUs is a valid absolute deadline
+	// FlagReplicaApplied: the entry's latest write (put or delete) was
+	// applied from a --mode=replicated peer, not originated on this node.
+	// Carried in the WAL xflags byte, so it survives restarts.  The
+	// replication catch-up feed skips such entries (ScanChanges localOnly):
+	// a node must never re-send another node's write — its copy may be
+	// stale, and replicas apply in arrival order.  (Was the never-set
+	// FlagReadRepairNeeded.)
+	FlagReplicaApplied uint8 = 0x10
+	FlagPinned         uint8 = 0x20 // never evict this entry from Index Vault
+	FlagPacked         uint8 = 0x40 // VLog record is packed (multiple records share a 4 KB block)
+	FlagTiered         uint8 = 0x80 // value has been demoted to cold tier; DiskOffset holds tier handle hash
 )
 
 // ── 64-byte Index Vault entry ────────────────────────────────────────────────
@@ -100,8 +107,11 @@ func (e *IndexEntry) IsExpired(nowUs int64) bool {
 	return e.HasTTL() && e.TTLExpiryUs > 0 && nowUs >= e.TTLExpiryUs
 }
 
+// MarkTombstone turns e into a tombstone written at nowUs.  It clears
+// FlagReplicaApplied (a delete is a new write; the caller sets the flag again
+// when the delete itself came from a replication peer).
 func (e *IndexEntry) MarkTombstone(nowUs int64) {
-	e.Flags |= FlagTombstone
+	e.Flags = e.Flags&^FlagReplicaApplied | FlagTombstone
 	e.ValueSize = 0
 	e.WriteTimestampUs = nowUs
 }
@@ -606,6 +616,12 @@ type StorageConfig struct {
 	// than it cannot parse. Text records cannot represent keys containing
 	// '|' or '\n' — see wal_format.go.
 	WALFormat string
+
+	// RaftAppliedIndex: the engine is a raft state machine.  Replay stops at
+	// the newest applied-index marker (writes of later raft entries are
+	// dropped; raft re-applies them) — storage/raft_applied.go, invariant 65.
+	// Only --mode=raft sets it: elsewhere a cut would drop acknowledged writes.
+	RaftAppliedIndex bool
 
 	// Write stall / back-pressure
 	//

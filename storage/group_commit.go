@@ -60,8 +60,35 @@ type commitPacer struct {
 	ewmaBatch float64       // requests per flush
 	ewmaSync  time.Duration // fdatasync duration
 
-	immediate atomic.Uint64 // flushes issued without waiting (alone)
-	gapped    atomic.Uint64 // flushes issued after an idle gap / deadline
+	// Flush decisions, by reason. Tests gate on these instead of wall-clock
+	// latency, which a loaded machine distorts (group_commit_test.go).
+	immediate atomic.Uint64 // flushed without waiting: lone writer
+	gapped    atomic.Uint64 // flushed when no request arrived for one gap
+	deadlined atomic.Uint64 // flushed at the window deadline
+	filled    atomic.Uint64 // flushed because the batch hit its cap
+}
+
+// pacerStats is a snapshot of one pacer's flush decisions.
+type pacerStats struct {
+	Immediate, Gap, Deadline, Full uint64
+}
+
+func (s pacerStats) add(o pacerStats) pacerStats {
+	return pacerStats{s.Immediate + o.Immediate, s.Gap + o.Gap, s.Deadline + o.Deadline, s.Full + o.Full}
+}
+
+func (p *commitPacer) stats() pacerStats {
+	return pacerStats{p.immediate.Load(), p.gapped.Load(), p.deadlined.Load(), p.filled.Load()}
+}
+
+// timerFired records why the batch timer fired: the window deadline (always,
+// in fixed mode) or an idle gap. Call it before bt.stop().
+func (p *commitPacer) timerFired(bt *batchTimer) {
+	if !p.adaptive || (!bt.deadline.IsZero() && !time.Now().Before(bt.deadline)) {
+		p.deadlined.Add(1)
+	} else {
+		p.gapped.Add(1)
+	}
 }
 
 func newCommitPacer(mode string, window time.Duration) *commitPacer {
@@ -144,7 +171,11 @@ func (bt *batchTimer) stop() {
 // holds n. It returns true when the caller must flush now; otherwise it has
 // (re)armed the timer.
 func (p *commitPacer) schedule(bt *batchTimer, n int, full bool) bool {
-	if p.window <= 0 || full {
+	if p.window <= 0 {
+		return true
+	}
+	if full {
+		p.filled.Add(1)
 		return true
 	}
 	now := time.Now()
@@ -163,6 +194,7 @@ func (p *commitPacer) schedule(bt *batchTimer, n int, full bool) bool {
 	}
 	rest := bt.deadline.Sub(now)
 	if rest <= 0 {
+		p.deadlined.Add(1)
 		return true
 	}
 	g := p.gap()

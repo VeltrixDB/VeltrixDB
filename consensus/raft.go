@@ -25,10 +25,10 @@
 // syncer goroutine outside rn.mu (pipeline.go).
 //
 // When the log exceeds Options.SnapshotThreshold entries and the state machine
-// implements SnapshotStateMachine, the applied prefix of the log is replaced
-// by a state-machine snapshot persisted to <dataDir>/raft_snapshot.gob (see
-// snapshot.go).  On restart the snapshot is restored before the remaining log
-// tail is replayed.
+// implements StreamingStateMachine (or the older SnapshotStateMachine), the
+// applied prefix of the log is replaced by a state-machine snapshot streamed
+// to <dataDir>/raft_snapshot.dat (see snapshot.go, snapshot_file.go).  On
+// restart the snapshot is restored before the remaining log tail is replayed.
 //
 // # Membership
 //
@@ -120,6 +120,12 @@ type RequestVoteArgs struct {
 	CandidateID  string
 	LastLogIndex uint64
 	LastLogTerm  uint64
+	// PreVote: a pre-vote round (membership.go, preVote).  Term is the term
+	// the candidate WOULD campaign in; the receiver changes no state and only
+	// says whether it would grant a vote.  Older servers ignore the field and
+	// treat it as a real vote request (no worse than an election without
+	// pre-vote).
+	PreVote bool
 }
 
 // RequestVoteReply carries the peer's response to a vote request.
@@ -154,6 +160,9 @@ type AppendEntriesReply struct {
 	// false; the leader then uses prev+len(Entries).
 	HasMatch   bool
 	MatchIndex uint64
+	// Caps: capability bits of the replying follower (capSnapshotChunks).
+	// Older followers leave it 0.
+	Caps uint32
 }
 
 // StateMachine is applied once a log entry is committed.
@@ -256,6 +265,40 @@ type Options struct {
 	// leader keeps in flight per follower when Pipeline is set.
 	// 0 = DefaultPipelineWindow.  Ignored (1) when Pipeline is false.
 	PipelineWindow int
+
+	// SnapshotChunkSize is the InstallSnapshot chunk size in bytes
+	// (0 = DefaultSnapshotChunkSize).
+	SnapshotChunkSize int
+
+	// legacyPeer (tests only) makes the node behave like a v1.16 peer on the
+	// snapshot wire: it advertises no capabilities, refuses chunks and
+	// sends only single-shot InstallSnapshots.
+	legacyPeer bool
+
+	// Join (server --join): the node starts with an EMPTY bootstrap
+	// configuration instead of {self + peers}, so until a leader replicates a
+	// configuration that includes it, it never campaigns and votes for
+	// nobody — an empty node can never form its own cluster.  Ignored once
+	// the log or snapshot holds a configuration.
+	Join bool
+
+	// ForceNewCluster (server --force-new-cluster, DANGEROUS): at startup,
+	// replace the configuration with {self} through a local config entry in
+	// a new term.  For disaster recovery when a quorum is permanently lost;
+	// every other former member must be wiped and re-joined.
+	ForceNewCluster bool
+
+	// SelfAddr / BootstrapAddrs: application addresses (Configuration.Addrs)
+	// of this node and of the bootstrap peers, recorded in the bootstrap
+	// configuration so the first configuration entry carries them.
+	SelfAddr       string
+	BootstrapAddrs map[string]string
+
+	// OnConfigChange, when set, is called with a copy of every new effective
+	// configuration (at startup and whenever an entry or snapshot changes
+	// it).  It runs with the node's lock held: it must not block or call
+	// back into the RaftNode.
+	OnConfigChange func(Configuration)
 }
 
 // ── RaftNode ──────────────────────────────────────────────────────────────────
@@ -299,8 +342,27 @@ type RaftNode struct {
 	lastIncludedIndex uint64
 	lastIncludedTerm  uint64
 	snapshotThreshold uint64
-	snapshotting      bool            // one snapshot at a time
+	snapshotting      bool            // one capture at a time (guarded by mu)
 	snapInFlight      map[string]bool // per-peer InstallSnapshot guard
+	captureFailures   int             // consecutive failed captures (mu)
+	captureRetryAt    time.Time       // no capture before this (mu)
+	snapChunkSize     int
+	legacyPeer        bool              // Options.legacyPeer
+	peerCaps          map[string]uint32 // leader: capabilities from AE replies (mu)
+	legacyRefused     map[string]uint64 // leader: snapshot ID refused per legacy peer (mu)
+	snapStats         snapshotStats     // metrics (atomic)
+	// snapMu serialises snapshot capture and install (snapshot.go).  Lock
+	// order: snapMu → smMu → rn.mu.  A capture holds it for its whole scan
+	// (without smMu); an install sets abortCapture to stop such a scan.
+	snapMu       sync.Mutex
+	abortCapture atomic.Bool
+	// installing counts snapshot installs in progress (verification and
+	// restore): while it is > 0 the election timer stays quiet (ticker).
+	installing atomic.Int32
+	// recvMu guards recv, the follower's in-progress chunked transfer.
+	// Lock order: recvMu → rn.mu; never held with smMu.
+	recvMu sync.Mutex
+	recv   *snapRecv
 	// smMu serialises all state-machine access (Apply / Snapshot / Restore).
 	// Lock order: smMu before rn.mu, never the reverse.
 	smMu sync.Mutex
@@ -311,8 +373,19 @@ type RaftNode struct {
 	config          Configuration
 	configIndex     uint64 // log index of the entry that produced config (0 = bootstrap)
 	baseConfig      Configuration
-	baseConfigIndex uint64 // config as of lastIncludedIndex (snapshot) or bootstrap
-	removed         atomic.Bool
+	baseConfigIndex uint64      // config as of lastIncludedIndex (snapshot) or bootstrap
+	removed         atomic.Bool // not a member (removed, or --join not yet added)
+	voter           atomic.Bool // a voter in its own configuration (may campaign)
+	voterPeers      []string    // voters except self (elections, ReadIndex)
+	onConfig        func(Configuration)
+	configNotified  bool
+	// leaderContact: last valid AppendEntries / snapshot RPC from a leader
+	// (pre-vote stickiness).  lastAck: leader only — last reply per peer in
+	// this term (ErrNoQuorum pre-check, promotion).  learnerRounds: leader
+	// only — catch-up rounds (membership.go).  All guarded by mu.
+	leaderContact time.Time
+	lastAck       map[string]time.Time
+	learnerRounds map[string]*learnerRound
 
 	// Volatile state on all servers
 	commitIndex uint64
@@ -342,6 +415,11 @@ type RaftNode struct {
 	batchSM     BatchStateMachine // non-nil if sm implements batch apply
 	applyCh     chan LogEntry     // committed entries queued here for applier goroutine
 	applierDone chan struct{}
+
+	// appliedSM: sm records its applied index with its state (applied.go).
+	appliedSM        AppliedIndexStateMachine
+	appliedErrLogged bool          // under smMu
+	startupSnap      *snapshotMeta // restore deferred by loadSnapshot (startup only)
 
 	// Batch-apply metrics (read without lock — approximate; used by tests to
 	// assert the applier actually coalesced consecutive writes).
@@ -382,14 +460,15 @@ type RaftNode struct {
 	electionGeneration atomic.Uint64
 
 	// Metrics (read without lock — approximate)
-	LeaderID atomic.Value // string
+	LeaderID     atomic.Value // string
+	preVotesLost atomic.Uint64
 }
 
 // NewRaftNode creates and starts a RaftNode with default Options.
 //
 //	id        — unique string ID for this server (e.g. "node-1")
 //	peers     — IDs of ALL other servers (not including self)
-//	dataDir   — directory for raft_log.dat / raft_meta.dat / raft_snapshot.gob
+//	dataDir   — directory for raft_log.dat / raft_meta.dat / raft_snapshot.dat
 //	sm        — state machine to apply committed commands to
 //	transport — network layer (use NewTCPTransport from transport.go)
 func NewRaftNode(id string, peers []string, dataDir string, sm StateMachine, transport Transport) (*RaftNode, error) {
@@ -410,6 +489,10 @@ func NewRaftNodeWithOptions(id string, peers []string, dataDir string, sm StateM
 		transport:         transport,
 		snapshotThreshold: opts.SnapshotThreshold,
 		snapInFlight:      make(map[string]bool),
+		snapChunkSize:     opts.SnapshotChunkSize,
+		legacyPeer:        opts.legacyPeer,
+		peerCaps:          make(map[string]uint32),
+		legacyRefused:     make(map[string]uint64),
 		electionResetC:    make(chan struct{}, 1),
 		applyCh:           make(chan LogEntry, 4096),
 		applierDone:       make(chan struct{}),
@@ -424,6 +507,7 @@ func NewRaftNodeWithOptions(id string, peers []string, dataDir string, sm StateM
 		syncCh:            make(chan struct{}, 1),
 		syncerDone:        make(chan struct{}),
 		pipeline:          opts.Pipeline,
+		onConfig:          opts.OnConfigChange,
 	}
 	rn.pipelineWindow = 1
 	if opts.Pipeline {
@@ -446,17 +530,37 @@ func NewRaftNodeWithOptions(id string, peers []string, dataDir string, sm StateM
 	if bsm, ok := sm.(BatchStateMachine); ok {
 		rn.batchSM = bsm
 	}
+	var applied startupApplied
+	if asm, ok := sm.(AppliedIndexStateMachine); ok {
+		rn.appliedSM = asm
+		applied.st, applied.ok = asm.DurableAppliedIndex()
+	}
 
-	// Bootstrap configuration: self + static peers.  Overridden below by any
-	// configuration found in the snapshot or the persisted log.
+	// Bootstrap configuration: self + static peers (empty for a joining
+	// node).  Overridden below by any configuration found in the snapshot or
+	// the persisted log — the persisted membership always wins.
 	boot := Configuration{Servers: append([]string{id}, peers...)}
+	if opts.Join {
+		boot = Configuration{}
+	} else if opts.SelfAddr != "" || len(opts.BootstrapAddrs) > 0 {
+		boot.Addrs = make(map[string]string)
+		for _, p := range peers {
+			if a := opts.BootstrapAddrs[p]; a != "" {
+				boot.Addrs[p] = a
+			}
+		}
+		if opts.SelfAddr != "" {
+			boot.Addrs[id] = opts.SelfAddr
+		}
+	}
 	rn.baseConfig = boot.clone()
 	rn.baseConfigIndex = 0
 	rn.setConfig(boot, 0)
 
 	// Restore the snapshot (state machine + lastIncludedIndex/Term) BEFORE
-	// loading the log, then replay only the retained tail.
-	if err := rn.loadSnapshot(); err != nil {
+	// loading the log, then replay only the retained tail — unless the state
+	// machine recorded that it already holds the snapshot (applied.go).
+	if err := rn.loadSnapshot(applied); err != nil {
 		return nil, fmt.Errorf("load snapshot: %w", err)
 	}
 
@@ -468,20 +572,52 @@ func NewRaftNodeWithOptions(id string, peers []string, dataDir string, sm StateM
 		return nil, fmt.Errorf("load state: %w", err)
 	}
 
+	trusted := rn.trustApplied(applied)
+	if err := rn.finishStartupRestore(applied, trusted); err != nil {
+		rn.store.close()
+		return nil, fmt.Errorf("load snapshot: %w", err)
+	}
+	if rn.appliedSM != nil && !trusted && rn.lastIncludedIndex == 0 && len(rn.ps.Log) > 0 {
+		if err := rn.resetStateForReplay(applied); err != nil {
+			rn.store.close()
+			return nil, err
+		}
+	}
+
 	// Everything up to the snapshot is already applied to the state machine;
-	// entries beyond it are re-applied once commitIndex advances.
+	// entries beyond it are re-applied once commitIndex advances — except
+	// those the state machine recorded as applied (applied.go): they were
+	// committed when they were applied, and applying them again would apply
+	// every non-idempotent command twice.
 	rn.commitIndex = rn.lastIncludedIndex
 	rn.lastApplied = rn.lastIncludedIndex
+	if trusted && applied.st.Index > rn.lastApplied {
+		rn.lastApplied = applied.st.Index
+		rn.commitIndex = applied.st.Index
+	}
+	if q, ok := sm.(ApplyQuiescer); ok {
+		q.SetApplyQuiescer(rn.withApplyQuiesced)
+	}
 
 	// Effective config = latest config entry in the log, else snapshot/bootstrap.
 	rn.refreshConfigFromLog()
+	if opts.ForceNewCluster {
+		if err := rn.forceSingleNodeConfigLocked(opts.SelfAddr); err != nil {
+			rn.store.close()
+			return nil, fmt.Errorf("force new cluster: %w", err)
+		}
+		rn.refreshConfigFromLog()
+	}
+	if opts.Join && rn.configIndex == 0 && rn.lastIncludedIndex == 0 && len(rn.config.Servers) == 0 {
+		log.Printf("[raft] node=%s joining: not a member yet — waiting for a leader to add it (never campaigns until it is a voter)", id)
+	}
 
 	rn.electionTimer = time.NewTimer(rn.randomElectionTimeout())
 
 	// Log before starting the goroutines: once they run, reading rn.ps/rn.peers
 	// requires rn.mu.
-	log.Printf("[raft] node=%s started  peers=%v  term=%d  log_len=%d  snapshot_idx=%d",
-		id, rn.peers, rn.ps.CurrentTerm, len(rn.ps.Log), rn.lastIncludedIndex)
+	log.Printf("[raft] node=%s started  peers=%v  term=%d  log_len=%d  snapshot_idx=%d  applied=%d",
+		id, rn.peers, rn.ps.CurrentTerm, len(rn.ps.Log), rn.lastIncludedIndex, rn.lastApplied)
 
 	rn.mu.Lock()
 	rn.repl = make(map[string]*peerRepl)
@@ -675,6 +811,13 @@ func (rn *RaftNode) rewriteLogLocked() error {
 		return err
 	}
 	rn.durableIndex = rn.lastLogIndex()
+	if rn.role == RoleLeader {
+		// The rewrite made entries durable that the syncer had not flushed
+		// yet; its next markDurableLocked sees nothing new, so the leader's
+		// self-count must advance here (a capture runs concurrently with
+		// appends — without this a single-node leader never committed them).
+		rn.maybeAdvanceCommit()
+	}
 	rn.kickSyncerLocked() // parked follower replies may now be answerable
 	return nil
 }
@@ -816,9 +959,24 @@ func (rn *RaftNode) HandleRequestVote(args RequestVoteArgs) RequestVoteReply {
 	reply := RequestVoteReply{Term: rn.ps.CurrentTerm}
 
 	// Membership safeguard (dissertation §4.2.3): refuse to vote for servers
-	// outside our current configuration, so a removed server that keeps timing
-	// out cannot disrupt the cluster (or even bump our term).
+	// outside our current voter set, so a removed server (or a learner, or a
+	// --join node) that keeps timing out cannot disrupt the cluster (or even
+	// bump our term).
 	if !rn.config.contains(args.CandidateID) {
+		return reply
+	}
+
+	if args.PreVote {
+		// Pre-vote: no state changes.  Grant only for a later term, an
+		// up-to-date log, and when no leader was heard from recently (a
+		// partitioned or restarted server cannot depose a working leader).
+		if args.Term <= rn.ps.CurrentTerm || rn.role == RoleLeader ||
+			(!rn.leaderContact.IsZero() && time.Since(rn.leaderContact) < electionTimeoutMin) ||
+			!rn.logUpToDate(args.LastLogTerm, args.LastLogIndex) {
+			return reply
+		}
+		reply.Term = args.Term
+		reply.VoteGranted = true
 		return reply
 	}
 
@@ -881,26 +1039,52 @@ func (rn *RaftNode) ticker() {
 			gen := rn.electionGeneration.Load()
 			rn.mu.Lock()
 			role := rn.role
+			if rn.installing.Load() > 0 && role != RoleLeader {
+				// Restoring a snapshot the leader sent: stay quiet (the
+				// leader keeps heartbeating; see snapshot.go).
+				rn.resetElectionTimer()
+				rn.mu.Unlock()
+				continue
+			}
 			rn.mu.Unlock()
-			if role != RoleLeader && !rn.removed.Load() && rn.electionGeneration.Load() == gen {
+			if role != RoleLeader && rn.voter.Load() && !rn.removed.Load() && rn.electionGeneration.Load() == gen {
 				rn.spawn(rn.startElection)
+			} else if role != RoleLeader {
+				// Not a voter (learner, removed, or --join not added yet):
+				// never campaign; just re-arm the timer.
+				rn.mu.Lock()
+				rn.resetElectionTimer()
+				rn.mu.Unlock()
 			}
 
 		case <-heartbeat.C:
 			rn.mu.Lock()
 			if rn.role == RoleLeader {
 				rn.heartbeatLocked()
+				rn.maybePromoteLearnersLocked()
 			}
 			rn.mu.Unlock()
 		}
 	}
 }
 
-// startElection transitions this server to Candidate and requests votes.
+// startElection runs a pre-vote round and, if a quorum of voters would vote
+// for this node, transitions to Candidate and requests votes.
 func (rn *RaftNode) startElection() {
+	if !rn.preVote() {
+		// No quorum would vote for us (or a leader showed up): stay a
+		// follower in this term and try again after another timeout.  The
+		// timer fired to get here, so it must be re-armed.
+		rn.mu.Lock()
+		if rn.role != RoleLeader {
+			rn.resetElectionTimer()
+		}
+		rn.mu.Unlock()
+		return
+	}
 	rn.mu.Lock()
 
-	if rn.removed.Load() {
+	if rn.removed.Load() || !rn.config.contains(rn.id) || rn.role == RoleLeader {
 		rn.mu.Unlock()
 		return
 	}
@@ -922,7 +1106,7 @@ func (rn *RaftNode) startElection() {
 	term := rn.ps.CurrentTerm
 	lastIdx := rn.lastLogIndex()
 	lastTerm := rn.lastLogTerm()
-	peers := rn.peers
+	peers := append([]string(nil), rn.voterPeers...) // learners never vote
 	needed := int64(rn.quorumSize())
 
 	rn.resetElectionTimer()
@@ -971,6 +1155,87 @@ func (rn *RaftNode) startElection() {
 	wg.Wait()
 }
 
+// preVote asks the voters whether they would vote for this node in the next
+// term, WITHOUT incrementing its own term (Raft dissertation §9.6).  Only a
+// node that a quorum would elect goes on to a real election, so a server
+// that cannot win — removed, partitioned away, or behind — never bumps its
+// term, and therefore never forces members to adopt a higher one.
+func (rn *RaftNode) preVote() bool {
+	rn.mu.Lock()
+	if rn.removed.Load() || !rn.config.contains(rn.id) || rn.role == RoleLeader {
+		rn.mu.Unlock()
+		return false
+	}
+	myTerm := rn.ps.CurrentTerm
+	args := RequestVoteArgs{
+		Term:         myTerm + 1,
+		CandidateID:  rn.id,
+		LastLogIndex: rn.lastLogIndex(),
+		LastLogTerm:  rn.lastLogTerm(),
+		PreVote:      true,
+	}
+	peers := append([]string(nil), rn.voterPeers...)
+	needed := int64(rn.quorumSize())
+	rn.mu.Unlock()
+	if needed <= 1 {
+		return true
+	}
+
+	var granted atomic.Int64
+	granted.Store(1) // self
+	won := make(chan struct{})
+	var once sync.Once
+	var wg sync.WaitGroup
+	for _, peer := range peers {
+		wg.Add(1)
+		go func(peer string) {
+			defer wg.Done()
+			reply, err := rn.transport.SendRequestVote(peer, args)
+			if err != nil {
+				return
+			}
+			if reply.VoteGranted {
+				if granted.Add(1) >= needed {
+					once.Do(func() { close(won) })
+				}
+				return
+			}
+			if reply.Term > myTerm {
+				rn.mu.Lock()
+				if reply.Term > rn.ps.CurrentTerm {
+					rn.becomeFollower(reply.Term)
+				}
+				rn.mu.Unlock()
+			}
+		}(peer)
+	}
+	all := make(chan struct{})
+	go func() { wg.Wait(); close(all) }()
+	select {
+	case <-won:
+	case <-all:
+		select {
+		case <-won:
+		default:
+			rn.preVotesLost.Add(1)
+			return false
+		}
+	case <-rn.done:
+		return false
+	}
+	// Still a follower of the same term?  (A leader may have contacted us
+	// meanwhile; then this election is moot.)
+	rn.mu.Lock()
+	ok := rn.ps.CurrentTerm == myTerm && rn.role != RoleLeader &&
+		(rn.leaderContact.IsZero() || time.Since(rn.leaderContact) >= electionTimeoutMin)
+	rn.mu.Unlock()
+	return ok
+}
+
+// PreVotesLost counts pre-vote rounds that did not reach a quorum (tests,
+// diagnostics): each one is an election that did NOT bump the term.
+func (rn *RaftNode) PreVotesLost() uint64 { return rn.preVotesLost.Load() }
+
 // becomeLeader transitions this node to Leader and initialises leader state.
 // Must be called with rn.mu held.
 func (rn *RaftNode) becomeLeader() {
@@ -986,6 +1251,8 @@ func (rn *RaftNode) becomeLeader() {
 		rn.nextIndex[p] = nextIdx
 		rn.matchIndex[p] = 0
 	}
+	rn.lastAck = make(map[string]time.Time)
+	rn.learnerRounds = nil
 	log.Printf("[raft] node=%s → LEADER  term=%d  log_len=%d",
 		rn.id, rn.ps.CurrentTerm, len(rn.ps.Log))
 
@@ -1114,22 +1381,30 @@ func (rn *RaftNode) applier() {
 // split at any non-batchable entry (no-op nil commands, configuration changes),
 // which are applied singly; nothing is ever applied out of order.
 //
-// The entire pass holds smMu for the duration.  Lock order: smMu is taken
-// before rn.mu (matching HandleInstallSnapshot and takeSnapshot) so a snapshot
-// restore can never interleave with an apply, and — because smMu is the only
-// mutator of lastApplied besides this goroutine — lastApplied cannot advance
-// underneath us, so a run gathered under it stays valid until applied.
+// Each run is gathered and applied under smMu.  Lock order: smMu is taken
+// before rn.mu (matching installSnapshot and the capture fence) so a snapshot
+// restore can never interleave with an apply, and — because lastApplied only
+// moves under smMu — a run gathered under it stays valid until applied.
 func (rn *RaftNode) applyCommitted() {
+	// smMu is taken per run, not for the whole pass: under a steady commit
+	// stream one pass can last arbitrarily long, and a snapshot capture's
+	// fence (snapshot.go) must be able to get in between two runs.
+	for rn.applyOneRun() {
+	}
+}
+
+// applyOneRun applies one gathered run of committed entries under smMu and
+// reports whether there may be more.
+func (rn *RaftNode) applyOneRun() bool {
 	rn.smMu.Lock()
 	defer rn.smMu.Unlock()
-
-	for {
+	{
 		rn.mu.Lock()
 		start := rn.lastApplied + 1
 		end := rn.commitIndex
 		if start > end {
 			rn.mu.Unlock()
-			return
+			return false
 		}
 		// Gather the contiguous committed-but-unapplied run.  Committed entries
 		// are never truncated or overwritten, so these copies stay valid after
@@ -1144,10 +1419,12 @@ func (rn *RaftNode) applyCommitted() {
 		}
 		rn.mu.Unlock()
 		if len(entries) == 0 {
-			return
+			return false
 		}
 		rn.applyEntries(entries)
+		rn.recordApplied(entries[len(entries)-1])
 	}
+	return true
 }
 
 // batchable reports whether an entry is an ordinary write that ApplyBatch may

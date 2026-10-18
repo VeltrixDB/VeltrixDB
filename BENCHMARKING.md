@@ -1,5 +1,11 @@
 # Benchmarking VeltrixDB
 
+> **Just want a number?** `make bench-quick` (one table in about a minute),
+> `make bench-ycsb` (YCSB, no Docker), `make cluster-up && make
+> bench-ycsb-cluster` (3 local nodes) and `make bench-gcp PROJECT=…` (real
+> 3-VM run). [QUICKSTART.md](QUICKSTART.md#4-benchmark) has all of them.
+> This file is the methodology and the gated storage benchmark.
+
 `scripts/bench.sh` runs a 6-phase sequenced workload (build + start, MPut bulk load, cool-down, read-only, mixed 70R/30W, sustained MPut write stress) and reports go/no-go on two hard gates: **packing density** and **GC emergency runs**. Re-run it after any storage engine change.
 
 It builds the server and `loadtest` with `CGO_ENABLED=0` (Go map index) unless you export `CGO_ENABLED=1`. The Docker image is a cgo build (native index), so set `CGO_ENABLED=1` on Linux to measure what the image runs.

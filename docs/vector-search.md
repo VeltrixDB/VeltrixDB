@@ -194,7 +194,9 @@ checked best-first on the scored documents until k match.
   restart (loaded x of y; retry, or start the server with
   --search-allow-partial)` — they would otherwise miss vectors — also when
   the rebuilding node is a peer in a fan-out, and `INFO` shows
-  `search_ready=0 search_loaded=x/y` (`search_ready=1` once done).
+  `search_ready=0 search_loaded=x/y` (`search_ready=1` once done; in
+  Prometheus `veltrixdb_search_ready` and `_rebuild_loaded_keys`, see
+  [monitoring.md](monitoring.md#search)).
   `--search-allow-partial` answers anyway. KV traffic, `QUERY` and
   `IDXQUERY` are not affected.
 - 3 SIGKILL-during-writes cycles (8.5K, 8.4K and 11.9K acknowledged writes):

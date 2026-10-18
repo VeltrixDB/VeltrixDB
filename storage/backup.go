@@ -5,11 +5,21 @@ package storage
 // Backup strategy (WiscKey KV-separation model):
 //
 //   Full backup
-//     1. Trigger a WAL checkpoint (compacted WAL, one record per live key).
+//     1. Run a runtime WAL checkpoint (wal_checkpoint_live.go): a compacted
+//        image of the index, one record per live key, while writes go on.
 //     2. For each disk: copy [0, vlogEnd) bytes of vlog_active.dat to
-//        backup_dir/disk<N>/vlog.dat.
-//     3. Copy the compacted wal.log to backup_dir/disk<N>/wal.log.
-//     4. Write backup_dir/manifest.json with vlogEnd offsets and version.
+//        backup_dir/disk<N>/vlog.dat. vlogEnd is read after the checkpoint,
+//        so it covers every value the compacted records point at (a record
+//        is in the index only once its value is durable).
+//     3. Copy that checkpoint's compacted records — only them, through a
+//        handle opened on the new file, never the live wal.log, whose tail
+//        keeps growing with records whose values may still be in flight —
+//        to backup_dir/disk<N>/wal.log.
+//     4. Write backup_dir/manifest.json with vlogEnd offsets and version:
+//        EngineVersion is the checkpoint's fence version — every write with
+//        a version at or below it is in the backup (PITR restore applies the
+//        archived records above it). Writes concurrent with the checkpoint's
+//        build may be in the backup too.
 //
 //   Incremental backup (relative to a full or previous incremental)
 //     1. Trigger a WAL checkpoint.
@@ -86,24 +96,27 @@ func NewBackupEngine(se *StorageEngine) *BackupEngine {
 // FullBackup writes a full backup to destDir.
 // destDir is created if it does not exist.
 // The engine continues serving traffic throughout — the WAL checkpoint is
-// crash-safe and VLog reads use pread64, which is safe alongside concurrent
-// appends to non-overlapping ranges.
+// safe under concurrent writes (wal_checkpoint_live.go) and VLog reads use
+// pread64, which is safe alongside concurrent appends to non-overlapping
+// ranges.
 func (be *BackupEngine) FullBackup(destDir string) (*BackupManifest, error) {
 	if err := os.MkdirAll(destDir, 0755); err != nil {
 		return nil, fmt.Errorf("mkdir %s: %w", destDir, err)
 	}
 
-	// 1. Flush a WAL checkpoint for every disk.
-	if err := be.se.Checkpoint(); err != nil {
+	// 1. A runtime WAL checkpoint of every disk.
+	lc, err := be.se.checkpointForBackup()
+	if err != nil {
 		return nil, fmt.Errorf("checkpoint: %w", err)
 	}
+	defer lc.close()
 
 	dataDirs := be.se.GetDataDirs()
 	manifest := &BackupManifest{
 		BackupID:      fmt.Sprintf("full-%d", time.Now().UnixNano()),
 		Type:          BackupTypeFull,
 		Timestamp:     time.Now().UnixNano(),
-		EngineVersion: be.se.GetVersion(),
+		EngineVersion: lc.fenceVersion,
 		NumDisks:      len(dataDirs),
 		Disks:         make([]DiskBackupMeta, len(dataDirs)),
 	}
@@ -128,10 +141,9 @@ func (be *BackupEngine) FullBackup(destDir string) (*BackupManifest, error) {
 			}
 		}
 
-		// 3. Copy the freshly-written compacted WAL.
-		walSrc := filepath.Join(dataDir, "wal.log")
+		// 3. Copy the checkpoint's compacted records.
 		walDst := filepath.Join(diskDir, "wal.log")
-		if err := copyFileFull(walSrc, walDst); err != nil {
+		if err := copyCheckpointRecords(lc, i, walDst); err != nil {
 			return nil, fmt.Errorf("disk %d copy wal: %w", i, err)
 		}
 
@@ -161,10 +173,12 @@ func (be *BackupEngine) IncrementalBackup(destDir string, baseManifest *BackupMa
 		return nil, fmt.Errorf("mkdir %s: %w", destDir, err)
 	}
 
-	// Checkpoint so WAL reflects all live keys at this moment.
-	if err := be.se.Checkpoint(); err != nil {
+	// Checkpoint so the compacted WAL reflects all live keys at this moment.
+	lc, err := be.se.checkpointForBackup()
+	if err != nil {
 		return nil, fmt.Errorf("checkpoint: %w", err)
 	}
+	defer lc.close()
 
 	dataDirs := be.se.GetDataDirs()
 	if len(dataDirs) != len(baseManifest.Disks) {
@@ -177,7 +191,7 @@ func (be *BackupEngine) IncrementalBackup(destDir string, baseManifest *BackupMa
 		Type:          BackupTypeIncremental,
 		BaseBackupDir: baseManifest.BackupID,
 		Timestamp:     time.Now().UnixNano(),
-		EngineVersion: be.se.GetVersion(),
+		EngineVersion: lc.fenceVersion,
 		NumDisks:      len(dataDirs),
 		Disks:         make([]DiskBackupMeta, len(dataDirs)),
 	}
@@ -208,10 +222,9 @@ func (be *BackupEngine) IncrementalBackup(destDir string, baseManifest *BackupMa
 			}
 		}
 
-		// Copy the new compacted WAL (covers all live keys at this moment).
-		walSrc := filepath.Join(dataDir, "wal.log")
+		// Copy the checkpoint's compacted records (all live keys at this moment).
 		walDst := filepath.Join(diskDir, "wal.log")
-		if err := copyFileFull(walSrc, walDst); err != nil {
+		if err := copyCheckpointRecords(lc, i, walDst); err != nil {
 			return nil, fmt.Errorf("disk %d copy wal: %w", i, err)
 		}
 
@@ -325,6 +338,25 @@ func writeManifest(dir string, m *BackupManifest) error {
 		return err
 	}
 	return os.Rename(tmp, filepath.Join(dir, "manifest.json"))
+}
+
+// copyCheckpointRecords writes disk i's compacted checkpoint records — the
+// first ckptLen bytes of the file that checkpoint created, read through the
+// handle it kept — to a new dst file.
+func copyCheckpointRecords(lc *liveCheckpoint, i int, dst string) error {
+	d := lc.disks[i]
+	if d.snap == nil {
+		return fmt.Errorf("no checkpoint handle for disk %d", i)
+	}
+	df, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer df.Close()
+	if err := copyWALRange(df, d.snap, 0, d.ckptLen); err != nil {
+		return err
+	}
+	return df.Sync()
 }
 
 // copyFileRange copies n bytes starting at offset off from src to a new dst file.

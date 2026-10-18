@@ -71,8 +71,13 @@ package consensus
 //     an older term are ignored.
 //
 // Heartbeats bypass the window.  A peer whose next entry was compacted gets
-// an InstallSnapshot once its pipeline has drained, after which the pipeline
-// restarts in probing mode at lastIncludedIndex+1.
+// an InstallSnapshot once its pipeline has drained.  The transfer runs on its
+// own goroutine (snapshot.go); meanwhile the replicator keeps heartbeating the
+// peer (prev = lastIncludedIndex; their rejections are ignored), so the
+// follower never times out during a long transfer or restore.  Afterwards
+// the pipeline restarts in probing mode at lastIncludedIndex+1.  Every
+// AppendEntries reply carries the follower's capabilities (Caps), which tell
+// the leader whether it may send chunked snapshots.
 //
 // In both modes an AppendEntries may carry entries the leader has not fsynced
 // yet (pipeline on: always; off: the ones appended while its last fsync ran).
@@ -272,7 +277,7 @@ func (rn *RaftNode) takeDecidedWaitersLocked() []aeDecided {
 			kept = append(kept, w)
 			continue
 		}
-		r := AppendEntriesReply{Term: rn.ps.CurrentTerm}
+		r := AppendEntriesReply{Term: rn.ps.CurrentTerm, Caps: rn.localCaps()}
 		if ok {
 			r.Success, r.HasMatch, r.MatchIndex = true, true, w.target
 		} else {
@@ -319,7 +324,7 @@ func (rn *RaftNode) HandleAppendEntries(args AppendEntriesArgs) AppendEntriesRep
 // waiter to park until the request's entries are durable.
 // Must be called with rn.mu held.
 func (rn *RaftNode) appendEntriesLocked(args AppendEntriesArgs) (AppendEntriesReply, *aeWaiter) {
-	reply := AppendEntriesReply{Term: rn.ps.CurrentTerm}
+	reply := AppendEntriesReply{Term: rn.ps.CurrentTerm, Caps: rn.localCaps()}
 	if rn.stopped.Load() {
 		return reply, nil
 	}
@@ -338,6 +343,7 @@ func (rn *RaftNode) appendEntriesLocked(args AppendEntriesArgs) (AppendEntriesRe
 	rn.currentRole.Store(int32(RoleFollower))
 	rn.LeaderID.Store(args.LeaderID)
 	rn.resetElectionTimer()
+	rn.noteLeaderContactLocked()
 	reply.Term = rn.ps.CurrentTerm
 
 	prev, prevTerm, ents := args.PrevLogIndex, args.PrevLogTerm, args.Entries
@@ -456,7 +462,9 @@ type peerRepl struct {
 	probing      bool   // one request at a time until a Success
 	epoch        uint64 // bumped on every pipeline reset
 	hbDue        bool   // the ticker asked for a heartbeat
-	snapshotting bool
+	snapshotting bool   // a snapshot transfer to this peer is running
+	// snapRetryAt: after a failed transfer, no new one before this.
+	snapRetryAt time.Time
 }
 
 func (pr *peerRepl) wake() {
@@ -553,6 +561,9 @@ type aeSend struct {
 	args    AppendEntriesArgs
 	entries bool   // carries entries (counts toward the window)
 	epoch   uint64 // pipeline epoch at send time
+	// snapHB: a keep-alive heartbeat sent while the peer needs or receives a
+	// snapshot; only its term is looked at.
+	snapHB bool
 }
 
 // appendArgsLocked builds an AppendEntries for the entries after prev.
@@ -596,7 +607,7 @@ func (rn *RaftNode) replicate(pr *peerRepl) {
 		if next <= rn.lastIncludedIndex {
 			// The entries this peer needs were compacted: ship the snapshot,
 			// but only once every in-flight request has been answered.
-			if pr.inflight == 0 {
+			if pr.inflight == 0 && !time.Now().Before(pr.snapRetryAt) {
 				pr.snapshotting, snap = true, true
 			}
 			break
@@ -616,23 +627,22 @@ func (rn *RaftNode) replicate(pr *peerRepl) {
 		rn.nextIndex[pr.peer] = next + uint64(n)
 		pr.inflight++
 	}
-	if hb && len(sends) == 0 && !snap && !pr.snapshotting {
-		if next := rn.nextIndex[pr.peer]; next > rn.lastIncludedIndex {
+	if hb && len(sends) == 0 {
+		if next := rn.nextIndex[pr.peer]; !pr.snapshotting && next > rn.lastIncludedIndex {
 			sends = append(sends, aeSend{args: rn.appendArgsLocked(next-1, nil), epoch: pr.epoch})
+		} else if rn.lastIncludedIndex > 0 {
+			// The peer needs, or is receiving, a snapshot: keep it from
+			// timing out.  prev = the snapshot point (its term is known);
+			// a rejection is expected and ignored (snapHB).
+			sends = append(sends, aeSend{args: rn.appendArgsLocked(rn.lastIncludedIndex, nil), epoch: pr.epoch, snapHB: true})
 		}
 	}
 	rn.mu.Unlock()
 
-	if snap {
-		rn.sendSnapshot(pr.peer, pr.term)
+	if snap && !rn.spawn(func() { rn.runSnapshotTransfer(pr) }) {
 		rn.mu.Lock()
 		pr.snapshotting = false
-		// InstallSnapshot resets the pipeline: restart (probing) after it.
-		pr.epoch++
-		pr.probing = true
 		rn.mu.Unlock()
-		pr.wake()
-		return
 	}
 	for _, s := range sends {
 		s := s
@@ -672,6 +682,13 @@ func (rn *RaftNode) onAppendReply(pr *peerRepl, s aeSend, reply AppendEntriesRep
 	if reply.Term > rn.ps.CurrentTerm {
 		rn.becomeFollower(reply.Term)
 		return
+	}
+	if rn.role == RoleLeader && reply.Term == rn.ps.CurrentTerm {
+		rn.noteAckLocked(pr.peer) // reachable (ErrNoQuorum pre-check)
+	}
+	rn.peerCaps[pr.peer] = reply.Caps
+	if s.snapHB {
+		return // keep-alive during a snapshot transfer
 	}
 	if pr.stopped || rn.role != RoleLeader || rn.ps.CurrentTerm != s.args.Term {
 		return // stale reply (older term or replaced replicator)

@@ -154,6 +154,13 @@ func (h *lateHandler) HandleInstallSnapshot(a InstallSnapshotArgs) InstallSnapsh
 	return InstallSnapshotReply{}
 }
 
+func (h *lateHandler) HandleInstallSnapshotChunk(a InstallSnapshotChunkArgs) InstallSnapshotChunkReply {
+	if n := h.get(); n != nil {
+		return n.HandleInstallSnapshotChunk(a)
+	}
+	return InstallSnapshotChunkReply{}
+}
+
 func envInt(k string, def int) int {
 	if v, err := strconv.Atoi(os.Getenv(k)); err == nil {
 		return v

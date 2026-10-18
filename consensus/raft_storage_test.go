@@ -334,12 +334,12 @@ func TestRaftLog_SnapshotCompactionThenRestart(t *testing.T) {
 	if len(disk) >= len(first) {
 		t.Fatalf("log file not compacted: %d records for %d commands", len(disk), len(first))
 	}
-	snap, ok, err := n.readSnapshotFile()
-	if err != nil || !ok {
-		t.Fatalf("read snapshot: ok=%v err=%v", ok, err)
+	snap, err := verifySnapshotFile(n.snapshotPath())
+	if err != nil {
+		t.Fatalf("read snapshot: %v", err)
 	}
-	if len(disk) > 0 && disk[0].Index != snap.LastIncludedIndex+1 {
-		t.Fatalf("log file starts at %d, snapshot covers through %d", disk[0].Index, snap.LastIncludedIndex)
+	if len(disk) > 0 && disk[0].Index != snap.Index+1 {
+		t.Fatalf("log file starts at %d, snapshot covers through %d", disk[0].Index, snap.Index)
 	}
 
 	sm2 := &mockSnapSM{}

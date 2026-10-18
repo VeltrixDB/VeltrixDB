@@ -230,10 +230,17 @@ WAL records are binary by default. Replay reads binary and legacy text records
 in any mix, so **upgrading needs no step**: the new build replays the existing
 text WAL and appends binary records after it.
 
-A build that predates the binary WAL cannot read it, and a build that predates
-TTL-in-WAL cannot read a record of a key with a TTL (binary version 2, or the
-11th text field): either stops its replay there and **drops every later
-record**. To roll back to any older build:
+**Rolling back to v1.14 or later (v1.16 included) needs no WAL step**: those
+builds read binary version-1 and version-2 records and keep TTLs, after a clean
+stop or a crash. Skip the procedure below for them — it would only make every
+TTL'd key immortal. (Raft nodes have their own rule: a node with
+`raft_snapshot.dat` must be wiped to go back to v1.16 — docs/replication.md,
+Persistence → Rollback.)
+
+A build that predates the binary WAL (v1.5 and older) cannot read it, and a
+build that predates TTL-in-WAL (v1.13 and older) cannot read a record of a key
+with a TTL (binary version 2, or the 11th text field): either stops its replay
+there and **drops every later record**. To roll back to one of those builds:
 
 ```bash
 # 1. On the CURRENT build, restart once writing the TTL-free legacy text WAL

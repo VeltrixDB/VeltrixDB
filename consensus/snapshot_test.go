@@ -147,7 +147,7 @@ func TestSnapshot_TakenTruncatedAndRestart(t *testing.T) {
 		node.Stop()
 		t.Fatal("no snapshot taken despite log exceeding threshold")
 	}
-	if _, err := os.Stat(filepath.Join(dir, "raft_snapshot.gob")); err != nil {
+	if _, err := os.Stat(filepath.Join(dir, snapFileName)); err != nil {
 		node.Stop()
 		t.Fatalf("snapshot file missing: %v", err)
 	}

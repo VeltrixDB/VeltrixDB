@@ -101,6 +101,12 @@ type VeltrixCollector struct {
 	replReplicasSyncPend *prometheus.Desc
 	replRecoveryProbes   *prometheus.Desc
 	replRecoveries       *prometheus.Desc
+	replCatchUpGaps      *prometheus.Desc
+	replFullResyncs      *prometheus.Desc
+	replStatePersists    *prometheus.Desc
+	replStatePersistErrs *prometheus.Desc
+	replResyncPending    *prometheus.Desc
+	replDeleteGap        *prometheus.Desc
 
 	// ── WAL I/O ───────────────────────────────────────────────────────────────
 	walWriteBytes   *prometheus.Desc // counter: bytes written to WAL across all disks
@@ -306,6 +312,12 @@ func NewVeltrixCollector(
 		replReplicasSyncPend: desc("replication", "replicas_sync_pending", "Replicas currently in SYNC_PENDING state (reachable again, catching up)."),
 		replRecoveryProbes:   desc("replication", "recovery_probes_total", "Reconnect probes sent to FAILED replicas."),
 		replRecoveries:       desc("replication", "replica_recoveries_total", "Replicas that completed FAILED → SYNC_PENDING → SYNC."),
+		replCatchUpGaps:      desc("replication", "catchup_gaps_total", "Replica recoveries that could not replay everything the replica missed (deletes may be missing; logged as ERROR)."),
+		replFullResyncs:      desc("replication", "full_resyncs_total", "Catch-ups that streamed the whole change feed: watermark older than the tombstone retention, or unreadable recovery state (log line FULL RESYNC)."),
+		replStatePersists:    desc("replication", "state_persists_total", "Writes of the durable recovery state (replication_state.json)."),
+		replStatePersistErrs: desc("replication", "state_persist_errors_total", "Failed writes of the durable recovery state (replication_state.json)."),
+		replResyncPending:    desc("replication", "replicas_resync_pending", "Replicas whose change-feed catch-up is pending or running."),
+		replDeleteGap:        desc("replication", "replicas_delete_gap", "Replicas flagged since start with a delete gap: a catch-up started further back than the tombstone retention, so deletes may be missing."),
 
 		// wal i/o
 		walWriteBytes:   desc("storage", "wal_write_bytes_total", "Bytes written to WAL files across all disks (includes WAL framing overhead)."),
@@ -392,6 +404,8 @@ func (c *VeltrixCollector) Describe(ch chan<- *prometheus.Desc) {
 		c.replWrites, c.replFailures, c.replLagBytes, c.replLagNs,
 		c.replAntiEntropyRuns, c.replReplicasFailed, c.replReplicasSyncPend,
 		c.replRecoveryProbes, c.replRecoveries,
+		c.replCatchUpGaps, c.replFullResyncs, c.replStatePersists, c.replStatePersistErrs,
+		c.replResyncPending, c.replDeleteGap,
 		// wal i/o
 		c.walWriteBytes, c.walBatchEntries,
 		// vlog i/o per disk
@@ -532,6 +546,12 @@ func (c *VeltrixCollector) Collect(ch chan<- prometheus.Metric) {
 		gauge(c.replReplicasSyncPend, float64(c.replMetrics.ReplicasSyncPending.Load()))
 		counter(c.replRecoveryProbes, c.replMetrics.RecoveryProbes.Load())
 		counter(c.replRecoveries, c.replMetrics.ReplicaRecoveries.Load())
+		counter(c.replCatchUpGaps, c.replMetrics.CatchUpGaps.Load())
+		counter(c.replFullResyncs, c.replMetrics.FullResyncs.Load())
+		counter(c.replStatePersists, c.replMetrics.StatePersists.Load())
+		counter(c.replStatePersistErrs, c.replMetrics.StatePersistErrors.Load())
+		gauge(c.replResyncPending, float64(c.replMetrics.ReplicasResyncPending.Load()))
+		gauge(c.replDeleteGap, float64(c.replMetrics.ReplicasDeleteGap.Load()))
 	}
 
 	// ── WAL I/O ───────────────────────────────────────────────────────────────

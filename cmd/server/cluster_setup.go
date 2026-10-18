@@ -20,6 +20,8 @@ import (
 	"hash/fnv"
 	"log"
 	"net"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -114,6 +116,19 @@ type clusterParams struct {
 
 	// raftPipeline: --raft-pipeline (consensus.Options.Pipeline).
 	raftPipeline bool
+	// raftSnapThreshold / raftSnapChunk: --raft-snapshot-threshold,
+	// --raft-snapshot-chunk-kb (consensus.Options).
+	raftSnapThreshold uint64
+	raftSnapChunk     int
+
+	// Online membership (membership.go): mm receives raft configuration
+	// changes; join = --join (start with an empty raft configuration);
+	// forceNewCluster = --force-new-cluster; advertise = this node's
+	// dialable client address (--advertise-addr).
+	mm              *membershipManager
+	join            bool
+	forceNewCluster bool
+	advertise       string
 }
 
 // buildCoordinator constructs the coordinator for raft/replicated mode and
@@ -134,7 +149,11 @@ func buildRaftCoordinator(p clusterParams) (*coordinator, func(), *replication.R
 	// Transport peer map: nodeID → raft RPC address.
 	transPeers := make(map[string]string, len(p.peers))
 	peerIDs := make([]string, 0, len(p.peers))
-	peerClientAddr := map[string]string{p.nodeID: p.clientAddr}
+	self := p.clientAddr
+	if p.advertise != "" {
+		self = p.advertise
+	}
+	peerClientAddr := map[string]string{p.nodeID: self}
 	for _, pr := range p.peers {
 		transPeers[pr.id] = deriveAddr(pr.clientAddr, offRaft)
 		peerIDs = append(peerIDs, pr.id)
@@ -156,12 +175,17 @@ func buildRaftCoordinator(p clusterParams) (*coordinator, func(), *replication.R
 	fsm := newRaftFSM(pCurrentEngine)
 
 	raftDir := p.dataDir + "/raft"
-	node, err := consensus.NewRaftNodeWithOptions(p.nodeID, peerIDs, raftDir, fsm, transport,
-		consensus.Options{SnapshotThreshold: consensus.DefaultSnapshotThreshold, Pipeline: p.raftPipeline})
+	opts := consensus.Options{SnapshotThreshold: p.raftSnapThreshold, Pipeline: p.raftPipeline, SnapshotChunkSize: p.raftSnapChunk,
+		Join: p.join, ForceNewCluster: p.forceNewCluster, SelfAddr: p.advertise, BootstrapAddrs: peerClientAddr}
+	if p.mm != nil {
+		opts.OnConfigChange = p.mm.raftConfigHook(transport)
+	}
+	node, err := consensus.NewRaftNodeWithOptions(p.nodeID, peerIDs, raftDir, fsm, transport, opts)
 	if err != nil {
 		_ = transport.Close()
 		return nil, nil, nil, fmt.Errorf("raft node: %w", err)
 	}
+	installSnapshotCrashHook(p.nodeID) // after startup: only live installs crash
 
 	raftListen := p.raftAddr
 	if raftListen == "" {
@@ -173,7 +197,8 @@ func buildRaftCoordinator(p clusterParams) (*coordinator, func(), *replication.R
 		return nil, nil, nil, fmt.Errorf("raft rpc server: %w", err)
 	}
 	go rpcSrv.ListenAndServe()
-	log.Printf("[raft] mode active  node=%s  rpc=%s  peers=%v  pipeline=%v", p.nodeID, raftListen, peerIDs, p.raftPipeline)
+	log.Printf("[raft] mode active  node=%s  rpc=%s  peers=%v  pipeline=%v  snapshot_threshold=%d  snapshot_chunk=%d",
+		p.nodeID, raftListen, peerIDs, p.raftPipeline, p.raftSnapThreshold, p.raftSnapChunk)
 
 	c := &coordinator{
 		mode:           modeRaft,
@@ -205,6 +230,14 @@ func buildReplicatedCoordinator(p clusterParams) (*coordinator, func(), *replica
 		}
 	}
 
+	// Per-replica recovery watermarks survive a restart (replication/state.go):
+	// a replica that was down when this node restarted is caught up from the
+	// change feed instead of being taken as current.  Deletes stay in the feed
+	// for 2 × the tombstone grace period; a replica further behind is fully
+	// resynced and flagged.
+	cfg.StatePath = filepath.Join(p.dataDir, "replication_state.json")
+	cfg.TombstoneRetention = pCurrentEngine.TombstoneRetention()
+
 	re := replication.NewReplicationEngine(p.nodeID, cfg)
 	re.Start()
 
@@ -213,10 +246,16 @@ func buildReplicatedCoordinator(p clusterParams) (*coordinator, func(), *replica
 		// Vector / text writes replicate as plain KV on their reserved
 		// prefixes; the engine's search hooks refresh this replica's RAM
 		// indexes (storage/search_hooks.go).
+		// Marked as applied-from-a-peer: this node's catch-up feed must never
+		// re-send another node's write (its copy may be stale).
+		// The key stripe orders it against a migrated put-if-absent of the
+		// same key (membership_replicated.go, receiveMigrated).
+		unlock := lockKey(op.Key)
+		defer unlock()
 		if op.IsTombstone {
-			return pCurrentEngine.Delete(op.Key)
+			return pCurrentEngine.DeleteReplicated(op.Key)
 		}
-		return pCurrentEngine.Put(op.Key, op.Value, op.TTL)
+		return pCurrentEngine.PutReplicated(op.Key, op.Value, op.TTL)
 	}
 	replListen := p.replAddr
 	if replListen == "" {
@@ -230,7 +269,7 @@ func buildReplicatedCoordinator(p clusterParams) (*coordinator, func(), *replica
 	// Recovery of a FAILED replica replays retained ops; if some were dropped
 	// from the retention buffer it first reads this node's durable change
 	// feed (index-backed, tombstones included).
-	re.SetCatchUpSource(engineCatchUp(pCurrentEngine, p.nodeID))
+	re.SetCatchUpSource(engineCatchUp(pCurrentEngine, pCurrentEngine.ReplayDone, p.nodeID))
 	// Tombstone GC waits for every replica to acknowledge a delete (bounded
 	// by 2 × the grace period — storage/tombstone_replicated.go).
 	re.SetWatermarkObserver(pCurrentEngine.SetReplicaWatermark)
@@ -293,22 +332,28 @@ const catchUpPageSize = 1000
 
 // changeFeed is the subset of *storage.StorageEngine engineCatchUp needs.
 type changeFeed interface {
-	ChangesSince(sinceUs int64, limit int) storage.ChangesSinceResult
+	ScanChanges(sinceUs int64, pageSize int, localOnly bool, emit func([]storage.CDCEvent) error) error
 	GetTTLForKey(key string) int32
 }
 
-// engineCatchUp adapts StorageEngine.ChangesSince to replication.CatchUpFunc:
-// the current value (or tombstone) of every key written since the cursor, in
-// timestamp order, one page per emit.  Values carry their remaining TTL; a
-// key with under a second left is skipped (it expires on the replica anyway).
-func engineCatchUp(se changeFeed, nodeID string) replication.CatchUpFunc {
+// engineCatchUp adapts StorageEngine.ScanChanges to replication.CatchUpFunc:
+// the current value (or tombstone) of every key this node wrote (originated —
+// not applied from a peer) since sinceNs, one
+// page per emit, in one pass over the index (a full resync streams the whole
+// engine).  Order does not matter: each key is sent once, with its current
+// state, while the replica receives no live batches.  Values carry their
+// remaining TTL; a key with under a second left is skipped (it expires on the
+// replica anyway).  replayDone (may be nil) gates the scan until the startup
+// WAL replay has rebuilt the index — a scan before that would miss keys and
+// the replica would be declared caught up without them.
+func engineCatchUp(se changeFeed, replayDone <-chan struct{}, nodeID string) replication.CatchUpFunc {
 	return func(sinceNs int64, emit func([]*replication.WriteOperation) error) error {
-		cursor := sinceNs / 1000
-		limit := catchUpPageSize
-		for {
-			page := se.ChangesSince(cursor, limit)
-			ops := make([]*replication.WriteOperation, 0, len(page.Events))
-			for _, ev := range page.Events {
+		if replayDone != nil {
+			<-replayDone
+		}
+		return se.ScanChanges(sinceNs/1000, catchUpPageSize, true, func(events []storage.CDCEvent) error {
+			ops := make([]*replication.WriteOperation, 0, len(events))
+			for _, ev := range events {
 				op := &replication.WriteOperation{
 					Key:       ev.Key,
 					Timestamp: ev.Timestamp * 1000,
@@ -325,21 +370,42 @@ func engineCatchUp(se changeFeed, nodeID string) replication.CatchUpFunc {
 				}
 				ops = append(ops, op)
 			}
-			if len(ops) > 0 {
-				if err := emit(ops); err != nil {
-					return err
-				}
-			}
-			if !page.More {
+			if len(ops) == 0 {
 				return nil
 			}
-			// The cursor is inclusive; if a whole page shares one timestamp
-			// it would not advance, so widen the page instead.
-			if page.Cursor == cursor {
-				limit *= 2
-				continue
-			}
-			cursor, limit = page.Cursor, catchUpPageSize
-		}
+			return emit(ops)
+		})
 	}
+}
+
+// installSnapshotCrashHook implements VELTRIX_TEST_CRASH_AT_SNAPSHOT_STAGE, a
+// crash-injection hook for tests only (tests/integration/raft_snapshot_test.go):
+// the process exits with status 86 — no cleanup, like a crash — when a raft
+// snapshot capture or install reaches the named stage (consensus stages
+// "capture-written", "capture-installed", "install-verified",
+// "install-renamed", "install-log-rewritten", "install-restored"; or
+// "fsm-restore-partial", after 2000 records of a state-machine restore).
+func installSnapshotCrashHook(nodeID string) {
+	stage := os.Getenv("VELTRIX_TEST_CRASH_AT_SNAPSHOT_STAGE")
+	if stage == "" {
+		return
+	}
+	log.Printf("[raft] TEST HOOK ACTIVE: node=%s exits at snapshot stage %q (VELTRIX_TEST_CRASH_AT_SNAPSHOT_STAGE)", nodeID, stage)
+	crash := func(at string) {
+		log.Printf("[raft] TEST HOOK: node=%s crashing at snapshot stage %q", nodeID, at)
+		os.Exit(86)
+	}
+	if stage == "fsm-restore-partial" {
+		fsmRestoreHook = func(n int) {
+			if n == 2000 {
+				crash(stage)
+			}
+		}
+		return
+	}
+	consensus.SetSnapshotStageHookForTesting(func(_, at string) {
+		if at == stage {
+			crash(at)
+		}
+	})
 }

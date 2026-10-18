@@ -210,3 +210,32 @@ func TestReadBarrier_BinaryReadsRedirectOnNonLeader(t *testing.T) {
 		t.Fatalf("VSEARCH: err=%v, want MOVED", err)
 	}
 }
+
+// A raft follower must answer a write batch (MPUT, which also carries every
+// TTL'd PUT) with the MOVED error frame, not per-entry ERR bytes that hide
+// the leader's address.
+func TestMPut_RedirectsOnNonLeader(t *testing.T) {
+	ts := startNonLeaderServer(t)
+
+	conn, err := net.DialTimeout("tcp", ts.addr, 5*time.Second)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	var ent [10]byte // [2B keyLen][4B valLen][4B ttl]
+	binary.LittleEndian.PutUint16(ent[0:2], 2)
+	binary.LittleEndian.PutUint32(ent[2:6], 2)
+	binary.LittleEndian.PutUint32(ent[6:10], 60)
+	f := frame(binCmdMPut, 0, 1, ent[:], "k1", "v1")
+	status, msg := rawBinary(t, conn, bufio.NewReader(conn), f)
+	if status != binStatusErr || !strings.HasPrefix(msg, "MOVED") {
+		t.Fatalf("MPUT: status=0x%02x msg=%q, want ERR MOVED", status, msg)
+	}
+
+	// Through the client: a TTL'd Put travels as MPUT.
+	bc := dialBinary(t, ts.addr)
+	defer bc.Close()
+	if err := bc.Put("k2", []byte("v2"), 60); err == nil || !strings.Contains(err.Error(), "MOVED") {
+		t.Errorf("Put with TTL: err=%v, want MOVED", err)
+	}
+}

@@ -3,6 +3,7 @@ package integration_test
 import (
 	"bufio"
 	"fmt"
+	"math/rand"
 	"net"
 	"os"
 	"os/exec"
@@ -219,16 +220,40 @@ func (c *textClient) close() {
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
-// freePort asks the OS for a free TCP port and returns it.
+// Test servers listen on ports drawn from [testPortLo, testPortHi), which is
+// below the ephemeral range of every OS the suite runs on (Linux 32768–60999,
+// macOS/BSD/Windows 49152–65535).
+//
+// A port that was probed free and released stays free only until the child
+// server binds it, which for the last node of a cluster is seconds later. The
+// old freePort asked the kernel for "127.0.0.1:0", i.e. an EPHEMERAL port, and
+// the kernel hands that same port to the next socket in any process that
+// listens on :0 or dials out. With other test binaries running (go test ./...,
+// a -race consensus run: hundreds of :0 listeners), a node then died with
+// "bind: address already in use" and the test failed with "startNode: not
+// ready" (TestRaftClusterFailover, 2/40 under load).
+const testPortLo, testPortHi = 20000, 32000
+
+// portFree reports whether 127.0.0.1:port can be bound right now.
+func portFree(port int) bool {
+	l, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+	if err != nil {
+		return false
+	}
+	l.Close()
+	return true
+}
+
+// freePort returns a currently bindable port from the non-ephemeral test range.
 func freePort(t *testing.T) int {
 	t.Helper()
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("freePort: %v", err)
+	for tries := 0; tries < 1000; tries++ {
+		if port := testPortLo + rand.Intn(testPortHi-testPortLo); portFree(port) {
+			return port
+		}
 	}
-	port := l.Addr().(*net.TCPAddr).Port
-	l.Close()
-	return port
+	t.Fatalf("freePort: no free port in [%d, %d)", testPortLo, testPortHi)
+	return 0
 }
 
 // moduleRoot returns the directory that contains go.mod, walking up from the

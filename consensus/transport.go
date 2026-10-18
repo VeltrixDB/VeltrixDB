@@ -9,8 +9,8 @@ package consensus
 // and from then on each side writes gob-encoded envelopes on ONE long-lived
 // gob encoder (type information is sent once per connection, not per RPC):
 //
-//	client → server  rpcRequest  {ID, Type, AE | RV | IS args}
-//	server → client  rpcResponse {ID, Type, AE | RV | IS reply}
+//	client → server  rpcRequest  {ID, Type, AE | RV | IS | ISC args}
+//	server → client  rpcResponse {ID, Type, AE | RV | IS | ISC reply}
 //
 // Requests are written in call order and the server reads and dispatches them
 // in that order — an AppendEntries is appended (in memory, and queued for the
@@ -35,8 +35,15 @@ package consensus
 //
 //	0x01 = RequestVote
 //	0x02 = AppendEntries
-//	0x03 = InstallSnapshot
+//	0x03 = InstallSnapshot (single-shot, v1.16 format)
+//	0x04 = InstallSnapshotChunk (chunked snapshots; only sent to followers
+//	       that advertise capSnapshotChunks — a v1.16 server would close
+//	       the connection on it)
 //	0x10 = stream hello (stream mode)
+//
+// The server handles InstallSnapshot on its own goroutine (the reply is sent
+// when the install finished, matched by ID like any other), so a long
+// single-shot install never stops the stream from reading heartbeats.
 //
 // The server side is RPCServer.  Create one per node and call ListenAndServe
 // in a goroutine.  The RaftNode is supplied as the handler.
@@ -68,12 +75,16 @@ const (
 	msgRequestVote     byte = 0x01
 	msgAppendEntries   byte = 0x02
 	msgInstallSnapshot byte = 0x03
+	msgSnapshotChunk   byte = 0x04
 	msgStreamHello     byte = 0x10
 	rpcDialTimeout          = 2 * time.Second
 	rpcCallTimeout          = 5 * time.Second
-	// snapshotCallTimeout bounds InstallSnapshot RPCs, which ship the whole
-	// state machine in one shot and can far exceed ordinary RPC sizes.
+	// snapshotCallTimeout bounds single-shot InstallSnapshot RPCs, which ship
+	// the whole state machine in one message.
 	snapshotCallTimeout = 60 * time.Second
+	// snapshotChunkTimeout bounds one InstallSnapshotChunk round trip (a few
+	// MB, plus the follower's fsync + verification on the last chunk).
+	snapshotChunkTimeout = 30 * time.Second
 	// legacyRetryAfter: how long a peer that refused the stream hello is
 	// served in legacy mode before the stream is tried again.
 	legacyRetryAfter = 30 * time.Second
@@ -285,6 +296,16 @@ func (t *TCPTransport) SendInstallSnapshot(peer string, args InstallSnapshotArgs
 	return reply, err
 }
 
+// SendInstallSnapshotChunk sends one snapshot chunk (ChunkTransport).
+func (t *TCPTransport) SendInstallSnapshotChunk(peer string, args InstallSnapshotChunkArgs) (InstallSnapshotChunkReply, error) {
+	var reply InstallSnapshotChunkReply
+	resp, err := t.roundTrip(peer, rpcRequest{Type: msgSnapshotChunk, ISC: &args}, snapshotChunkTimeout, &reply)
+	if err == nil && resp.ISC != nil {
+		reply = *resp.ISC
+	}
+	return reply, err
+}
+
 // SendAppendEntriesAsync queues an AppendEntries for peer (requests to one
 // peer are written in call order) and calls done with the reply or an error.
 // In legacy mode it runs the RPC synchronously before returning.
@@ -323,6 +344,8 @@ func (t *TCPTransport) roundTrip(peer string, req rpcRequest, timeout time.Durat
 			args = *req.RV
 		case msgAppendEntries:
 			args = *req.AE
+		case msgSnapshotChunk:
+			args = *req.ISC
 		default:
 			args = *req.IS
 		}
@@ -436,6 +459,7 @@ type rpcRequest struct {
 	AE   *AppendEntriesArgs
 	RV   *RequestVoteArgs
 	IS   *InstallSnapshotArgs
+	ISC  *InstallSnapshotChunkArgs // new field: older decoders skip it
 }
 
 type rpcResponse struct {
@@ -444,6 +468,7 @@ type rpcResponse struct {
 	AE   *AppendEntriesReply
 	RV   *RequestVoteReply
 	IS   *InstallSnapshotReply
+	ISC  *InstallSnapshotChunkReply
 }
 
 type pendingCall struct {
@@ -575,8 +600,11 @@ func (t *TCPTransport) call(peer string, msgType byte, args, reply interface{}) 
 	}
 
 	timeout := rpcCallTimeout
-	if msgType == msgInstallSnapshot {
+	switch msgType {
+	case msgInstallSnapshot:
 		timeout = snapshotCallTimeout
+	case msgSnapshotChunk:
+		timeout = snapshotChunkTimeout
 	}
 	conn.SetDeadline(time.Now().Add(timeout))
 
@@ -799,6 +827,22 @@ func (s *RPCServer) serveLegacy(conn net.Conn, msgType byte) {
 				return
 			}
 
+		case msgSnapshotChunk:
+			ch, ok := s.handler.(ChunkedSnapshotHandler)
+			if !ok {
+				log.Printf("[raft-rpc] snapshot chunk received but the handler does not support chunked snapshots")
+				return
+			}
+			conn.SetDeadline(time.Now().Add(snapshotChunkTimeout))
+			var args InstallSnapshotChunkArgs
+			if err := dec.Decode(&args); err != nil {
+				return
+			}
+			reply := ch.HandleInstallSnapshotChunk(args)
+			if err := enc.Encode(reply); err != nil {
+				return
+			}
+
 		default:
 			log.Printf("[raft-rpc] unknown message type 0x%02x", msgType)
 			return
@@ -859,8 +903,26 @@ func (s *RPCServer) serveStream(conn net.Conn) {
 			if req.IS != nil {
 				args = *req.IS
 			}
-			r := s.handler.HandleInstallSnapshot(args)
-			w.put(rpcResponse{ID: id, Type: msgInstallSnapshot, IS: &r})
+			// Off the read loop: the install may take long, and heartbeats
+			// on this stream must keep flowing meanwhile.
+			s.wg.Add(1)
+			go func() {
+				defer s.wg.Done()
+				r := s.handler.HandleInstallSnapshot(args)
+				w.put(rpcResponse{ID: id, Type: msgInstallSnapshot, IS: &r})
+			}()
+		case msgSnapshotChunk:
+			ch, ok := s.handler.(ChunkedSnapshotHandler)
+			if !ok {
+				log.Printf("[raft-rpc] snapshot chunk received but the handler does not support chunked snapshots")
+				return
+			}
+			var args InstallSnapshotChunkArgs
+			if req.ISC != nil {
+				args = *req.ISC
+			}
+			r := ch.HandleInstallSnapshotChunk(args)
+			w.put(rpcResponse{ID: id, Type: msgSnapshotChunk, ISC: &r})
 		default:
 			log.Printf("[raft-rpc] unknown stream message type 0x%02x", req.Type)
 			return
