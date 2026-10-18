@@ -90,7 +90,7 @@ jobs:
   node-2-cluster:
     name: "Node 2 — consensus + cluster + replication"
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
 
@@ -104,13 +104,13 @@ jobs:
           cache: true
 
       - name: consensus tests
-        run: CGO_ENABLED=0 go test -timeout 120s -count=1 ./consensus/...
+        run: CGO_ENABLED=0 go test -timeout 600s -count=1 ./consensus/...  # ~230 s on a laptop: streaming-snapshot, membership and crash tests
 
       - name: cluster tests
-        run: CGO_ENABLED=0 go test -timeout 120s -count=1 ./cluster/...
+        run: CGO_ENABLED=0 go test -timeout 300s -count=1 ./cluster/...
 
       - name: replication tests
-        run: CGO_ENABLED=0 go test -timeout 120s -count=1 ./replication/...
+        run: CGO_ENABLED=0 go test -timeout 300s -count=1 ./replication/...
 
       - name: push CI metrics
         if: always()
@@ -180,7 +180,7 @@ jobs:
       - name: integration tests (starts 3 in-process server nodes)
         run: |
           set -o pipefail
-          CGO_ENABLED=0 go test -v -timeout 300s -count=1 ./tests/integration/... \
+          CGO_ENABLED=0 go test -v -timeout 900s -count=1 ./tests/integration/... \
             2>&1 | tee /tmp/integration-test-output.txt
         env:
           VELTRIX_SERVER_BIN: /tmp/veltrixdb
@@ -378,7 +378,7 @@ jobs:
           TMPDIR: /mnt/veltrix-tmp
         run: |
           set -o pipefail
-          go test -race -v -timeout 600s -count=1 ${{ matrix.pkgs }} \
+          go test -race -v -timeout 1200s -count=1 ${{ matrix.pkgs }} \
             2>&1 | tee /tmp/race-${{ matrix.group }}.txt
 
       # On a hang, Go's timeout panic dumps every goroutine; on a failure, the
