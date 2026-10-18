@@ -121,6 +121,9 @@ type TransferAgent struct {
 	migrateMu sync.Mutex
 	baseline  map[string]string
 	stopOnce  sync.Once
+	// receive, when set, applies each key of an inbound batch instead of
+	// store.Put (SetReceiveFunc).
+	receive ReceiveFunc
 }
 
 // NewTransferAgent creates a plaintext TransferAgent.
@@ -291,7 +294,13 @@ func (ta *TransferAgent) handleReceive(w http.ResponseWriter, r *http.Request) {
 
 	var failed int
 	for _, kv := range batch.Keys {
-		if err := ta.store.Put(kv.Key, kv.Value, kv.TTL); err != nil {
+		var err error
+		if ta.receive != nil {
+			err = ta.receive(kv)
+		} else {
+			err = ta.store.Put(kv.Key, kv.Value, kv.TTL)
+		}
+		if err != nil {
 			log.Printf("[transfer] receive put key=%q: %v", kv.Key, err)
 			failed++
 		}

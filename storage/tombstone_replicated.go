@@ -27,8 +27,16 @@ package storage
 //   - Defragmenter.reapExpiredTombstones calls canReapTombstone for every
 //     tombstone past the grace period.
 //
-// Watermarks live in memory: after a restart they are empty until the
-// replication engine reports again (≤ 1 s).
+// Watermarks live in memory here; the replication engine persists its own
+// per-replica watermarks (replication/state.go, --mode=replicated) and reports
+// them again as each replica is registered at startup, before the first
+// defrag pass.
+//
+// Clean shutdown: the WAL checkpoint keeps exactly the tombstones this rule
+// would still keep (checkpointKeepsTombstone) once any replica reported a
+// watermark, so a clean restart of a primary does not drop deletes a replica
+// has not acknowledged from the catch-up feed.  Without replicas the
+// checkpoint drops every tombstone, as before.
 
 import (
 	"sync"
@@ -138,4 +146,24 @@ func (se *StorageEngine) ReplicatedTombstoneStats() ReplicatedTombstoneStats {
 		MinWatermarkUs: se.tombstones.MinWatermarkUs(),
 		NowUs:          time.Now().UnixMicro(),
 	}
+}
+
+// checkpointKeepsTombstone reports whether the WAL checkpoint must keep a
+// tombstone written at tombstoneWriteTsUs: only when replicas are tracked,
+// and then exactly while canReapTombstone would keep it in the index.
+func (se *StorageEngine) checkpointKeepsTombstone(tombstoneWriteTsUs, nowUs int64) bool {
+	tc := se.tombstones
+	if tc == nil || !tc.hasReplicas.Load() {
+		return false
+	}
+	return !canReapTombstone(tc, tombstoneWriteTsUs, nowUs, se.config.GCGracePeriodSec)
+}
+
+// TombstoneRetention is how long a delete is guaranteed to stay in the
+// change feed (ChangesSince / ScanChanges) in replicated mode: 2 × the GC
+// grace period, after which a tombstone is reaped even if a replica has not
+// acknowledged it.  The replication engine resyncs a replica from the whole
+// feed (and flags it) when its catch-up would start further back.
+func (se *StorageEngine) TombstoneRetention() time.Duration {
+	return 2 * time.Duration(se.config.GCGracePeriodSec) * time.Second
 }

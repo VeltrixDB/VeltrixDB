@@ -141,7 +141,7 @@ func (se *StorageEngine) SetIfNotExists(key string, value []byte, ttl int32) (Se
 	defer shard.mu.Unlock()
 
 	if entry, ok := shard.entries.get(key, fnv64a(key)); ok && !entry.IsTombstone() {
-		nowUs := time.Now().UnixMicro()
+		nowUs := se.decisionNowUs() // raft Apply: the command's time
 		if !entry.IsExpired(nowUs) {
 			se.audit.Log(AuditRecord{Op: "SETNX", Key: key, Status: "exists"})
 			return SetNXExists, nil
@@ -168,8 +168,7 @@ func (se *StorageEngine) readUnderShardLockKVSep(shard *indexShard, key string) 
 	if !ok || entry.IsTombstone() {
 		return nil, false, nil
 	}
-	nowUs := time.Now().UnixMicro()
-	if entry.IsExpired(nowUs) {
+	if entry.IsExpired(se.decisionNowUs()) { // raft Apply: the command's time
 		return nil, false, nil
 	}
 	if v, ok := shard.dirtyValues[key]; ok {
@@ -220,13 +219,17 @@ func (se *StorageEngine) persistAtomicKVSep(shard *indexShard, shardID uint16, k
 		}
 	}()
 	now := time.Now()
-	nowUs := now.UnixMicro()
-	version := se.version.Add(1)
+	stampUs, nowUs := se.writeClock() // raft_clock.go
 	crc := computeCRC32C(value)
 	diskIdx := diskForShard(shardID, len(se.wals))
+	// In flight for a runtime checkpoint's fence from before the version to
+	// after the index install (wal_checkpoint_live.go).
+	walTok := se.wals[diskIdx].enterWrite()
+	defer se.wals[diskIdx].exitWrite(walTok)
+	version := se.version.Add(1)
 
 	walEntry := walEntryPool.Get().(*WALEntry)
-	walEntry.Timestamp = now.UnixNano()
+	walEntry.Timestamp = stampUs * 1000
 	walEntry.KeyLen = uint32(len(key))
 	walEntry.Key = key
 	walEntry.ValueLen = uint32(len(value))
@@ -287,7 +290,7 @@ func (se *StorageEngine) persistAtomicKVSep(shard *indexShard, shardID uint16, k
 		ValueSize:        uint32(len(writeBytes)), // on-disk blob length
 		UncompressedSize: uint32(len(value)),      // plaintext length
 		KeySize:          uint32(len(key)),
-		WriteTimestampUs: nowUs,
+		WriteTimestampUs: stampUs,
 		CRC32C:           crc,
 		SchemaVersion:    CurrentSchemaVersion,
 		ShardID:          shardID,
@@ -312,6 +315,7 @@ func (se *StorageEngine) persistAtomicKVSep(shard *indexShard, shardID uint16, k
 		shard.bloom.Add(fnv64a(key))
 	}
 	delete(shard.dirtyValues, key) // value is in VLog, not RAM
+	se.index.noteWrite(key)        // shard lock still held: readers of key wait
 
 	se.cache.PutWithExpiry(key, value, entry.CacheExpiryUs())
 	se.metrics.Writes.Add(1)
@@ -320,6 +324,6 @@ func (se *StorageEngine) persistAtomicKVSep(shard *indexShard, shardID uint16, k
 	se.metrics.WritesLatencyNs.Store(elapsed.Nanoseconds())
 	se.metrics.ObserveWriteLatency(elapsed.Seconds())
 	se.audit.Log(AuditRecord{Op: op, Key: key, Status: "ok"})
-	se.cdc.Broadcast(CDCEvent{Op: "PUT", Key: key, Value: value, Timestamp: nowUs})
+	se.cdc.Broadcast(CDCEvent{Op: "PUT", Key: key, Value: value, Timestamp: stampUs})
 	return nil
 }

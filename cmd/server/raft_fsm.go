@@ -2,8 +2,9 @@ package main
 
 // raft_fsm.go — storage-backed Raft state machine.
 //
-// raftFSM implements consensus.SnapshotStateMachine (StateMachine + Snapshot /
-// Restore) on top of *storage.StorageEngine.  Every mutating client operation in
+// raftFSM implements consensus.StreamingStateMachine (StateMachine +
+// CaptureSnapshot / RestoreSnapshot, raft_snapshot.go) on top of
+// *storage.StorageEngine.  Every mutating client operation in
 // raft mode is gob-encoded into an fsmCmd, submitted to the Raft log via
 // RaftNode.Submit, and applied — deterministically and in the same order — on
 // every node through Apply.  Because Raft guarantees identical log order on all
@@ -31,11 +32,12 @@ package main
 import (
 	"bytes"
 	"encoding/gob"
-	"errors"
 	"fmt"
-	"io"
 	"sync"
+	"sync/atomic"
+	"time"
 
+	"github.com/VeltrixDB/veltrixdb/consensus"
 	"github.com/VeltrixDB/veltrixdb/storage"
 )
 
@@ -114,9 +116,22 @@ type fsmCmd struct {
 
 	// opVSet
 	Vec []float32
+
+	// Ts is the leader's wall clock (Unix µs) when it built the command.
+	// Every node derives the command's time from it (storage
+	// NextRaftApplyTime: version stamps, TTL deadlines, expiry decisions —
+	// invariant 66).  0 = a legacy command (v1.16 leader, or an entry from
+	// before the upgrade): gob omits a zero field, and a v1.16 decoder
+	// ignores the unknown one.
+	Ts int64
 }
 
+// encodeCmd gob-encodes c, stamping it with the local wall clock unless it
+// already carries a Ts.  Only the leader encodes commands it submits.
 func encodeCmd(c fsmCmd) ([]byte, error) {
+	if c.Ts == 0 {
+		c.Ts = time.Now().UnixMicro()
+	}
 	var buf bytes.Buffer
 	if err := gob.NewEncoder(&buf).Encode(c); err != nil {
 		return nil, err
@@ -140,6 +155,23 @@ type raftFSM struct {
 
 	mu      sync.Mutex
 	pending map[uint64]chan fsmResult
+
+	// replayed: the engine's WAL replay finished (waitApplyReady).
+	replayed atomic.Bool
+}
+
+// waitApplyReady blocks the first Apply until the engine's background WAL
+// replay finished: before that the index is incomplete, so a CAS / INCR /
+// SETIF / SETNX would decide against a partial state (and a live write could
+// race the replay).  One atomic load afterwards.
+func (f *raftFSM) waitApplyReady() {
+	if f.replayed.Load() {
+		return
+	}
+	if f.engine.ReplayDone != nil {
+		<-f.engine.ReplayDone
+	}
+	f.replayed.Store(true)
 }
 
 func newRaftFSM(engine *storage.StorageEngine) *raftFSM {
@@ -186,6 +218,7 @@ func (f *raftFSM) deliver(reqID uint64, res fsmResult) {
 // legitimate outcomes delivered via the result channel, not Raft-level errors.
 // A non-nil return is reserved for decode failures, which indicate corruption.
 func (f *raftFSM) Apply(command []byte) error {
+	f.waitApplyReady()
 	var c fsmCmd
 	if err := gob.NewDecoder(bytes.NewReader(command)).Decode(&c); err != nil {
 		return fmt.Errorf("raft-fsm decode: %w", err)
@@ -196,7 +229,14 @@ func (f *raftFSM) Apply(command []byte) error {
 // applyOne executes a single decoded command against the storage engine and
 // delivers its result to the reqID waiter.  It is the shared core of both Apply
 // (single entry) and ApplyBatch (non-PUT entries within a batch).
+//
+// The command runs at its raft time (storage/raft_clock.go, invariant 66):
+// every write is stamped with it and every expiry decision is taken at it,
+// so the outcome — CAS / SETNX / INCR results, SETIF guards, TTL deadlines,
+// version tokens — is the same on every node and on every re-application.
 func (f *raftFSM) applyOne(c fsmCmd) error {
+	f.engine.SetApplyTime(f.engine.NextRaftApplyTime(c.Ts))
+	defer f.engine.ClearApplyTime()
 	switch c.Op {
 	case opPut:
 		err := f.engine.Put(c.Key, c.Value, c.TTL)
@@ -246,7 +286,9 @@ func (f *raftFSM) applyOne(c fsmCmd) error {
 		return nil
 
 	case opNSPut:
-		err := f.engine.PutNS(c.Ns, c.Key, c.Value, c.TTL)
+		// The quota was checked by the leader before it submitted
+		// (coordinator.PutNS): per-node quota state is not deterministic.
+		err := f.engine.PutNSUnchecked(c.Ns, c.Key, c.Value, c.TTL)
 		f.deliver(c.ReqID, fsmResult{err: err})
 		return nil
 
@@ -289,12 +331,22 @@ func (f *raftFSM) applyOne(c fsmCmd) error {
 		return nil
 
 	case opIdxCreate:
-		err := f.engine.CreateFieldIndex(c.Key, c.Field)
+		// EnsureFieldIndex, not CreateFieldIndex: the definition lives
+		// outside the WAL, so an entry re-applied after a crash (the WAL
+		// cut at the applied index dropped its backfill) finds the
+		// definition present and must still backfill (raft_applied.go).
+		err := f.engine.EnsureFieldIndex(c.Key, c.Field)
 		f.deliver(c.ReqID, fsmResult{err: err})
 		return nil
 
 	case opIdxDrop:
 		err := f.engine.DropFieldIndex(c.Key)
+		if err != nil && !f.hasFieldIndex(c.Key) {
+			// Same, for a drop: the definition is already gone, its
+			// entries came back with the cut.  Purge them (a no-op for
+			// an index that never existed).
+			f.engine.PurgeFieldIndexEntries(c.Key)
+		}
 		f.deliver(c.ReqID, fsmResult{err: err})
 		return nil
 
@@ -356,63 +408,46 @@ func (f *raftFSM) applyTxn(ops []fsmTxnOp) error {
 	return txn.Commit()
 }
 
-// ── Snapshot / Restore (consensus.SnapshotStateMachine) ─────────────────────
-
-// snapshotEntry is one key/value pair in a state-machine snapshot.
-type snapshotEntry struct {
-	Key   string
-	Value []byte
-}
-
-// Snapshot serialises the entire live keyspace as a gob-encoded stream of
-// key/value pairs.  It walks the engine with a paginated ScanCursor so a large
-// keyspace never materialises a single giant slice in the scan itself.  TTLs
-// are intentionally not preserved across a snapshot (restored keys become
-// immortal) — the same simplification the WAL-replay path documents for
-// crash recovery of already-expired keys.
-func (f *raftFSM) Snapshot() ([]byte, error) {
-	var buf bytes.Buffer
-	enc := gob.NewEncoder(&buf)
-
-	cursor := ""
-	const page = 1024
-	for {
-		kvs, next, err := f.engine.ScanCursor(cursor, page)
-		if err != nil {
-			return nil, fmt.Errorf("raft-fsm snapshot scan: %w", err)
-		}
-		for _, kv := range kvs {
-			if err := enc.Encode(snapshotEntry{Key: kv.Key, Value: kv.Value}); err != nil {
-				return nil, fmt.Errorf("raft-fsm snapshot encode: %w", err)
-			}
-		}
-		if next == "" {
-			break
-		}
-		cursor = next
-	}
-	return buf.Bytes(), nil
-}
-
-// Restore rebuilds engine state from a snapshot produced by Snapshot.  It is
-// called on a follower that fell too far behind for log replication; the
-// engine already reflects the pre-snapshot state, and each Put overwrites or
-// inserts as needed to converge on the leader's snapshot.
-func (f *raftFSM) Restore(data []byte) error {
-	dec := gob.NewDecoder(bytes.NewReader(data))
-	for {
-		var e snapshotEntry
-		if err := dec.Decode(&e); err != nil {
-			if errors.Is(err, io.EOF) {
-				break
-			}
-			return fmt.Errorf("raft-fsm restore decode: %w", err)
-		}
-		// Vectors and text documents arrive in a snapshot as plain reserved
-		// KV pairs; the engine's search hooks index them.
-		if err := f.engine.Put(e.Key, e.Value, -1); err != nil {
-			return fmt.Errorf("raft-fsm restore put %q: %w", e.Key, err)
+func (f *raftFSM) hasFieldIndex(name string) bool {
+	for _, d := range f.engine.ListFieldIndexes() {
+		if d.Name == name {
+			return true
 		}
 	}
-	return nil
+	return false
 }
+
+// ── Applied index (consensus.AppliedIndexStateMachine, invariant 65) ─────────
+//
+// The engine records the applied index as a WAL marker and, opened with
+// StorageConfig.RaftAppliedIndex (--mode=raft), cuts its replay at the newest
+// one (storage/raft_applied.go), so after any restart it holds exactly the
+// entries ≤ the recorded index and raft skips them.  An engine opened
+// without it records nothing and reports nothing: raft then re-applies as
+// before.
+
+var (
+	_ consensus.AppliedIndexStateMachine = (*raftFSM)(nil)
+	_ consensus.ApplyQuiescer            = (*raftFSM)(nil)
+)
+
+// DurableAppliedIndex implements consensus.AppliedIndexStateMachine.
+func (f *raftFSM) DurableAppliedIndex() (consensus.AppliedIndexState, bool) {
+	st, ok := f.engine.RaftAppliedState()
+	return consensus.AppliedIndexState{Index: st.Index, Term: st.Term, Restoring: st.Restoring}, ok
+}
+
+// SetAppliedIndex implements consensus.AppliedIndexStateMachine.
+func (f *raftFSM) SetAppliedIndex(index, term uint64, durable bool) error {
+	return f.engine.SetRaftAppliedState(storage.AppliedIndexState{Index: index, Term: term}, durable)
+}
+
+// BeginRestore implements consensus.AppliedIndexStateMachine.
+func (f *raftFSM) BeginRestore() error { return f.engine.BeginRaftRestore() }
+
+// SetApplyQuiescer implements consensus.ApplyQuiescer: a runtime engine
+// checkpoint (admin, backup) runs with Apply quiesced, so the applied-index
+// marker it writes matches the state it captures.
+func (f *raftFSM) SetApplyQuiescer(run func(fn func())) { f.engine.SetCheckpointGate(run) }
+
+// Snapshot capture / restore: raft_snapshot.go (consensus.StreamingStateMachine).

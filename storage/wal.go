@@ -80,6 +80,34 @@ type WriteAheadLog struct {
 	// TTL field so records are readable by builds that predate it; TTL'd keys
 	// then come back immortal after a restart. Set before the first append.
 	dropTTL bool
+	// keepTombstone, when set, makes the checkpoint keep a tombstone written
+	// at the given Unix µs instead of dropping it (replicated mode: deletes a
+	// replica has not acknowledged must survive a clean restart in the
+	// catch-up feed — StorageEngine.checkpointKeepsTombstone).
+	keepTombstone func(tsUs, nowUs int64) bool
+
+	// Runtime checkpoints (wal_checkpoint_live.go). ctlCh carries functions
+	// the flusher runs between batches — the only way anything else touches
+	// wal.file while the WAL is open. wepoch / wactive count the writes in
+	// flight per epoch (enterWrite / exitWrite) so a checkpoint can wait for
+	// every write that may have a record before its fence to reach the
+	// index. ckptMu serialises checkpoints (live, backup and Close's).
+	ctlCh   chan walCtl
+	wepoch  atomic.Uint64
+	wactive [2]atomic.Int64
+	ckptMu  sync.Mutex
+	// ckptHook (tests, under ckptMu) runs at each checkpoint step; a non-nil
+	// error from a step before the rename aborts the checkpoint.
+	ckptHook func(diskIdx int, step string) error
+	// lastCkpt describes the last runtime checkpoint (LastCheckpointStats).
+	lastCkpt atomic.Pointer[walCkptStats]
+	// fileGen is a seqlock over (file, durableBytes): odd while a runtime
+	// checkpoint swaps wal.file; fileGen/2 is the number of swaps. The PITR
+	// archiver follows swaps through swaps (followSwaps).
+	fileGen   atomic.Uint64
+	swapMu    sync.Mutex
+	swapWatch bool
+	swaps     []walSwap
 }
 
 type walItem struct {
@@ -129,6 +157,7 @@ func newWriteAheadLog(
 		file:        file,
 		walPath:     walPath,
 		appendCh:    make(chan *walItem, 4096),
+		ctlCh:       make(chan walCtl),
 		doneCh:      make(chan struct{}),
 		flusherDone: make(chan struct{}),
 		walFlushes:  walFlushes,
@@ -499,8 +528,17 @@ func (wal *WriteAheadLog) flusher() {
 
 		case <-bt.C:
 			// Idle gap or window expired — flush everything that accumulated.
+			wal.pacer.timerFired(&bt)
 			bt.stop()
 			flush()
+
+		case c := <-wal.ctlCh:
+			// A runtime checkpoint step (wal_checkpoint_live.go): close the
+			// open batch, then run it between batches — nothing is written
+			// to wal.file while it runs, and it may swap wal.file.
+			bt.stop()
+			flush()
+			c.done <- c.fn()
 
 		case <-wal.doneCh:
 			// Shutdown: stop timer, drain channel, flush final batch.
@@ -551,7 +589,14 @@ func (wal *WriteAheadLog) close() error {
 }
 
 // checkpoint writes a compacted WAL (one record per live key) via an atomic
-// rename so keys survive a clean restart.  Must be called after close().
-func (wal *WriteAheadLog) checkpoint(index *shardedIndex, numDisks int, kvSep bool, version uint64) error {
-	return writeWALCheckpoint(wal.walPath, index, wal.diskIdx, numDisks, kvSep, version, wal.legacyText, wal.dropTTL)
+// rename so keys survive a clean restart.  Must be called after close(): it
+// replaces wal.log under the flusher's feet otherwise. A WAL that is still
+// serving writes is checkpointed with checkpointLive (wal_checkpoint_live.go).
+//
+// version and extra (the raft applied-index marker) come from
+// StorageEngine.checkpointVersion.
+func (wal *WriteAheadLog) checkpoint(index *shardedIndex, numDisks int, kvSep bool, version uint64, extra []*WALEntry) error {
+	wal.ckptMu.Lock() // waits out a runtime checkpoint racing with Close
+	defer wal.ckptMu.Unlock()
+	return writeWALCheckpoint(wal.walPath, index, wal.diskIdx, numDisks, kvSep, version, wal.legacyText, wal.dropTTL, wal.keepTombstone, extra...)
 }

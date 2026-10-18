@@ -119,8 +119,9 @@ func applyWALReplay(
 ) uint64 {
 	var maxVersion uint64
 	// TTL deadlines are absolute, so "already expired" is judged against the
-	// wall clock at replay, once for the whole pass.
-	replayNowUs := time.Now().UnixMicro()
+	// wall clock at replay, once for the whole pass (raft mode: capped at the
+	// raft clock — shardedIndex.replayNowUs, raft_clock.go).
+	replayNowUs := index.replayNowUs()
 
 	// pending collects old-format KV-sep entries whose VLog fdatasync is in
 	// flight.  All beginAppend calls are submitted before any response is read
@@ -139,7 +140,7 @@ func applyWALReplay(
 		nowUs := e.timestampNs / 1000
 
 		if e.isTombstone {
-			index.replayMarkTombstone(e.key, nowUs)
+			index.replayTombstoneRecord(e.key, nowUs, e.xflags&FlagReplicaApplied)
 			continue
 		}
 		// A TTL'd write whose deadline has already passed is applied as an
@@ -173,7 +174,7 @@ func applyWALReplay(
 		}
 		// Restore the transform bits so Get() decrypts/decompresses this
 		// record exactly as it would have before the restart.
-		entry.Flags |= e.xflags & (FlagCompressed | FlagEncrypted)
+		entry.Flags |= e.xflags & (FlagCompressed | FlagEncrypted | FlagReplicaApplied)
 		// Restore the TTL. Before the WAL carried it, every TTL'd key came
 		// back immortal after any restart, crash or clean.
 		if e.ttlExpiryUs > 0 {
@@ -265,14 +266,42 @@ func walPathForDir(dir string) string {
 // rename to walPath — so a crash mid-write leaves the old WAL intact.
 //
 // Must be called after the WAL flusher goroutine has stopped (w.close()).
-func writeWALCheckpoint(walPath string, index *shardedIndex, diskIdx, numDisks int, kvSep bool, version uint64, legacyText, dropTTL bool) error {
+// A checkpoint of a WAL that is still serving writes goes through
+// WriteAheadLog.checkpointLive (wal_checkpoint_live.go), which writes the same
+// records (writeCheckpointRecords) and then carries the WAL's tail over.
+//
+// keepTombstone (may be nil) selects tombstones to keep as tombstone records
+// with their original timestamp; the rest are dropped.  Never under dropTTL
+// (text-legacy, the rollback format).
+//
+// extra records (the raft applied-index marker, raft_applied.go) are written
+// after the keys, as given.
+func writeWALCheckpoint(walPath string, index *shardedIndex, diskIdx, numDisks int, kvSep bool, version uint64, legacyText, dropTTL bool, keepTombstone func(tsUs, nowUs int64) bool, extra ...*WALEntry) error {
 	tmpPath := walPath + ".ckpt"
 	f, err := os.Create(tmpPath)
 	if err != nil {
 		return fmt.Errorf("wal checkpoint create: %w", err)
 	}
+	writeErr := writeCheckpointRecords(f, index, diskIdx, numDisks, kvSep, version, legacyText, dropTTL, keepTombstone, extra...)
+	if writeErr == nil {
+		writeErr = f.Sync()
+	}
+	f.Close()
+	if writeErr != nil {
+		os.Remove(tmpPath)
+		return fmt.Errorf("wal checkpoint write: %w", writeErr)
+	}
+	// Atomic rename: on Linux this is a single syscall — crash between Sync and
+	// Rename leaves walPath+".ckpt" on disk; the next startup finds it, ignores
+	// it (not named wal.log), and replays the old WAL intact.
+	return os.Rename(tmpPath, walPath)
+}
 
-	bw := bufio.NewWriterSize(f, 1<<20) // 1 MB write buffer
+// writeCheckpointRecords writes the checkpoint body — one record per live key
+// of diskIdx at version, the kept tombstones, then extra — to w, buffered,
+// and flushes the buffer. The rules are writeWALCheckpoint's.
+func writeCheckpointRecords(w io.Writer, index *shardedIndex, diskIdx, numDisks int, kvSep bool, version uint64, legacyText, dropTTL bool, keepTombstone func(tsUs, nowUs int64) bool, extra ...*WALEntry) error {
+	bw := bufio.NewWriterSize(w, 1<<20) // 1 MB write buffer
 	now := time.Now().UnixNano()
 	nowUs := now / 1000
 	var writeErr error
@@ -283,6 +312,14 @@ func writeWALCheckpoint(walPath string, index *shardedIndex, diskIdx, numDisks i
 		shard := &index.shards[i]
 		shard.mu.RLock()
 		shard.entries.rangeAll(func(key string, entry *IndexEntry) bool {
+			if entry.IsTombstone() && keepTombstone != nil && !dropTTL &&
+				entry.WriteTimestampUs > 0 && keepTombstone(entry.WriteTimestampUs, nowUs) {
+				we = WALEntry{Timestamp: entry.WriteTimestampUs * 1000, Key: key, KeyLen: uint32(len(key)),
+					Version: version, IsTombstone: true, XformFlags: entry.Flags & FlagReplicaApplied}
+				buf = appendWALRecordEnc(buf[:0], &we, legacyText, dropTTL)
+				_, writeErr = bw.Write(buf)
+				return writeErr == nil
+			}
 			if entry.IsTombstone() || entry.IsExpired(nowUs) {
 				return true // deleted and expired keys are not checkpointed
 			}
@@ -312,7 +349,7 @@ func writeWALCheckpoint(walPath string, index *shardedIndex, diskIdx, numDisks i
 				we.VLogOffset = int64(entry.DiskOffset)
 				we.Packed = entry.IsPacked()
 				we.DiskValueLen = entry.ValueSize
-				we.XformFlags = entry.Flags & (FlagCompressed | FlagEncrypted)
+				we.XformFlags = entry.Flags & (FlagCompressed | FlagEncrypted | FlagReplicaApplied)
 			} else {
 				// Non-KV-sep (or missing vlogOffset): embed value bytes from the
 				// dirty map.  If the dirty value is gone (already flushed to segment
@@ -325,6 +362,7 @@ func writeWALCheckpoint(walPath string, index *shardedIndex, diskIdx, numDisks i
 				// untransformed regardless of what the IndexEntry says.
 				we.Value = dirtyVal
 				we.ValueLen = uint32(len(dirtyVal))
+				we.XformFlags = entry.Flags & FlagReplicaApplied
 				we.Checksum = computeCRC32C(dirtyVal)
 			}
 			buf = appendWALRecordEnc(buf[:0], &we, legacyText, dropTTL)
@@ -334,21 +372,17 @@ func writeWALCheckpoint(walPath string, index *shardedIndex, diskIdx, numDisks i
 		shard.mu.RUnlock()
 	}
 
+	for _, e := range extra {
+		if writeErr != nil {
+			break
+		}
+		buf = appendWALRecordEnc(buf[:0], e, legacyText, dropTTL)
+		_, writeErr = bw.Write(buf)
+	}
 	if writeErr == nil {
 		writeErr = bw.Flush()
 	}
-	if writeErr == nil {
-		writeErr = f.Sync()
-	}
-	f.Close()
-	if writeErr != nil {
-		os.Remove(tmpPath)
-		return fmt.Errorf("wal checkpoint write: %w", writeErr)
-	}
-	// Atomic rename: on Linux this is a single syscall — crash between Sync and
-	// Rename leaves walPath+".ckpt" on disk; the next startup finds it, ignores
-	// it (not named wal.log), and replays the old WAL intact.
-	return os.Rename(tmpPath, walPath)
+	return writeErr
 }
 
 // maxVLogEndFromWAL returns one byte past the highest VLog position referenced

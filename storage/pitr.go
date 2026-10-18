@@ -118,16 +118,21 @@ type diskArchiver struct {
 	vlog     *VLog    // nil when KV separation is off
 	reader   *os.File // independent O_RDONLY handle on wal.log
 	archived int64    // WAL bytes consumed so far
-	seq      uint64   // next segment sequence number
-	dir      string   // <ArchiveDir>/disk<N>
+	// gen is the number of runtime-checkpoint swaps of wal.log that reader
+	// has followed (WriteAheadLog.durableSnapshot / peekSwap).
+	gen uint64
+	seq uint64 // next segment sequence number
+	dir string // <ArchiveDir>/disk<N>
 }
 
 // StartWALArchiver attaches a WAL archiver to a running engine, driven by the
 // engine's config (ArchiveDir, ArchiveIntervalMs, MaxArchiveAgeSec,
 // MaxArchiveBytes). Returns (nil, nil) when cfg.ArchiveDir is empty.
 //
-// Call this immediately after NewStorageEngine, before any Checkpoint(), so
-// the read handle is opened on the same WAL file the flusher writes to.
+// Runtime checkpoints (Checkpoint, online backups) replace wal.log while the
+// archiver runs; it follows each swap: it finishes the replaced file up to
+// its final length, then continues in the new file after the checkpoint's
+// compacted records and carried tail (wal_checkpoint_live.go).
 // Segment sequence numbers continue from any segments already present in
 // ArchiveDir, so archives accumulate correctly across restarts.
 func StartWALArchiver(se *StorageEngine) (*WALArchiver, error) {
@@ -155,7 +160,7 @@ func StartWALArchiver(se *StorageEngine) (*WALArchiver, error) {
 			a.closeReaders()
 			return nil, fmt.Errorf("pitr: mkdir %s: %w", diskDir, err)
 		}
-		reader, err := os.Open(w.walPath)
+		reader, gen, err := w.openFollower()
 		if err != nil {
 			a.closeReaders()
 			return nil, fmt.Errorf("pitr: open wal for archiving: %w", err)
@@ -169,6 +174,7 @@ func StartWALArchiver(se *StorageEngine) (*WALArchiver, error) {
 			wal:     w,
 			vlog:    vl,
 			reader:  reader,
+			gen:     gen,
 			seq:     nextArchiveSeq(diskDir),
 			dir:     diskDir,
 		})
@@ -193,6 +199,7 @@ func (a *WALArchiver) closeReaders() {
 		if d.reader != nil {
 			d.reader.Close()
 		}
+		d.wal.stopFollowing()
 	}
 }
 
@@ -222,11 +229,43 @@ func (a *WALArchiver) archiveAll() {
 	}
 }
 
-// archiveDisk copies WAL bytes [d.archived, durableOffset) into one new
-// segment file. The lower bound of the copy is always an entry boundary
-// because the previous pass advanced d.archived by whole parsed records.
+// archiveDisk archives everything durable in wal.log since the last pass,
+// following runtime-checkpoint swaps: a replaced file is archived up to its
+// final length, then the new file from the end of the checkpoint's compacted
+// records and carried tail — those are either already archived (the tail was
+// the replaced file's) or not archivable (compacted records are not writes).
 func (a *WALArchiver) archiveDisk(d *diskArchiver) error {
-	durable := d.wal.durableOffset()
+	gen, durable := d.wal.durableSnapshot()
+	for d.gen < gen {
+		sw, ok := d.wal.peekSwap()
+		if !ok {
+			return fmt.Errorf("wal swap %d not recorded", d.gen+1)
+		}
+		if err := a.archiveRange(d, sw.oldEnd); err != nil {
+			return err // retried next pass, from the same file
+		}
+		d.reader.Close()
+		d.reader = sw.reader
+		if d.reader == nil {
+			// The new file could not be opened at the swap; the current
+			// wal.log is the best remaining source.
+			r, err := os.Open(d.wal.walPath)
+			if err != nil {
+				return fmt.Errorf("reopen wal after checkpoint: %w", err)
+			}
+			d.reader = r
+		}
+		d.archived = sw.newStart
+		d.gen++
+		d.wal.dropSwap()
+	}
+	return a.archiveRange(d, durable)
+}
+
+// archiveRange copies WAL bytes [d.archived, durable) of d.reader into one
+// new segment file. The lower bound of the copy is always an entry boundary
+// because the previous pass advanced d.archived by whole parsed records.
+func (a *WALArchiver) archiveRange(d *diskArchiver, durable int64) error {
 	if durable <= d.archived {
 		return nil
 	}

@@ -1,36 +1,42 @@
 package main
 
 import (
-	"sort"
+	"errors"
 	"testing"
+	"time"
 
 	"github.com/VeltrixDB/veltrixdb/replication"
 	"github.com/VeltrixDB/veltrixdb/storage"
 )
 
-// fakeFeed mimics StorageEngine.ChangesSince: inclusive cursor, timestamp order.
+// fakeFeed mimics StorageEngine.ScanChanges: inclusive cursor, pages of at
+// most pageSize, no particular order.
 type fakeFeed struct {
 	events []storage.CDCEvent
 	ttl    map[string]int32
+	pages  int
 }
 
-func (f *fakeFeed) ChangesSince(sinceUs int64, limit int) storage.ChangesSinceResult {
-	var m []storage.CDCEvent
+func (f *fakeFeed) ScanChanges(sinceUs int64, pageSize int, localOnly bool, emit func([]storage.CDCEvent) error) error {
+	var page []storage.CDCEvent
 	for _, e := range f.events {
-		if e.Timestamp >= sinceUs {
-			m = append(m, e)
+		if e.Timestamp < sinceUs {
+			continue
+		}
+		page = append(page, e)
+		if len(page) == pageSize {
+			f.pages++
+			if err := emit(page); err != nil {
+				return err
+			}
+			page = nil
 		}
 	}
-	sort.SliceStable(m, func(i, j int) bool { return m[i].Timestamp < m[j].Timestamp })
-	res := storage.ChangesSinceResult{Cursor: sinceUs}
-	if limit > 0 && len(m) > limit {
-		m, res.More = m[:limit], true
+	if len(page) > 0 {
+		f.pages++
+		return emit(page)
 	}
-	res.Events = m
-	if len(m) > 0 {
-		res.Cursor = m[len(m)-1].Timestamp
-	}
-	return res
+	return nil
 }
 
 func (f *fakeFeed) GetTTLForKey(k string) int32 {
@@ -42,8 +48,7 @@ func (f *fakeFeed) GetTTLForKey(k string) int32 {
 
 // TestEngineCatchUp_PagesFeedIntoOps: the recovery catch-up source converts
 // the change feed to replication ops (tombstones, TTLs, ns timestamps), skips
-// keys about to expire, and does not loop when a full page shares one
-// timestamp.
+// keys about to expire, and ships a run longer than one page in full.
 func TestEngineCatchUp_PagesFeedIntoOps(t *testing.T) {
 	f := &fakeFeed{ttl: map[string]int32{"ttl": 30, "expiring": 0}}
 	f.events = append(f.events,
@@ -59,7 +64,7 @@ func TestEngineCatchUp_PagesFeedIntoOps(t *testing.T) {
 
 	seen := map[string]*replication.WriteOperation{}
 	count := 0
-	err := engineCatchUp(f, "n1")(10_000, func(ops []*replication.WriteOperation) error {
+	err := engineCatchUp(f, nil, "n1")(10_000, func(ops []*replication.WriteOperation) error {
 		for _, op := range ops {
 			seen[op.Key] = op
 			count++
@@ -83,5 +88,33 @@ func TestEngineCatchUp_PagesFeedIntoOps(t *testing.T) {
 	}
 	if seen["same"] == nil || count < catchUpPageSize+5 {
 		t.Errorf("same-timestamp run not fully shipped (count=%d)", count)
+	}
+}
+
+// TestEngineCatchUp_WaitsForReplayAndStopsOnError: the catch-up does not scan
+// before the startup WAL replay finished (it would miss keys and the replica
+// would be declared caught up without them), and an emit error stops it.
+func TestEngineCatchUp_WaitsForReplayAndStopsOnError(t *testing.T) {
+	f := &fakeFeed{}
+	for i := 0; i < 3*catchUpPageSize; i++ {
+		f.events = append(f.events, storage.CDCEvent{Op: "DEL", Key: "k", Timestamp: 1})
+	}
+	replay := make(chan struct{})
+	done := make(chan error, 1)
+	boom := errors.New("replica apply failed")
+	go func() {
+		done <- engineCatchUp(f, replay, "n1")(0, func([]*replication.WriteOperation) error { return boom })
+	}()
+	select {
+	case err := <-done:
+		t.Fatalf("catch-up ran before replay finished: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(replay)
+	if err := <-done; !errors.Is(err, boom) {
+		t.Fatalf("err = %v, want the emit error", err)
+	}
+	if f.pages != 1 {
+		t.Errorf("scan emitted %d pages after the first failed, want 1", f.pages)
 	}
 }

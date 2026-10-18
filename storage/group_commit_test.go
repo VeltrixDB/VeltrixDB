@@ -30,10 +30,28 @@ func withSyncLatency(t *testing.T, d time.Duration) {
 }
 
 type putStats struct {
-	n        int
-	p50, p99 time.Duration
-	perSec   float64
-	flushes  uint64
+	n         int
+	p50, p99  time.Duration
+	perSec    float64
+	flushes   uint64
+	wal, vlog pacerStats // flush decisions during the run
+}
+
+// enginePacerStats sums the flush decisions of every WAL and VLog pacer.
+func enginePacerStats(se *StorageEngine) (wal, vlog pacerStats) {
+	for _, w := range se.wals {
+		wal = wal.add(w.pacer.stats())
+	}
+	for _, v := range se.vlogs {
+		if v != nil {
+			vlog = vlog.add(v.pacer.stats())
+		}
+	}
+	return wal, vlog
+}
+
+func (a pacerStats) sub(b pacerStats) pacerStats {
+	return pacerStats{a.Immediate - b.Immediate, a.Gap - b.Gap, a.Deadline - b.Deadline, a.Full - b.Full}
 }
 
 // measurePuts runs `writers` goroutines doing durable single-key Puts for dur.
@@ -50,6 +68,7 @@ func measurePuts(t *testing.T, mode string, window, dur time.Duration, writers i
 	defer se.Close()
 	<-se.ReplayDone
 	flushes0 := se.metrics.WALFlushes.Load()
+	wal0, vlog0 := enginePacerStats(se)
 
 	var mu sync.Mutex
 	var lats []time.Duration
@@ -77,6 +96,7 @@ func measurePuts(t *testing.T, mode string, window, dur time.Duration, writers i
 	time.Sleep(dur)
 	stop.Store(true)
 	wg.Wait()
+	wal1, vlog1 := enginePacerStats(se)
 	sort.Slice(lats, func(i, j int) bool { return lats[i] < lats[j] })
 	if len(lats) == 0 {
 		t.Fatal("no writes completed")
@@ -87,36 +107,94 @@ func measurePuts(t *testing.T, mode string, window, dur time.Duration, writers i
 		p99:     lats[len(lats)*99/100],
 		perSec:  float64(len(lats)) / dur.Seconds(),
 		flushes: se.metrics.WALFlushes.Load() - flushes0,
+		wal:     wal1.sub(wal0),
+		vlog:    vlog1.sub(vlog0),
 	}
 }
 
 // TestGroupCommit_AdaptiveGates is the regression gate: with a 300 µs
 // device sync and the default 15 ms window,
-//   - a lone writer must not wait for the window (P50 well under it), and
+//   - a lone writer must not wait for the window, and
 //   - 64 concurrent writers must still share syncs (far fewer flushes than
-//     writes), at no less throughput than fixed-window commit.
+//     writes), flushing on idle gaps rather than at the window deadline, at
+//     no less throughput than fixed-window commit.
+//
+// The gates are built to hold on a loaded machine (go test ./... running
+// other packages, CI neighbours). There the emulated 300 µs sync sleeps for
+// milliseconds, the real fsync queues behind other processes' I/O, and writer
+// goroutines wait for a CPU, so absolute latencies mean nothing and one
+// fixed-then-adaptive pair can straddle a load spike. The old gates
+// (lone-writer P50 < 3 ms absolute; one 1 s fixed run, then one 1 s adaptive
+// run) failed that way 2/4 under load while every flush decision was correct.
+// So:
+//   - what the pacer DECIDED is gated exactly: pacer counters, immune to
+//     timing (a lone writer's flushes are all "immediate"; concurrent flushes
+//     are gap-driven, not deadline-driven);
+//   - wall-clock claims are relative (adaptive vs fixed measured back to
+//     back) and retried: a real regression fails every attempt, a load spike
+//     does not.
 func TestGroupCommit_AdaptiveGates(t *testing.T) {
 	if testing.Short() {
 		t.Skip("timing test")
 	}
 	withSyncLatency(t, 300*time.Microsecond)
 	const window = 15 * time.Millisecond
+	const attempts = 5
 
-	alone := measurePuts(t, GroupCommitAdaptive, window, 700*time.Millisecond, 1)
-	t.Logf("adaptive, 1 writer:   p50=%v p99=%v %.0f writes/s", alone.p50, alone.p99, alone.perSec)
-	if alone.p50 > window/5 {
-		t.Errorf("lone writer P50 %v: adaptive commit is waiting for the %v window", alone.p50, window)
+	// Lone writer — decisions. Every WAL and VLog flush must have been issued
+	// at once; any gap or deadline flush means a lone writer waited.
+	alone := measurePuts(t, GroupCommitAdaptive, window, 500*time.Millisecond, 1)
+	t.Logf("adaptive, 1 writer:   p50=%v p99=%v %.0f writes/s  wal=%+v vlog=%+v", alone.p50, alone.p99, alone.perSec, alone.wal, alone.vlog)
+	for _, d := range []struct {
+		name string
+		s    pacerStats
+	}{{"WAL", alone.wal}, {"VLog", alone.vlog}} {
+		if waited := d.s.Gap + d.s.Deadline + d.s.Full; d.s.Immediate == 0 || waited > d.s.Immediate/100 {
+			t.Errorf("lone writer: %s flushes %+v — adaptive commit made a lone writer wait", d.name, d.s)
+		}
 	}
 
-	fixed := measurePuts(t, GroupCommitFixed, window, time.Second, 64)
-	adapt := measurePuts(t, GroupCommitAdaptive, window, time.Second, 64)
-	t.Logf("fixed,    64 writers: p50=%v p99=%v %.0f writes/s, %.1f writes/flush", fixed.p50, fixed.p99, fixed.perSec, float64(fixed.n)/float64(fixed.flushes))
-	t.Logf("adaptive, 64 writers: p50=%v p99=%v %.0f writes/s, %.1f writes/flush", adapt.p50, adapt.p99, adapt.perSec, float64(adapt.n)/float64(adapt.flushes))
-	if float64(adapt.n)/float64(adapt.flushes) < 4 {
-		t.Errorf("adaptive commit stopped batching: %.1f writes per flush at 64 writers", float64(adapt.n)/float64(adapt.flushes))
+	// Lone writer — wall clock. A fixed-window lone writer waits the whole
+	// window; adaptive must take under half of that AND under half the window
+	// (catches a wait the pacer does not see, e.g. a sleep in the flusher,
+	// which would slow both modes alike).
+	lonePass := false
+	for a := 1; a <= attempts && !lonePass; a++ {
+		fixed1 := measurePuts(t, GroupCommitFixed, window, 300*time.Millisecond, 1)
+		adapt1 := measurePuts(t, GroupCommitAdaptive, window, 300*time.Millisecond, 1)
+		lonePass = adapt1.p50 < fixed1.p50/2 && adapt1.p50 < window/2
+		t.Logf("attempt %d, 1 writer: fixed p50=%v adaptive p50=%v pass=%v", a, fixed1.p50, adapt1.p50, lonePass)
 	}
-	if adapt.perSec < 0.9*fixed.perSec {
-		t.Errorf("adaptive throughput %.0f/s < 90%% of fixed %.0f/s at 64 writers", adapt.perSec, fixed.perSec)
+	if !lonePass {
+		t.Errorf("lone writer: adaptive P50 not under half of fixed-window P50 and of the window in %d attempts: adaptive commit is waiting for the %v window", attempts, window)
+	}
+
+	// 64 writers. An attempt passes when adaptive batches (≥ 4 writes per
+	// flush), flushes on idle gaps (deadline flushes are a minority), and
+	// keeps ≥ 90% of fixed-window throughput measured right before it.
+	var why string
+	concPass := false
+	for a := 1; a <= attempts && !concPass; a++ {
+		fixed := measurePuts(t, GroupCommitFixed, window, 500*time.Millisecond, 64)
+		adapt := measurePuts(t, GroupCommitAdaptive, window, 500*time.Millisecond, 64)
+		perFlush := float64(adapt.n) / float64(adapt.flushes)
+		flushes := adapt.wal.add(adapt.vlog)
+		total := flushes.Immediate + flushes.Gap + flushes.Deadline + flushes.Full
+		t.Logf("attempt %d, 64 writers: fixed %.0f writes/s (%.1f/flush, p50=%v)  adaptive %.0f writes/s (%.1f/flush, p50=%v)  wal=%+v vlog=%+v",
+			a, fixed.perSec, float64(fixed.n)/float64(fixed.flushes), fixed.p50, adapt.perSec, perFlush, adapt.p50, adapt.wal, adapt.vlog)
+		switch {
+		case perFlush < 4:
+			why = fmt.Sprintf("adaptive commit stopped batching: %.1f writes per flush at 64 writers", perFlush)
+		case flushes.Deadline*4 > total:
+			why = fmt.Sprintf("adaptive commit waits for the window: %d of %d flushes at the deadline", flushes.Deadline, total)
+		case adapt.perSec < 0.9*fixed.perSec:
+			why = fmt.Sprintf("adaptive throughput %.0f/s < 90%% of fixed %.0f/s at 64 writers", adapt.perSec, fixed.perSec)
+		default:
+			concPass = true
+		}
+	}
+	if !concPass {
+		t.Errorf("64 writers, all %d attempts failed; last: %s", attempts, why)
 	}
 }
 

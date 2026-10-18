@@ -43,6 +43,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	veltrixmetrics "github.com/VeltrixDB/veltrixdb/metrics"
 	"github.com/VeltrixDB/veltrixdb/storage"
 )
 
@@ -54,6 +55,10 @@ const defaultSearchTimeout = 2 * time.Second
 // partialSearches counts searches answered without every peer
 // (--search-allow-partial).
 var partialSearches atomic.Uint64
+
+// errSearchIncomplete starts the error of a fan-out a peer did not answer
+// (metrics: reason="incomplete").
+var errSearchIncomplete = errors.New("search incomplete")
 
 // searchRequest is one node-to-node search call.
 type searchRequest struct {
@@ -200,8 +205,8 @@ func (c *coordinator) fanout(peers []string, req searchRequest) ([]searchRespons
 	}
 	sort.Strings(failed)
 	if !c.searchAllowPartial {
-		return nil, fmt.Errorf("search incomplete: %d of %d peers did not answer: %s (retry, or start the server with --search-allow-partial)",
-			len(failed), len(peers), strings.Join(failed, "; "))
+		return nil, fmt.Errorf("%w: %d of %d peers did not answer: %s (retry, or start the server with --search-allow-partial)",
+			errSearchIncomplete, len(failed), len(peers), strings.Join(failed, "; "))
 	}
 	partialSearches.Add(1)
 	log.Printf("[search] partial %s result without %s", req.Kind, strings.Join(failed, "; "))
@@ -230,8 +235,48 @@ func mergeHits(lists [][]storage.VectorMatch, k int) []storage.VectorMatch {
 	return out
 }
 
+// searchOutcome classifies a search error for veltrixdb_search_errors_total.
+func searchOutcome(err error) veltrixmetrics.SearchOutcome {
+	switch {
+	case err == nil:
+		return veltrixmetrics.SearchOK
+	case errors.Is(err, storage.ErrSearchRebuilding):
+		return veltrixmetrics.SearchFailedRebuilding
+	case errors.Is(err, errSearchIncomplete):
+		return veltrixmetrics.SearchFailedIncomplete
+	}
+	return veltrixmetrics.SearchFailedOther
+}
+
+// VSearch, TSearch and HSearch are the client entry points: each counts one
+// request in c.searchMetrics (HSearch's vector and text halves are not
+// counted again).
+
 // VSearch is a (possibly distributed) vector search.
 func (c *coordinator) VSearch(ns string, q []float32, k int, opts storage.VectorSearchOptions) ([]storage.VectorMatch, error) {
+	t0 := time.Now()
+	hits, err := c.vsearch(ns, q, k, opts)
+	c.searchMetrics.ObserveSearch(veltrixmetrics.SearchVector, time.Since(t0), searchOutcome(err))
+	return hits, err
+}
+
+// TSearch is a (possibly distributed) BM25 search.
+func (c *coordinator) TSearch(ns, query string, k int, filter *storage.VectorFilter) ([]storage.VectorMatch, error) {
+	t0 := time.Now()
+	hits, err := c.tsearch(ns, query, k, filter)
+	c.searchMetrics.ObserveSearch(veltrixmetrics.SearchText, time.Since(t0), searchOutcome(err))
+	return hits, err
+}
+
+// HSearch is a (possibly distributed) hybrid search.
+func (c *coordinator) HSearch(ns string, vec []float32, query string, k int, opts storage.HybridOptions) ([]storage.VectorMatch, error) {
+	t0 := time.Now()
+	hits, err := c.hsearch(ns, vec, query, k, opts)
+	c.searchMetrics.ObserveSearch(veltrixmetrics.SearchHybrid, time.Since(t0), searchOutcome(err))
+	return hits, err
+}
+
+func (c *coordinator) vsearch(ns string, q []float32, k int, opts storage.VectorSearchOptions) ([]storage.VectorMatch, error) {
 	if err := c.searchReady(); err != nil {
 		return nil, err
 	}
@@ -260,8 +305,7 @@ func (c *coordinator) VSearch(ns string, q []float32, k int, opts storage.Vector
 	return mergeHits(lists, k), nil
 }
 
-// TSearch is a (possibly distributed) BM25 search.
-func (c *coordinator) TSearch(ns, query string, k int, filter *storage.VectorFilter) ([]storage.VectorMatch, error) {
+func (c *coordinator) tsearch(ns, query string, k int, filter *storage.VectorFilter) ([]storage.VectorMatch, error) {
 	if err := c.searchReady(); err != nil {
 		return nil, err
 	}
@@ -365,8 +409,7 @@ func (c *coordinator) Query(ns, field, op, value string, limit int) ([]storage.N
 	return out, nil
 }
 
-// HSearch is a (possibly distributed) hybrid search.
-func (c *coordinator) HSearch(ns string, vec []float32, query string, k int, opts storage.HybridOptions) ([]storage.VectorMatch, error) {
+func (c *coordinator) hsearch(ns string, vec []float32, query string, k int, opts storage.HybridOptions) ([]storage.VectorMatch, error) {
 	if err := c.searchReady(); err != nil {
 		return nil, err
 	}
@@ -380,7 +423,7 @@ func (c *coordinator) HSearch(ns string, vec []float32, query string, k int, opt
 	var vecHits, textHits []storage.VectorMatch
 	ran := false
 	if len(vec) > 0 {
-		hits, err := c.VSearch(ns, vec, cand, storage.VectorSearchOptions{Ef: opts.Ef, Filter: opts.Filter})
+		hits, err := c.vsearch(ns, vec, cand, storage.VectorSearchOptions{Ef: opts.Ef, Filter: opts.Filter})
 		switch {
 		case err == nil:
 			vecHits, ran = hits, true
@@ -389,7 +432,7 @@ func (c *coordinator) HSearch(ns string, vec []float32, query string, k int, opt
 		}
 	}
 	if storage.HasSearchTerms(query) {
-		hits, err := c.TSearch(ns, query, cand, opts.Filter)
+		hits, err := c.tsearch(ns, query, cand, opts.Filter)
 		if err != nil {
 			return nil, err
 		}

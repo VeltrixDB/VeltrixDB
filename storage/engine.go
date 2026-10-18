@@ -62,6 +62,13 @@ type StorageEngine struct {
 	// any WAL / VLog file is opened; released last in Close.
 	dirLocks []*dirLock
 
+	// applied is the raft applied-index state (raft_applied.go, invariant 65).
+	applied *appliedTracker
+
+	// rclock is the raft clock: the deterministic time of raft Apply
+	// (raft_clock.go, invariant 66).  Idle outside --mode=raft.
+	rclock raftClock
+
 	// Per-disk compaction queues: compactionQueues[diskIdx] feeds the
 	// compaction goroutine that owns diskIdx.
 	compactionQueues []chan CompactionRequest
@@ -119,9 +126,12 @@ type StorageEngine struct {
 	// vectors / texts hold this engine's in-RAM search indexes, one per
 	// namespace (vector_index.go, text_index.go), kept in sync with their
 	// reserved keys by search_hooks.go. Zero values are ready to use.
-	vectors       vectorRegistry
-	texts         textRegistry
-	searchRebuild searchRebuild
+	vectors vectorRegistry
+	texts   textRegistry
+	// searchRebuildMu serialises RebuildSearchIndexes and ResetSearchIndexes
+	// (raft snapshot restore), so two rebuilds never load into one registry.
+	searchRebuildMu sync.Mutex
+	searchRebuild   searchRebuild
 
 	// diskHealth holds one consecutive-error breaker per disk; a tripped
 	// breaker fails writes fast and reports the node degraded (disk_health.go).
@@ -408,6 +418,11 @@ func NewStorageEngine(cfg *StorageConfig) (*StorageEngine, error) {
 		}
 	}
 
+	// Phase 2c: strip raft applied-index markers and, in raft mode, cut the
+	// replay at the newest one (raft_applied.go). After 2/2b: the version
+	// counter and the VLog seed still cover every record, dropped or not.
+	applied := cutWALAtAppliedMarker(allEntries, maxReplayVersion, cfg.RaftAppliedIndex)
+
 	// Optionally create the io_uring storage bridge (one ring per disk) and
 	// wire it into every VLog, so VLogBatcher.Flush submits its one write
 	// through io_uring instead of pwrite. Off unless VELTRIXDB_URING_BRIDGE
@@ -469,6 +484,7 @@ func NewStorageEngine(cfg *StorageConfig) (*StorageEngine, error) {
 		sst:              sst,
 		cgoBatch:         cgoBatch,
 		storageBridge:    storageBridge,
+		applied:          applied,
 	}
 	// Probe once for the hashed-lookup capability rather than type-asserting
 	// on every read.
@@ -481,6 +497,18 @@ func NewStorageEngine(cfg *StorageConfig) (*StorageEngine, error) {
 	// version that appears in the replayed WAL entries.
 	if maxReplayVersion > 0 {
 		se.version.Store(maxReplayVersion)
+	}
+	// Raft mode: the raft clock comes back from the applied-index marker the
+	// replay is cut at, and replay applies records in WAL order (Apply waits
+	// for ReplayDone, so no live write races it) with expiry judged at the
+	// clock — raft_clock.go, invariant 66.
+	if cfg.RaftAppliedIndex {
+		index.replayInOrder = true
+		if applied.present {
+			se.rclock.last.Store(applied.m.clock)
+			se.rclock.floor.Store(applied.m.floor)
+			index.replayExpiryCapUs = applied.m.clock
+		}
 	}
 
 	// Phase 3 (background, async): apply WAL entries to the in-memory index.
@@ -570,6 +598,9 @@ func NewStorageEngine(cfg *StorageConfig) (*StorageEngine, error) {
 	se.quotas = NewQuotaManager()
 	se.tombstones = NewTombstoneCoordinator()
 	defrag.tombstones = se.tombstones // before defrag.start() below
+	for _, w := range se.wals {
+		w.keepTombstone = se.checkpointKeepsTombstone // tombstone_replicated.go
+	}
 
 	// Start the async write batcher after se is fully initialised so the
 	// batcher goroutine can safely call se.MultiPut and se.cgoBatch.
@@ -718,6 +749,26 @@ func (se *StorageEngine) transformForWrite(value []byte) ([]byte, uint8, error) 
 // With KV separation there is no "dirty flush to segment" step; compaction
 // only needs to GC the VLog, not merge key-value records.
 func (se *StorageEngine) Put(key string, value []byte, ttl int32) error {
+	return se.put(key, value, ttl, 0, false)
+}
+
+// put is Put with two restore-only knobs (raft snapshot restore,
+// snapshot_support.go):
+//
+//	expiryUs > 0 — install this ABSOLUTE expiry (Unix µs) instead of
+//	               deriving one from ttl, so a restored key keeps the exact
+//	               deadline it had on the node that captured it;
+//	raw          — write the key and nothing else: no secondary-index
+//	               diff-apply and no search hook.  A snapshot carries every
+//	               derived key ("@idx/", "@vec/", …) explicitly, so deriving
+//	               them again would write keys the snapshot does not hold.
+func (se *StorageEngine) put(key string, value []byte, ttl int32, expiryUs int64, raw bool) error {
+	return se.putOrigin(key, value, ttl, expiryUs, raw, 0)
+}
+
+// putOrigin is put; origin is 0 for a write this node originated or
+// FlagReplicaApplied for one applied from a replication peer (PutReplicated).
+func (se *StorageEngine) putOrigin(key string, value []byte, ttl int32, expiryUs int64, raw bool, origin uint8) error {
 	_, span := tracing.Start(context.Background(), "engine.Put")
 	defer span.End()
 	// Guarded: passing an int as `any` boxes it at the call site, which
@@ -753,14 +804,16 @@ func (se *StorageEngine) Put(key string, value []byte, ttl int32) error {
 	// one atomic load). The old value must be read BEFORE the write so the
 	// diff-apply after commit can remove index entries the update obsoletes.
 	var oldIdxVal []byte
-	maintainIdx := indexRulesActive() && !isInternalIndexKey(key)
+	maintainIdx := !raw && indexRulesActive() && !isInternalIndexKey(key)
 	if maintainIdx {
 		oldIdxVal, _ = se.Get(key) // nil when the key is absent
 	}
 
 	start := time.Now()
-	nowUs := start.UnixMicro()
-	version := se.version.Add(1)
+	// stampUs is the entry's WriteTimestampUs (its version token); nowUs is
+	// the time TTLs are converted against.  Both are the local clock, or the
+	// raft command's time inside raft Apply (raft_clock.go).
+	stampUs, nowUs := se.writeClock()
 	crc := computeCRC32C(value)
 
 	shardID := uint16(fnv64a(key) & (numShards - 1))
@@ -768,15 +821,23 @@ func (se *StorageEngine) Put(key string, value []byte, ttl int32) error {
 	if se.diskIsFailed(diskIdx) {
 		return degradedError(diskIdx)
 	}
+	// In flight for a runtime checkpoint's fence from before the version to
+	// after the index update (wal_checkpoint_live.go).
+	walTok := se.wals[diskIdx].enterWrite()
+	defer se.wals[diskIdx].exitWrite(walTok)
+	version := se.version.Add(1)
 
 	// The absolute expiry goes into the WAL record as well as the IndexEntry:
 	// without it replay rebuilt every TTL'd key as immortal. Every field is
 	// (re)set — pooled entries keep whatever the previous user left, and a
 	// stale TTLExpiryUs would give an immortal key someone else's deadline.
 	ttlExpiryUs := walTTLExpiryUs(nowUs, ttl)
+	if expiryUs > 0 {
+		ttlExpiryUs = expiryUs
+	}
 	walEntry := walEntryPool.Get().(*WALEntry)
 	*walEntry = WALEntry{
-		Timestamp:   start.UnixNano(),
+		Timestamp:   stampUs * 1000,
 		KeyLen:      uint32(len(key)),
 		Key:         key,
 		ValueLen:    uint32(len(value)),
@@ -793,7 +854,7 @@ func (se *StorageEngine) Put(key string, value []byte, ttl int32) error {
 		ValueSize:        uint32(len(value)),
 		UncompressedSize: uint32(len(value)),
 		KeySize:          uint32(len(key)),
-		WriteTimestampUs: nowUs,
+		WriteTimestampUs: stampUs,
 		CRC32C:           crc,
 		SchemaVersion:    CurrentSchemaVersion,
 		ShardID:          shardID,
@@ -802,6 +863,8 @@ func (se *StorageEngine) Put(key string, value []byte, ttl int32) error {
 		entry.Flags |= FlagHasTTL
 		entry.TTLExpiryUs = ttlExpiryUs
 	}
+	entry.Flags |= origin
+	walEntry.XformFlags = origin
 
 	if se.config.KeyValueSeparation && len(se.vlogs) > 0 {
 		if old, _, ok := se.index.get(key); ok && !old.IsTombstone() && old.DiskOffset > 0 {
@@ -838,7 +901,7 @@ func (se *StorageEngine) Put(key string, value []byte, ttl int32) error {
 		// and fail CRC — every compressed or encrypted key unreadable after a
 		// crash restart.
 		walEntry.DiskValueLen = uint32(len(writeBytes))
-		walEntry.XformFlags = xflags
+		walEntry.XformFlags = xflags | origin
 		walRp := se.wals[diskIdx].beginAppend(walEntry)
 		walEntryPool.Put(walEntry) // safe: serialize() consumed all fields above
 
@@ -882,7 +945,7 @@ func (se *StorageEngine) Put(key string, value []byte, ttl int32) error {
 	se.metrics.WritesLatencyNs.Store(elapsed.Nanoseconds())
 	se.metrics.ObserveWriteLatency(elapsed.Seconds())
 	se.audit.Log(AuditRecord{Op: "PUT", Key: key, Status: "ok"})
-	se.cdc.Broadcast(CDCEvent{Op: "PUT", Key: key, Value: value, Timestamp: nowUs})
+	se.cdc.Broadcast(CDCEvent{Op: "PUT", Key: key, Value: value, Timestamp: stampUs})
 
 	// Diff-apply secondary indexes AFTER the primary write committed — the
 	// contract documented in secondary_index.go. Best-effort: index write
@@ -890,7 +953,7 @@ func (se *StorageEngine) Put(key string, value []byte, ttl int32) error {
 	if maintainIdx {
 		se.applySecondaryIndexes(key, oldIdxVal, value)
 	}
-	if isSearchKey(key) {
+	if !raw && isSearchKey(key) {
 		se.onSearchKeyPut(key, value)
 	}
 	return nil
@@ -1049,7 +1112,7 @@ func (se *StorageEngine) get(key string, mode getMode) (_ []byte, needIO bool, _
 		// through to the index, which tombstones the key, evicts it and
 		// returns ErrKeyExpired exactly as an uncached read does. Immortal
 		// keys (expiresUs == 0) pay one compare and no clock read.
-		if hit && expiresUs != 0 && time.Now().UnixMicro() >= expiresUs {
+		if hit && expiresUs != 0 && se.decisionNowUs() >= expiresUs {
 			hit = false
 		}
 	} else {
@@ -1057,7 +1120,7 @@ func (se *StorageEngine) get(key string, mode getMode) (_ []byte, needIO bool, _
 		// A Cache without getHashed carries no deadline: confirm against
 		// the index. No shipped cache takes this path.
 		if hit {
-			if e, _, ok := se.index.getHashed(key, h); !ok || e.IsTombstone() || e.IsExpired(time.Now().UnixMicro()) {
+			if e, _, ok := se.index.getHashed(key, h); !ok || e.IsTombstone() || e.IsExpired(se.decisionNowUs()) {
 				hit = false
 			}
 		}
@@ -1089,9 +1152,13 @@ func (se *StorageEngine) get(key string, mode getMode) (_ []byte, needIO bool, _
 		return nil, false, ErrKeyNotFound
 	}
 
-	nowUs := time.Now().UnixMicro()
-	if entry.IsExpired(nowUs) {
-		se.index.markTombstone(key, nowUs)
+	// Hidden once expired by the local clock (inside a raft command: at the
+	// command's time); tombstoned only when expired at expiryCutoffUs —
+	// raft_clock.go.
+	if nowUs := se.decisionNowUs(); entry.IsExpired(nowUs) {
+		if cut := se.expiryCutoffUs(); entry.IsExpired(cut) {
+			se.index.markExpired(key, cut, nowUs)
+		}
 		se.cache.Evict(key)
 		return nil, false, ErrKeyExpired
 	}
@@ -1131,9 +1198,6 @@ func (se *StorageEngine) get(key string, mode getMode) (_ []byte, needIO bool, _
 			if computeCRC32C(value) != entry.CRC32C {
 				return nil, false, fmt.Errorf("CRC32C mismatch for key %s: data corruption", key)
 			}
-			if entry.Flags&FlagReadRepairNeeded != 0 {
-				entry.Flags &^= FlagReadRepairNeeded
-			}
 			se.cache.PutWithExpiry(key, value, entry.CacheExpiryUs())
 			return value, false, nil
 		}
@@ -1150,20 +1214,49 @@ func (se *StorageEngine) get(key string, mode getMode) (_ []byte, needIO bool, _
 // Defragmenter reaps it after GCGracePeriodSec to give lagging replicas time
 // to receive the delete before the tombstone disappears.
 func (se *StorageEngine) Delete(key string) error {
+	return se.del(key, false)
+}
+
+// del is Delete; raw (raft snapshot restore) skips every derived effect —
+// secondary-index removal, the search hook and the invariant-60 cascade —
+// because the snapshot states each derived key explicitly.
+func (se *StorageEngine) del(key string, raw bool) error {
+	return se.delOrigin(key, raw, 0)
+}
+
+// delOrigin is del; origin as for putOrigin (DeleteReplicated).
+func (se *StorageEngine) delOrigin(key string, raw bool, origin uint8) error {
 	// Secondary-index maintenance: capture the old value before tombstoning
 	// so the obsolete "@idx/..." entries can be diff-removed afterwards.
 	// One atomic load when no indexes are defined.
 	var oldIdxVal []byte
-	maintainIdx := indexRulesActive() && !isInternalIndexKey(key)
+	maintainIdx := !raw && indexRulesActive() && !isInternalIndexKey(key)
 	if maintainIdx {
 		oldIdxVal, _ = se.Get(key)
 	}
 
 	start := time.Now()
-	nowUs := start.UnixMicro()
+	stampUs, nowUs := se.writeClock() // raft_clock.go
+	// Inside a raft command the invariant-60 cascade below runs when the
+	// record was live at the command's time — not when an entry merely
+	// exists: whether a tombstone is still there depends on local reaping.
+	at := se.applyTime()
+	liveBefore := false
+	if at != nil {
+		if e, _, ok := se.index.get(key); ok && !e.IsTombstone() && !e.IsExpired(nowUs) {
+			liveBefore = true
+		}
+	}
+
+	delShardID := uint16(fnv64a(key) & (numShards - 1))
+	delDiskIdx := diskForShard(delShardID, len(se.wals))
+	// In flight for a runtime checkpoint's fence from before the version to
+	// after the index update (wal_checkpoint_live.go).
+	walTok := se.wals[delDiskIdx].enterWrite()
+	defer se.wals[delDiskIdx].exitWrite(walTok)
 
 	walEntry := walEntryPool.Get().(*WALEntry)
-	walEntry.Timestamp = start.UnixNano()
+	walEntry.Timestamp = stampUs * 1000
 	walEntry.KeyLen = uint32(len(key))
 	walEntry.Key = key
 	walEntry.IsTombstone = true
@@ -1173,8 +1266,7 @@ func (se *StorageEngine) Delete(key string) error {
 	walEntry.Checksum = 0
 	walEntry.ReplicationID = 0
 	walEntry.TTLExpiryUs = 0 // pooled: never carry a previous put's TTL
-	delShardID := uint16(fnv64a(key) & (numShards - 1))
-	delDiskIdx := diskForShard(delShardID, len(se.wals))
+	walEntry.XformFlags = origin
 	err := se.wals[delDiskIdx].append(walEntry)
 	walEntryPool.Put(walEntry)
 	if err != nil {
@@ -1189,7 +1281,13 @@ func (se *StorageEngine) Delete(key string) error {
 
 	// existed: the key had an index entry (live, or a tombstone not yet
 	// reaped) — the condition for the search cascade below.
-	existed := se.index.markTombstone(key, nowUs)
+	existed := se.index.markTombstone(key, stampUs)
+	if at != nil {
+		existed = liveBefore
+	}
+	if origin != 0 {
+		se.index.setReplicaApplied(key, stampUs)
+	}
 	se.cache.Evict(key)
 
 	se.metrics.Deletes.Add(1)
@@ -1197,11 +1295,14 @@ func (se *StorageEngine) Delete(key string) error {
 	se.metrics.DeletesLatencyNs.Store(elapsed.Nanoseconds())
 	se.metrics.ObserveDeleteLatency(elapsed.Seconds())
 	se.audit.Log(AuditRecord{Op: "DEL", Key: key, Status: "ok"})
-	se.cdc.Broadcast(CDCEvent{Op: "DEL", Key: key, Timestamp: nowUs})
+	se.cdc.Broadcast(CDCEvent{Op: "DEL", Key: key, Timestamp: stampUs})
 
 	// Remove the deleted key's secondary-index entries (diff against nil).
 	if maintainIdx && oldIdxVal != nil {
 		se.applySecondaryIndexes(key, oldIdxVal, nil)
+	}
+	if raw {
+		return nil
 	}
 	if isSearchKey(key) {
 		se.onSearchKeyDelete(key)
@@ -1287,7 +1388,7 @@ func (se *StorageEngine) DeleteNS(ns, key string) error {
 // Returns the number of keys deleted.
 func (se *StorageEngine) DropNamespace(ns string) (int, error) {
 	prefix := ns + nsSep
-	nowUs := time.Now().UnixMicro()
+	nowUs := se.decisionNowUs() // inside raft Apply: the command's time
 	var keys []string
 	for i := range se.index.shards {
 		shard := &se.index.shards[i]
@@ -1561,23 +1662,26 @@ func (se *StorageEngine) GetDataDirs() []string {
 }
 
 // Checkpoint writes a compacted WAL for every disk (one record per live key)
-// and truncates the live WAL so the next startup replays O(numLiveKeys) instead
-// of the full write history.  Safe to call while the engine is serving writes.
+// and carries over the WAL written since, so the next startup replays
+// O(numLiveKeys + writes during the checkpoint) instead of the full write
+// history.  Safe to call while the engine is serving writes: see
+// wal_checkpoint_live.go for how, and LastCheckpointStats for the stall.
 func (se *StorageEngine) Checkpoint() error {
-	version := se.version.Load()
-	numDisks := len(se.wals)
-	kvSep := se.config.KeyValueSeparation
-	var firstErr error
-	for _, w := range se.wals {
-		if err := w.checkpoint(se.index, numDisks, kvSep, version); err != nil && firstErr == nil {
-			firstErr = err
-		}
+	if gate := se.checkpointGate(); gate != nil {
+		var err error
+		gate(func() { err = se.checkpointNow() })
+		return err
 	}
-	if firstErr == nil {
-		log.Printf("[checkpoint] complete  disks=%d  keys=%d  version=%d",
-			numDisks, se.index.size(), version)
+	return se.checkpointNow()
+}
+
+func (se *StorageEngine) checkpointNow() error {
+	lc, err := se.checkpointAll(false)
+	if err != nil {
+		return err
 	}
-	return firstErr
+	lc.close()
+	return nil
 }
 
 // ScanKeys returns the keys of all live (non-tombstoned, non-expired) entries.
@@ -1756,6 +1860,7 @@ func (se *StorageEngine) Close() error {
 			firstErr = err
 		}
 	}
+	ckptVersion, ckptExtra := se.checkpointVersion()
 	for _, w := range se.wals {
 		if err := w.close(); err != nil && firstErr == nil {
 			firstErr = err
@@ -1764,7 +1869,7 @@ func (se *StorageEngine) Close() error {
 		// keys survive a clean restart.  The checkpoint is written to a temp
 		// file and atomically renamed so a crash mid-write leaves the old WAL
 		// intact.  Replay on next startup is O(numKeys) not O(totalWrites).
-		if err := w.checkpoint(se.index, len(se.wals), se.config.KeyValueSeparation, se.version.Load()); err != nil && firstErr == nil {
+		if err := w.checkpoint(se.index, len(se.wals), se.config.KeyValueSeparation, ckptVersion, ckptExtra); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}
@@ -1880,11 +1985,17 @@ func (se *StorageEngine) backgroundTTLScanner() {
 		case <-se.done:
 			return
 		case <-ticker.C:
+			// Raft mode: never tombstone past the raft clock (raft_clock.go).
+			cutoffUs := se.expiryCutoffUs()
 			nowUs := time.Now().UnixMicro()
-			expired := se.index.expiredTTL()
+			expired := se.index.expiredTTL(cutoffUs)
 			if len(expired) > 0 {
 				for _, key := range expired {
-					se.index.markTombstone(key, nowUs)
+					// Re-checked under the shard lock: a write since the
+					// scan must not be tombstoned.
+					if !se.index.markExpired(key, cutoffUs, nowUs) {
+						continue
+					}
 					se.cache.Evict(key)
 					se.metrics.EvictionMetrics.TTLEvictions.Add(1)
 					se.metrics.EvictionMetrics.TotalEvictions.Add(1)

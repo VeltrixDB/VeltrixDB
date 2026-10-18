@@ -14,6 +14,7 @@ Technical documentation for VeltrixDB internals.
 | [backup-restore.md](backup-restore.md) | Full and incremental backup (`POST /admin/backup`, `veltrixdb-backup`); cloud backup (S3/GCS/Azure); restore procedure; point-in-time recovery (WAL archiving, `restore-pitr`); backup safety guarantees |
 | [vector-search.md](vector-search.md) | Vector, full-text and hybrid search: commands, float32 / int8 / PQ / disk-graph layouts, filters, clusters, restarts, measured recall / latency / RAM |
 | [redis-comparison.md](redis-comparison.md) | VeltrixDB vs Redis: when to use each |
+| [monitoring.md](monitoring.md) | `/metrics` contents (storage, Go / process, search, raft), the alert rules and how they are tested, the Helm chart's rules, remaining gaps |
 
 ## Existing Docs
 
@@ -53,7 +54,7 @@ Technical documentation for VeltrixDB internals.
 | C++ network front-end (`--net=cpp\|uring\|poll`, opt-in) | `netfront/` |
 | Profiling listener (`--pprof-addr`) | `cmd/server/pprof.go` |
 | cgo toggles (`VELTRIXDB_DISABLE_CGO_ENGINE`, `VELTRIXDB_URING_BRIDGE`) | `storage/cgo_toggle.go` |
-| Prometheus metrics | `metrics/prometheus.go` |
+| Prometheus metrics | `metrics/prometheus.go`, `metrics/search.go`, `metrics/raft.go`, `metrics/runtime.go`; registry: `cmd/server/metrics_setup.go` |
 | Sharded LIRS cache | `storage/cache_sharded.go` |
 | Value transform (compress/encrypt) | `storage/engine.go` — `transformForWrite` |
 | Transform-metadata repair | `storage/repair.go`, `cmd/veltrix-repair/main.go` |

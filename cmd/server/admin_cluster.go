@@ -44,6 +44,13 @@ type replicaStatus struct {
 	LagNs         int64  `json:"lag_ns"`
 	LastAckAt     int64  `json:"last_ack_unix_nano"`
 	NextProbeAt   int64  `json:"next_probe_unix_nano,omitempty"`
+	// ResyncPending: the replica missed writes that are no longer retained
+	// (evicted, or made before this node restarted) and its change-feed
+	// catch-up has not finished.  DeleteGap: a catch-up started further back
+	// than the tombstone retention — deletes may be missing on the replica
+	// (log line "FULL RESYNC"); rebuild it from a healthy node to be sure.
+	ResyncPending bool `json:"resync_pending"`
+	DeleteGap     bool `json:"delete_gap"`
 }
 
 type nodeEntry struct {
@@ -111,6 +118,8 @@ func buildTopology(coord *coordinator, pm *cluster.PartitionMap) topologyRespons
 					LagNs:         lag.LagNs,
 					LastAckAt:     lag.LastAckAt,
 					NextProbeAt:   lag.NextProbeAt,
+					ResyncPending: lag.ResyncPending,
+					DeleteGap:     lag.DeleteGap,
 				})
 			}
 		}

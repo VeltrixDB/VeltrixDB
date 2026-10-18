@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"runtime"
 	"sync"
-	"time"
 )
 
 // MultiPutRequest is a single entry in a vectorized write batch.
@@ -31,9 +30,48 @@ type MultiGetResult struct {
 //
 // Non-KV-separation path: grouped by shard, goroutines run in parallel.
 func (se *StorageEngine) MultiPut(reqs []MultiPutRequest) []error {
+	return se.multiPut(reqs, nil, nil, false)
+}
+
+// MultiPutAt is MultiPut for a run of raft commands, one per request: request
+// i is written as of times[i] — stamped times[i].StampUs, its TTL converted
+// against times[i].NowUs, and the reads it makes (secondary-index old
+// value) judged at it — exactly as if it were applied alone under
+// SetApplyTime(times[i]) (raft_clock.go).
+func (se *StorageEngine) MultiPutAt(reqs []MultiPutRequest, times []ApplyTime) []error {
+	if len(times) != len(reqs) {
+		errs := make([]error, len(reqs))
+		for i := range errs {
+			errs[i] = fmt.Errorf("MultiPutAt: %d times for %d requests", len(times), len(reqs))
+		}
+		return errs
+	}
+	return se.multiPut(reqs, nil, times, false)
+}
+
+// multiPut is MultiPut with the restore-only knobs of put: expiries (nil, or
+// one absolute Unix-µs expiry per request; 0 = derive from TTL) and raw (no
+// secondary-index diff-apply, no search hooks); times (nil, or one ApplyTime
+// per request — MultiPutAt; a zero StampUs / NowUs means the batch's own).
+func (se *StorageEngine) multiPut(reqs []MultiPutRequest, expiries []int64, times []ApplyTime, raw bool) []error {
 	errs := make([]error, len(reqs))
 	if len(reqs) == 0 {
 		return errs
+	}
+	// at runs fn as of request i's time (MultiPutAt), else as is.
+	at := func(i int, fn func()) {
+		if times == nil || times[i].NowUs == 0 {
+			fn()
+			return
+		}
+		prev := se.applyTime()
+		se.SetApplyTime(times[i])
+		fn()
+		if prev != nil {
+			se.SetApplyTime(*prev)
+		} else {
+			se.ClearApplyTime()
+		}
 	}
 
 	if se.config.KeyValueSeparation && len(se.vlogs) > 0 {
@@ -42,28 +80,32 @@ func (se *StorageEngine) MultiPut(reqs []MultiPutRequest) []error {
 		// values are captured before the batch so the diff-apply can remove
 		// obsolete entries. The fallback path below needs none of this — it
 		// funnels through se.Put, which maintains indexes itself.
-		maintainIdx := indexRulesActive()
+		maintainIdx := !raw && indexRulesActive()
 		var oldVals [][]byte
 		if maintainIdx {
 			oldVals = make([][]byte, len(reqs))
 			for i, r := range reqs {
 				if !isInternalIndexKey(r.Key) {
-					oldVals[i], _ = se.Get(r.Key)
+					i, r := i, r
+					at(i, func() { oldVals[i], _ = se.Get(r.Key) })
 				}
 			}
 		}
-		errs = se.multiPutKVSep(reqs, errs)
+		errs = se.multiPutKVSep(reqs, errs, expiries, times)
 		if maintainIdx {
 			for i, r := range reqs {
 				if errs[i] != nil || isInternalIndexKey(r.Key) {
 					continue
 				}
-				se.applySecondaryIndexes(r.Key, oldVals[i], r.Value)
+				i, r := i, r
+				at(i, func() { se.applySecondaryIndexes(r.Key, oldVals[i], r.Value) })
 			}
 		}
-		for i, r := range reqs {
-			if errs[i] == nil && isSearchKey(r.Key) {
-				se.onSearchKeyPut(r.Key, r.Value)
+		if !raw {
+			for i, r := range reqs {
+				if errs[i] == nil && isSearchKey(r.Key) {
+					se.onSearchKeyPut(r.Key, r.Value)
+				}
 			}
 		}
 		return errs
@@ -75,6 +117,19 @@ func (se *StorageEngine) MultiPut(reqs []MultiPutRequest) []error {
 		groups[sid] = append(groups[sid], i)
 	}
 
+	if times != nil {
+		// One time per request: the fallback runs them in order, each as of
+		// its own time (put reads the stamp from the installed ApplyTime).
+		for i := range reqs {
+			var exp int64
+			if expiries != nil {
+				exp = expiries[i]
+			}
+			i := i
+			at(i, func() { errs[i] = se.put(reqs[i].Key, reqs[i].Value, reqs[i].TTL, exp, raw) })
+		}
+		return errs
+	}
 	var wg sync.WaitGroup
 	wg.Add(len(groups))
 	for sid, idxs := range groups {
@@ -83,7 +138,11 @@ func (se *StorageEngine) MultiPut(reqs []MultiPutRequest) []error {
 			defer wg.Done()
 			_ = sid
 			for _, i := range idxs {
-				errs[i] = se.Put(reqs[i].Key, reqs[i].Value, reqs[i].TTL)
+				var exp int64
+				if expiries != nil {
+					exp = expiries[i]
+				}
+				errs[i] = se.put(reqs[i].Key, reqs[i].Value, reqs[i].TTL, exp, raw)
 			}
 		}()
 	}
@@ -128,10 +187,30 @@ func (se *StorageEngine) MultiPut(reqs []MultiPutRequest) []error {
 //     VLog bytes are orphaned (next GC pass reclaims them).
 //   - Both pending at crash time → client never received OK; replay sees no
 //     WAL record → VLog bytes orphaned (next GC pass reclaims them).
-func (se *StorageEngine) multiPutKVSep(reqs []MultiPutRequest, errs []error) []error {
+func (se *StorageEngine) multiPutKVSep(reqs []MultiPutRequest, errs []error, expiries []int64, times []ApplyTime) []error {
 	numDisks := len(se.vlogs)
-	nowUs := time.Now().UnixMicro()
-	nowNs := nowUs * 1000
+	// The batch's stamp and "now": the local clock, or the raft command's
+	// time inside raft Apply; times[i] overrides them per request
+	// (MultiPutAt, snapshot restore) — raft_clock.go.
+	batchStampUs, batchNowUs := se.writeClock()
+	stampOf := func(i int) int64 {
+		if times != nil && times[i].StampUs != 0 {
+			return times[i].StampUs
+		}
+		return batchStampUs
+	}
+	// expiryOf is request i's absolute expiry: the caller's (restore), else
+	// derived from its TTL.  WAL record and IndexEntry must agree.
+	expiryOf := func(i int) int64 {
+		if expiries != nil && expiries[i] > 0 {
+			return expiries[i]
+		}
+		nowUs := batchNowUs
+		if times != nil && times[i].NowUs != 0 {
+			nowUs = times[i].NowUs
+		}
+		return walTTLExpiryUs(nowUs, reqs[i].TTL)
+	}
 
 	byDisk := make([][]int, numDisks)
 	for i, r := range reqs {
@@ -152,6 +231,10 @@ func (se *StorageEngine) multiPutKVSep(reqs []MultiPutRequest, errs []error) []e
 
 			vl := se.vlogs[d]
 			wal := se.wals[d]
+			// In flight for a runtime checkpoint's fence from before the
+			// versions (Phase 1b) to after the index update (Phase 4).
+			walTok := wal.enterWrite()
+			defer wal.exitWrite(walTok)
 			batcher := vl.NewBatcher()
 
 			// Pre-compute CRC and shard for every entry in this disk's slice.
@@ -232,7 +315,7 @@ func (se *StorageEngine) multiPutKVSep(reqs []MultiPutRequest, errs []error) []e
 				// die once appendAll has serialized them, and allocating one
 				// per key cost 1024 allocations per 1024-entry batch.
 				we := walEntryPool.Get().(*WALEntry)
-				we.Timestamp = nowNs
+				we.Timestamp = stampOf(s.reqIdx) * 1000
 				we.Key = r.Key
 				we.KeyLen = uint32(len(r.Key))
 				// ValueLen is the plaintext length; DiskValueLen is what
@@ -249,7 +332,7 @@ func (se *StorageEngine) multiPutKVSep(reqs []MultiPutRequest, errs []error) []e
 				we.XformFlags = s.xflags
 				// Same absolute deadline Phase 4 installs on the IndexEntry;
 				// always assigned, so a pooled entry never keeps an old one.
-				we.TTLExpiryUs = walTTLExpiryUs(nowUs, r.TTL)
+				we.TTLExpiryUs = expiryOf(s.reqIdx)
 				walEntries = append(walEntries, we)
 			}
 
@@ -317,7 +400,7 @@ func (se *StorageEngine) multiPutKVSep(reqs []MultiPutRequest, errs []error) []e
 					ValueSize:        s.diskLen,
 					UncompressedSize: uint32(len(r.Value)),
 					KeySize:          uint32(len(r.Key)),
-					WriteTimestampUs: nowUs,
+					WriteTimestampUs: stampOf(s.reqIdx),
 					CRC32C:           s.crc,
 					SchemaVersion:    CurrentSchemaVersion,
 					ShardID:          s.shardID,
@@ -326,7 +409,7 @@ func (se *StorageEngine) multiPutKVSep(reqs []MultiPutRequest, errs []error) []e
 					entry.Flags |= FlagPacked
 				}
 				entry.Flags |= s.xflags
-				if exp := walTTLExpiryUs(nowUs, r.TTL); exp > 0 {
+				if exp := expiryOf(s.reqIdx); exp > 0 {
 					entry.Flags |= FlagHasTTL
 					entry.TTLExpiryUs = exp
 				}
@@ -346,7 +429,7 @@ func (se *StorageEngine) multiPutKVSep(reqs []MultiPutRequest, errs []error) []e
 				se.cache.PutIfPresentWithExpiry(r.Key, r.Value, entry.CacheExpiryUs())
 				if emit {
 					se.audit.Log(AuditRecord{Op: "PUT", Key: r.Key, Status: "ok"})
-					se.cdc.Broadcast(CDCEvent{Op: "PUT", Key: r.Key, Value: r.Value, Timestamp: nowUs})
+					se.cdc.Broadcast(CDCEvent{Op: "PUT", Key: r.Key, Value: r.Value, Timestamp: entry.WriteTimestampUs})
 				}
 				survived++
 			}

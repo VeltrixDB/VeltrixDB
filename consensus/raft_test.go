@@ -22,6 +22,16 @@ type mockTransport struct {
 	// the nodeTransport wrapper (which also fails RPCs FROM a cut node) for a
 	// full bidirectional partition.
 	cut map[string]bool
+	// chunkDelay delays every snapshot chunk delivery; aeHook sees every
+	// AppendEntries before delivery (snapshot tests).
+	chunkDelay time.Duration
+	aeHook     func(to string, args AppendEntriesArgs)
+}
+
+func (m *mockTransport) setAEHook(h func(to string, args AppendEntriesArgs)) {
+	m.mu.Lock()
+	m.aeHook = h
+	m.mu.Unlock()
 }
 
 func newMockTransport() *mockTransport {
@@ -94,6 +104,13 @@ func (nt *nodeTransport) SendInstallSnapshot(peer string, args InstallSnapshotAr
 	return nt.hub.SendInstallSnapshot(peer, args)
 }
 
+func (nt *nodeTransport) SendInstallSnapshotChunk(peer string, args InstallSnapshotChunkArgs) (InstallSnapshotChunkReply, error) {
+	if nt.blocked(peer) {
+		return InstallSnapshotChunkReply{}, fmt.Errorf("partitioned")
+	}
+	return nt.hub.SendInstallSnapshotChunk(peer, args)
+}
+
 // Close is a no-op on the per-node view: the hub owns no resources, and
 // closing it from one node's Stop would break the remaining nodes.
 func (nt *nodeTransport) Close() error { return nil }
@@ -124,6 +141,9 @@ func (m *mockTransport) SendAppendEntries(peer string, args AppendEntriesArgs) (
 	if !ok {
 		return AppendEntriesReply{}, fmt.Errorf("unknown peer %q", peer)
 	}
+	if m.aeHook != nil {
+		m.aeHook(peer, args)
+	}
 	return node.HandleAppendEntries(args), nil
 }
 
@@ -138,6 +158,29 @@ func (m *mockTransport) SendInstallSnapshot(peer string, args InstallSnapshotArg
 		return InstallSnapshotReply{}, fmt.Errorf("unknown peer %q", peer)
 	}
 	return node.HandleInstallSnapshot(args), nil
+}
+
+func (m *mockTransport) SendInstallSnapshotChunk(peer string, args InstallSnapshotChunkArgs) (InstallSnapshotChunkReply, error) {
+	m.mu.RLock()
+	d := m.chunkDelay
+	m.mu.RUnlock()
+	if d > 0 {
+		time.Sleep(d)
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.closed {
+		return InstallSnapshotChunkReply{}, fmt.Errorf("transport closed")
+	}
+	node, ok := m.peers[peer]
+	if !ok {
+		return InstallSnapshotChunkReply{}, fmt.Errorf("unknown peer %q", peer)
+	}
+	if node.legacyPeer {
+		// A v1.16 server closes the connection on an unknown message type.
+		return InstallSnapshotChunkReply{}, fmt.Errorf("connection closed: unknown message type 0x%02x", msgSnapshotChunk)
+	}
+	return node.HandleInstallSnapshotChunk(args), nil
 }
 
 func (m *mockTransport) Close() error {

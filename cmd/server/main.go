@@ -24,14 +24,13 @@ import (
 
 	"github.com/VeltrixDB/veltrixdb/adminapi"
 	"github.com/VeltrixDB/veltrixdb/cluster"
+	"github.com/VeltrixDB/veltrixdb/consensus"
 	"github.com/VeltrixDB/veltrixdb/hardware"
-	veltrixmetrics "github.com/VeltrixDB/veltrixdb/metrics"
 	"github.com/VeltrixDB/veltrixdb/netfront"
 	"github.com/VeltrixDB/veltrixdb/replication"
 	"github.com/VeltrixDB/veltrixdb/security"
 	"github.com/VeltrixDB/veltrixdb/storage"
 	"github.com/VeltrixDB/veltrixdb/tracing"
-	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
@@ -258,6 +257,12 @@ func main() {
 			"\ttrue: up to 8 in flight, sent before the leader's own fsync — faster when every\n"+
 			"\tnode has its own disk, slower when nodes share one (3 local nodes on a Mac:\n"+
 			"\t~600 vs ~1,050 loads/s). Durability is the same. Off until measured on separate hosts.")
+	raftSnapThreshold := flag.Uint64("raft-snapshot-threshold", uint64(envInt("VELTRIX_RAFT_SNAPSHOT_THRESHOLD", consensus.DefaultSnapshotThreshold)),
+		"Raft mode: take a state-machine snapshot and compact the log once this many entries\n"+
+			"\tare retained (env VELTRIX_RAFT_SNAPSHOT_THRESHOLD; 0 = never). Snapshots have no size\n"+
+			"\tcap and are streamed to disk; Apply keeps running while one is captured.")
+	raftSnapChunkKB := flag.Int("raft-snapshot-chunk-kb", envInt("VELTRIX_RAFT_SNAPSHOT_CHUNK_KB", consensus.DefaultSnapshotChunkSize>>10),
+		"Raft mode: InstallSnapshot chunk size in KiB (env VELTRIX_RAFT_SNAPSHOT_CHUNK_KB).")
 	autoRebalance := flag.Bool("auto-rebalance", true,
 		"Replicated mode: when a node is added to or removed from the membership, rebalance\n"+
 			"\tthe ring and copy keys to their new RF replicas (a key leaves a node only after\n"+
@@ -283,6 +288,21 @@ func main() {
 	clusterTLSKey := flag.String("cluster-tls-key", "", "PEM key for inter-node (Raft/replication) TLS.")
 	clusterTLSCA := flag.String("cluster-tls-ca", "", "PEM CA bundle for inter-node TLS verification.")
 	clusterMTLS := flag.Bool("cluster-mtls", false, "Require and verify peer client certificates (mutual TLS) for inter-node traffic.")
+	joinFlag := flag.String("join", "",
+		"Join a running cluster instead of bootstrapping one: comma-separated client addresses\n"+
+			"\t(host:port) of existing members. The node starts empty and NOT a member — in raft mode\n"+
+			"\tit never campaigns until a leader adds it — and asks the members to add it (needs\n"+
+			"\t--cluster-secret-file or --cluster-mtls; otherwise add it with the admin API).\n"+
+			"\tIgnored once the node has persisted membership. See docs/node-lifecycle.md.")
+	advertiseFlag := flag.String("advertise-addr", "",
+		"This node's client address as other nodes dial it (host:port). Default: --addr when it\n"+
+			"\tnames a host. Required with --join when --addr has no host.")
+	forceNewCluster := flag.Bool("force-new-cluster", false,
+		"DANGEROUS — disaster recovery only. raft: rewrite this node's membership to itself alone\n"+
+			"\t(a local config entry in a new term) so it elects itself after a quorum was lost for good;\n"+
+			"\twipe every other former member and re-add it with --join. replicated: discard the\n"+
+			"\tpersisted membership (kept as cluster_membership.json.reset-*) and start from --peers.\n"+
+			"\tRemove the flag after one start.")
 
 	// Encryption / audit / scrub flags
 	encryptAtRest := flag.Bool("encrypt-at-rest", false,
@@ -436,6 +456,7 @@ func main() {
 	cfg.VLogFlushWindowMs = *vlogWindowMs
 	cfg.WALMaxBatchEntries = *walMaxBatch
 	cfg.WALFormat = *walFormat
+	cfg.RaftAppliedIndex = deploy == modeRaft // replay stops at the raft applied index (invariant 65)
 	if *groupCommit != storage.GroupCommitAdaptive && *groupCommit != storage.GroupCommitFixed {
 		log.Fatalf("--group-commit must be %s or %s, got %q", storage.GroupCommitAdaptive, storage.GroupCommitFixed, *groupCommit)
 	}
@@ -599,6 +620,64 @@ func main() {
 	if perr != nil {
 		log.Fatalf("config: %v", perr)
 	}
+
+	// Online membership (membership.go): persisted membership wins over
+	// --peers; --join starts a node that waits to be added.
+	var mm *membershipManager
+	var joinSeeds []string
+	for _, a := range strings.Split(*joinFlag, ",") {
+		if a = strings.TrimSpace(a); a != "" {
+			joinSeeds = append(joinSeeds, a)
+		}
+	}
+	if len(joinSeeds) > 0 && selfInPeers(*peersFlag, *nodeID) {
+		// A node named in --peers is a bootstrap member: it bootstraps from
+		// --peers (or its persisted membership), so one pod template can
+		// carry both flags — --join only applies to nodes added later.
+		log.Printf("[membership] %s is listed in --peers: bootstrap member, --join ignored", *nodeID)
+		joinSeeds = nil
+	}
+	advertise := *advertiseFlag
+	if advertise == "" {
+		if h, _, err := net.SplitHostPort(*addr); err == nil && h != "" && h != "0.0.0.0" && h != "::" {
+			advertise = *addr
+		}
+	}
+	if deploy != modeStandalone {
+		if len(joinSeeds) > 0 && validMemberAddr(advertise) != nil {
+			log.Fatalf("--join needs a dialable client address: set --advertise-addr=host:port (--addr %q has no host)", *addr)
+		}
+		secret, serr := loadClusterSecret(*clusterSecretFile)
+		if serr != nil {
+			log.Fatalf("cluster secret: %v", serr)
+		}
+		var mTLS *cluster.TransferTLSConfig
+		if *clusterTLSCert != "" && *clusterTLSKey != "" {
+			mTLS = &cluster.TransferTLSConfig{Enabled: true, CertFile: *clusterTLSCert, KeyFile: *clusterTLSKey,
+				CAFile: *clusterTLSCA, RequireClientCert: *clusterMTLS}
+		}
+		var merr error
+		mm, merr = newMembershipManager(membershipParams{
+			mode: deploy, localID: *nodeID, selfAddr: advertise, dataDir: *dataDir, pm: pm, engine: engine,
+			staticPeers: peers, joinSeeds: joinSeeds, forceReset: *forceNewCluster,
+			secret: secret, transferTLS: mTLS, mtls: mTLS != nil && *clusterMTLS,
+		})
+		if merr != nil {
+			log.Fatalf("membership: %v", merr)
+		}
+		defer mm.stop()
+		if deploy == modeReplicated {
+			// Every member holds every key in this mode (the replication
+			// engine sends every write to every member), so the partition
+			// map's placement — and the migration — use every member.
+			pm.ReplicationFactor = cluster.AllNodesRF
+			if peers, merr = mm.resolveReplicatedPeers(peers); merr != nil {
+				log.Fatalf("membership: %v", merr)
+			}
+		}
+	} else if len(joinSeeds) > 0 || *forceNewCluster {
+		log.Printf("[membership] --join / --force-new-cluster have no effect in --mode=standalone")
+	}
 	for _, pr := range peers {
 		if err := pm.AddNode(pr.id, pr.host, pr.clientPort); err != nil {
 			log.Printf("[cluster] register peer %s: %v", pr.id, err)
@@ -665,7 +744,14 @@ func main() {
 			tlsCA:       *clusterTLSCA,
 			mutual:      *clusterMTLS,
 
-			raftPipeline: *raftPipeline,
+			raftPipeline:      *raftPipeline,
+			raftSnapThreshold: *raftSnapThreshold,
+			raftSnapChunk:     *raftSnapChunkKB << 10,
+
+			mm:              mm,
+			join:            len(joinSeeds) > 0,
+			forceNewCluster: *forceNewCluster,
+			advertise:       advertise,
 		})
 		if cerr != nil {
 			log.Fatalf("cluster setup: %v", cerr)
@@ -677,6 +763,9 @@ func main() {
 	coord.pm = pm
 	if coord.localID == "" {
 		coord.localID = *nodeID
+	}
+	if mm != nil {
+		mm.attach(coord)
 	}
 	if *raftPipeline && deploy != modeRaft {
 		log.Printf("[server] --raft-pipeline has no effect outside --mode=raft")
@@ -713,6 +802,13 @@ func main() {
 		}
 		// Distributed search rides the transfer listener (and its TLS).
 		ta.Handle(searchPath, newSearchHandler(engine))
+		// So does node-to-node membership traffic (membership.go).
+		if mm != nil {
+			mm.registerMembershipTransfer(ta)
+			if deploy == modeReplicated {
+				ta.SetReceiveFunc(mm.receiveMigrated) // put-if-absent, marked as a peer write
+			}
+		}
 		secret, serr := loadClusterSecret(*clusterSecretFile)
 		if serr != nil {
 			log.Fatalf("cluster secret: %v", serr)
@@ -745,15 +841,21 @@ func main() {
 	}
 
 	// Wire full metrics/admin onto the existing health mux now that engine is ready.
-	reg := prometheus.NewRegistry()
-	collector := veltrixmetrics.NewVeltrixCollector(*nodeID, engine, pm, fd, replMetrics)
-	reg.MustRegister(collector)
+	metricsDirs := diskPaths
+	if len(metricsDirs) == 0 {
+		metricsDirs = []string{*dataDir}
+	}
+	reg := newMetricsRegistry(*nodeID, engine, pm, fd, replMetrics, coord, *raftSnapThreshold, metricsDirs)
 	healthMux.Handle("/metrics", promhttp.HandlerFor(reg, promhttp.HandlerOpts{
 		EnableOpenMetrics: true,
 	}))
 	adminMux := http.NewServeMux()
 	adminapi.Register(adminMux, engine, "/admin", storage.NewBackupEngine(engine))
 	registerClusterAdmin(adminMux, "/admin", coord, pm)
+	registerMembershipAdmin(adminMux, "/admin", mm)
+	if mm != nil {
+		mm.start()
+	}
 	healthMux.Handle("/admin/", adminapi.Guard(*adminToken, adminMux))
 	if *adminToken != "" {
 		log.Printf("[admin] token auth enabled for /admin/*")
@@ -1775,6 +1877,8 @@ func handleTextConn(conn net.Conn, br *bufio.Reader, engine *storage.StorageEngi
 			}
 
 		// VER <key>  →  optimistic version token (0 = absent). Pass to SETIF.
+		// In raft mode it is the raft time of the key's last write, the same
+		// on every node (storage/raft_clock.go, invariant 66).
 		case "VER":
 			if err := checkRead(); err != nil {
 				writeLine("ERR " + err.Error())
@@ -3276,6 +3380,9 @@ func handleBinaryConn(conn net.Conn, br *bufio.Reader, engine *storage.StorageEn
 // Response:
 //
 //	[1B 0x00 OK][4B count LE][count × 1B per-entry status]
+//
+// or, when a raft follower rejects the whole batch, the error frame
+// [1B 0x01][4B msgLen]["MOVED <addr> <leaderId>"].
 func handleMPut(count int, br *bufio.Reader, bw *bufio.Writer, engine *storage.StorageEngine, coord *coordinator) error {
 	if count <= 0 || count > maxBatchCount {
 		resp := [5]byte{binStatusErr}
@@ -3321,6 +3428,23 @@ func handleMPut(count int, br *bufio.Reader, bw *bufio.Writer, engine *storage.S
 	}
 
 	putErrs := coord.MultiPut(reqs)
+
+	// A raft follower rejects the whole batch with one redirect. Answer it as
+	// the error frame every other op uses ([0x01][4B len]["MOVED addr id"]) so
+	// the client learns the leader; per-entry status bytes cannot carry it.
+	if moved := batchRedirect(putErrs); moved != nil {
+		var hdr [5]byte
+		msg := moved.Error()
+		hdr[0] = binStatusErr
+		binary.LittleEndian.PutUint32(hdr[1:5], uint32(len(msg)))
+		if _, err := bw.Write(hdr[:]); err != nil {
+			return err
+		}
+		if _, err := bw.WriteString(msg); err != nil {
+			return err
+		}
+		return bw.Flush()
+	}
 
 	respPtr := mputRespPool.Get().(*[]byte)
 	needed := 5 + count
@@ -3632,4 +3756,18 @@ func envBool(name string, def bool) bool {
 		log.Fatalf("config: %s=%q is not a boolean", name, v)
 	}
 	return b
+}
+
+// envInt reads an integer environment variable used as a flag default; unset
+// or empty gives def, anything else is a startup error.
+func envInt(name string, def int) int {
+	v := os.Getenv(name)
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 0 {
+		log.Fatalf("config: %s=%q is not a non-negative integer", name, v)
+	}
+	return n
 }

@@ -106,6 +106,7 @@ var vlogRespPool = sync.Pool{New: func() any { ch := make(chan error, 1); return
 // reclaim uses BLKDISCARD; everything else (offsets, alignment, magic) is
 // identical so engine code is backing-agnostic.
 type VLog struct {
+	pacer         *commitPacer // group-commit decisions; owned by flusher
 	diskIdx       int
 	diskPath      string
 	rawDevicePath string // empty when running on a regular file backing
@@ -277,7 +278,8 @@ func newVLog(diskIdx int, diskPath, rawDevicePath string, flushWindow time.Durat
 		vl.punchWatermark.Store(saved)
 	}
 
-	go vl.flusher(newCommitPacer(groupCommit, flushWindow))
+	vl.pacer = newCommitPacer(groupCommit, flushWindow)
+	go vl.flusher(vl.pacer)
 	return vl, nil
 }
 
@@ -695,6 +697,7 @@ func (vl *VLog) flusher(pacer *commitPacer) {
 			}
 
 		case <-bt.C:
+			pacer.timerFired(&bt)
 			bt.stop()
 			flush()
 

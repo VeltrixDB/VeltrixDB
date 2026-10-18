@@ -44,12 +44,15 @@ package main
 //	                  local keyspace.  Reads are local.
 
 import (
+	"errors"
 	"fmt"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/VeltrixDB/veltrixdb/cluster"
 	"github.com/VeltrixDB/veltrixdb/consensus"
+	veltrixmetrics "github.com/VeltrixDB/veltrixdb/metrics"
 	"github.com/VeltrixDB/veltrixdb/replication"
 	"github.com/VeltrixDB/veltrixdb/storage"
 )
@@ -103,8 +106,14 @@ type coordinator struct {
 	reqSeq   atomic.Uint64
 	nodeSalt uint64 // per-node high bits so reqIDs never collide across nodes
 	// peerClientAddr maps a nodeID to its client-facing storage address so a
-	// follower can tell a client where the leader is.
+	// follower can tell a client where the leader is.  Guarded by peerMu:
+	// online membership changes update it (membership.go, setPeerAddrs).
+	peerMu         sync.RWMutex
 	peerClientAddr map[string]string
+
+	// mm: online membership (membership.go); nil in standalone mode and in
+	// unit tests.  In replicated mode it gates writes (writeGate).
+	mm *membershipManager
 
 	// replicated mode
 	repl        *replication.ReplicationEngine
@@ -124,6 +133,9 @@ type coordinator struct {
 	searchFanout       bool
 	searchAllowPartial bool
 	searchTimeout      time.Duration
+	// searchMetrics counts VSearch / TSearch / HSearch requests (nil = off;
+	// set by newMetricsRegistry before the listeners start).
+	searchMetrics *veltrixmetrics.SearchMetrics
 }
 
 // readIndexTimeout bounds one linearizable-read fence (quorum heartbeat round
@@ -185,7 +197,7 @@ func (c *coordinator) nextReqID() uint64 {
 // leaderRedirect builds a redirectError pointing at the current Raft leader.
 func (c *coordinator) leaderRedirect() *redirectError {
 	leaderID := c.raft.GetLeaderID()
-	return &redirectError{leaderID: leaderID, addr: c.peerClientAddr[leaderID]}
+	return &redirectError{leaderID: leaderID, addr: c.peerAddr(leaderID)}
 }
 
 // submitForResult registers a result slot, submits the command, and waits for
@@ -281,6 +293,9 @@ func (c *coordinator) Put(key string, value []byte, ttl int32) error {
 	case modeRaft:
 		return c.submitVoid(fsmCmd{Op: opPut, Key: key, Value: value, TTL: ttl})
 	case modeReplicated:
+		if err := c.writeGate(); err != nil {
+			return err
+		}
 		if err := c.engine.Put(key, value, ttl); err != nil {
 			return err
 		}
@@ -297,6 +312,9 @@ func (c *coordinator) Delete(key string) error {
 	case modeRaft:
 		return c.submitVoid(fsmCmd{Op: opDelete, Key: key})
 	case modeReplicated:
+		if err := c.writeGate(); err != nil {
+			return err
+		}
 		if err := c.engine.Delete(key); err != nil {
 			return err
 		}
@@ -322,6 +340,9 @@ func (c *coordinator) MultiPut(reqs []storage.MultiPutRequest) []error {
 		}
 		return errs
 	case modeReplicated:
+		if err := c.writeGate(); err != nil {
+			return gateErrs(len(reqs), err)
+		}
 		errs := c.engine.MultiPut(reqs)
 		for i, r := range reqs {
 			if errs[i] == nil {
@@ -351,6 +372,10 @@ func (c *coordinator) CompareAndSwap(key string, expected, newValue []byte, ttl 
 		}
 		return res.casRes, res.err
 	case modeReplicated:
+		if err := c.writeGate(); err != nil {
+			var zero storage.CASResult
+			return zero, err
+		}
 		res, err := c.engine.CompareAndSwap(key, expected, newValue, ttl)
 		if err == nil && res == storage.CASSuccess {
 			if rerr := c.replicateWrite(key, newValue, ttl, false); rerr != nil {
@@ -386,6 +411,9 @@ func (c *coordinator) incrDecr(op fsmOp, key string, delta int64, ttl int32) (in
 		}
 		return res.intVal, res.err
 	case modeReplicated:
+		if err := c.writeGate(); err != nil {
+			return 0, err
+		}
 		var v int64
 		var err error
 		if op == opIncr {
@@ -417,6 +445,10 @@ func (c *coordinator) SetIfNotExists(key string, value []byte, ttl int32) (stora
 		}
 		return res.setnxRes, res.err
 	case modeReplicated:
+		if err := c.writeGate(); err != nil {
+			var zero storage.SetNXResult
+			return zero, err
+		}
 		res, err := c.engine.SetIfNotExists(key, value, ttl)
 		if err == nil && res == storage.SetNXCreated {
 			if rerr := c.replicateWrite(key, value, ttl, false); rerr != nil {
@@ -441,6 +473,9 @@ func (c *coordinator) Txn(ops []fsmTxnOp) error {
 		}
 		return res.err
 	case modeReplicated:
+		if err := c.writeGate(); err != nil {
+			return err
+		}
 		if err := c.runLocalTxn(ops); err != nil {
 			return err
 		}
@@ -477,12 +512,20 @@ func (c *coordinator) PutNS(ns, key string, value []byte, ttl int32) error {
 	case modeStandalone:
 		return c.engine.PutNS(ns, key, value, ttl)
 	case modeRaft:
+		// Quotas are checked here, on the leader, not in Apply: per-node
+		// quota state would make the replicas decide differently.
+		if err := c.engine.CheckNSWrite(ns, key); err != nil {
+			return err
+		}
 		res, err := c.submitForResult(fsmCmd{Op: opNSPut, Ns: ns, Key: key, Value: value, TTL: ttl})
 		if err != nil {
 			return err
 		}
 		return res.err
 	case modeReplicated:
+		if err := c.writeGate(); err != nil {
+			return err
+		}
 		if err := c.engine.PutNS(ns, key, value, ttl); err != nil {
 			return err
 		}
@@ -503,6 +546,9 @@ func (c *coordinator) DeleteNS(ns, key string) error {
 		}
 		return res.err
 	case modeReplicated:
+		if err := c.writeGate(); err != nil {
+			return err
+		}
 		if err := c.engine.DeleteNS(ns, key); err != nil {
 			return err
 		}
@@ -523,6 +569,9 @@ func (c *coordinator) DropNamespace(ns string) (int, error) {
 		}
 		return int(res.intVal), res.err
 	case modeReplicated:
+		if err := c.writeGate(); err != nil {
+			return 0, err
+		}
 		// Enumerate first so each deleted key ships as its own tombstone.
 		entries, err := c.engine.ScanNamespace(ns, "", 0)
 		if err != nil {
@@ -552,6 +601,9 @@ func (c *coordinator) HSet(key, field string, value []byte, ttl int32) error {
 		}
 		return res.err
 	case modeReplicated:
+		if err := c.writeGate(); err != nil {
+			return err
+		}
 		if err := c.engine.HSet(key, field, value, ttl); err != nil {
 			return err
 		}
@@ -572,6 +624,9 @@ func (c *coordinator) HDel(key, field string) error {
 		}
 		return res.err
 	case modeReplicated:
+		if err := c.writeGate(); err != nil {
+			return err
+		}
 		if err := c.engine.HDel(key, field); err != nil {
 			return err
 		}
@@ -592,6 +647,9 @@ func (c *coordinator) HExpire(key, field string, ttl int32) error {
 		}
 		return res.err
 	case modeReplicated:
+		if err := c.writeGate(); err != nil {
+			return err
+		}
 		if err := c.engine.HExpire(key, field, ttl); err != nil {
 			return err
 		}
@@ -619,6 +677,9 @@ func (c *coordinator) VSet(ns, id string, vec []float32) error {
 		}
 		return res.err
 	case modeReplicated:
+		if err := c.writeGate(); err != nil {
+			return err
+		}
 		if err := c.engine.RegisterVectorNamespace(ns, len(vec)); err != nil {
 			return err
 		}
@@ -649,6 +710,9 @@ func (c *coordinator) VDel(ns, id string) error {
 		}
 		return res.err
 	case modeReplicated:
+		if err := c.writeGate(); err != nil {
+			return err
+		}
 		if err := c.engine.DeleteVector(ns, id); err != nil {
 			return err
 		}
@@ -668,6 +732,9 @@ func (c *coordinator) IdxCreate(name, field string) error {
 	case modeStandalone:
 		return c.engine.CreateFieldIndex(name, field)
 	case modeReplicated:
+		if err := c.writeGate(); err != nil {
+			return err
+		}
 		if err := c.engine.CreateFieldIndex(name, field); err != nil {
 			return err
 		}
@@ -688,6 +755,9 @@ func (c *coordinator) IdxDrop(name string) error {
 	case modeStandalone:
 		return c.engine.DropFieldIndex(name)
 	case modeReplicated:
+		if err := c.writeGate(); err != nil {
+			return err
+		}
 		if err := c.engine.DropFieldIndex(name); err != nil {
 			return err
 		}
@@ -723,6 +793,9 @@ func (c *coordinator) replicateMuts(muts []storage.ListMutation) error {
 func (c *coordinator) ListPush(key string, val []byte, left bool) (int64, error) {
 	switch c.mode {
 	case modeStandalone, modeReplicated:
+		if err := c.writeGate(); err != nil {
+			return 0, err
+		}
 		var n int64
 		var muts []storage.ListMutation
 		var err error
@@ -758,6 +831,9 @@ func (c *coordinator) ListPush(key string, val []byte, left bool) (int64, error)
 func (c *coordinator) ListPop(key string, left bool) ([]byte, bool, error) {
 	switch c.mode {
 	case modeStandalone, modeReplicated:
+		if err := c.writeGate(); err != nil {
+			return nil, false, err
+		}
 		var v []byte
 		var found bool
 		var muts []storage.ListMutation
@@ -794,6 +870,9 @@ func (c *coordinator) ListPop(key string, left bool) ([]byte, bool, error) {
 func (c *coordinator) SetAdd(key, member string) (bool, error) {
 	switch c.mode {
 	case modeStandalone, modeReplicated:
+		if err := c.writeGate(); err != nil {
+			return false, err
+		}
 		added, muts, err := c.engine.SAdd(key, member)
 		if err != nil {
 			return false, err
@@ -818,6 +897,9 @@ func (c *coordinator) SetAdd(key, member string) (bool, error) {
 func (c *coordinator) SetRem(key, member string) (bool, error) {
 	switch c.mode {
 	case modeStandalone, modeReplicated:
+		if err := c.writeGate(); err != nil {
+			return false, err
+		}
 		removed, muts, err := c.engine.SRem(key, member)
 		if err != nil {
 			return false, err
@@ -854,4 +936,20 @@ func (c *coordinator) runLocalTxn(ops []fsmTxnOp) error {
 		}
 	}
 	return txn.Commit()
+}
+
+// batchRedirect returns the redirect when every entry of a batch failed with
+// one (a raft follower rejects the whole submission), else nil.
+func batchRedirect(errs []error) *redirectError {
+	var first *redirectError
+	for _, err := range errs {
+		var re *redirectError
+		if !errors.As(err, &re) {
+			return nil
+		}
+		if first == nil {
+			first = re
+		}
+	}
+	return first
 }

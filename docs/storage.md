@@ -194,19 +194,26 @@ Replay also reads the legacy text records below, in any mix with binary ones
 binary records after existing text ones. The field meanings are the same in
 both.
 
-**Rollback.** No build older than the TTL field can read a version-2 record or
-a text record with the 11th (TTL) field: its decoder treats either as a torn
-tail, stops replay there and drops that record **and every record after it**.
-So to roll back to *any* older build — pre-binary or not — run the new build
-once with `--wal-format=text-legacy` and stop cleanly: the checkpoint rewrites
-`wal.log` as 8/10-field text with no TTL field, which every build since the
-text format reads; then downgrade. The cost is that keys written with a TTL
-come back **immortal** on the older build — what that build did to them on
-every restart anyway. `--wal-format=text` writes text *with* the TTL field and
-is therefore readable only by builds that have it; it is not a rollback mode.
-A PITR archive written by this build is likewise unreadable by an older
-`restore-pitr` once it holds a TTL'd key (that restore fails with "truncated
-or malformed" rather than silently dropping records).
+**Rollback.** The TTL field (version-2 records, the 11th text field) shipped
+in v1.14; binary records in v1.6. **v1.14 and later — v1.16 included — need no
+step:** they read every record this build writes, TTLs included, after a clean
+stop or a crash (`tests/upgrade` `TestDowngrade_Standalone`). No build older
+than v1.14 can read a version-2 record or a text record with the 11th (TTL)
+field: its decoder treats either as a torn tail, stops replay there and drops
+that record **and every record after it**. So to roll back to **v1.13 or
+older** — pre-binary or not — run the new build once with
+`--wal-format=text-legacy` and stop cleanly: the checkpoint rewrites `wal.log`
+as 8/10-field text with no TTL field, which every build since the text format
+reads; then downgrade. The cost is that keys written with a TTL come back
+**immortal** on the older build — what that build did to them on every restart
+anyway — which is why the step must not be used for a v1.14+ target.
+`--wal-format=text` writes text *with* the TTL field and is therefore readable
+only by builds that have it; it is not a rollback mode. A PITR archive written
+by this build is likewise unreadable by a pre-v1.14 `restore-pitr` once it
+holds a TTL'd key (that restore fails with "truncated or malformed" rather than
+silently dropping records). A raft node's WAL also carries the applied-index
+marker record; v1.16 replays it as a live key `"\x00veltrix/raft-applied"`
+(see replication.md, Applied index → Downgrade).
 
 Legacy text record:
 
@@ -277,7 +284,7 @@ In `Put()`, both WAL and VLog `beginAppend()` are called concurrently. The calle
 └── .vlog_punch_wm       — GC punch-hole watermark (8-byte little-endian offset)
 ```
 
-The first data dir also holds `index_defs.json` (secondary-index definitions). Raft state is not per disk: in `--mode=raft` it lives in `<--data>/raft/` (`raft_log.dat`, `raft_meta.dat`, `raft_snapshot.gob`); see [replication.md](replication.md#persistence).
+The first data dir also holds `index_defs.json` (secondary-index definitions). Raft state is not per disk: in `--mode=raft` it lives in `<--data>/raft/` (`raft_log.dat`, `raft_meta.dat`, `raft_snapshot.dat`); see [replication.md](replication.md#persistence).
 
 With multiple disks (`--data-dirs /mnt/nvme0,...,/mnt/nvme7`), each disk gets its own independent WAL, VLog, segment file, and compaction goroutine. Shard `i` always lives on disk `i % numDisks`.
 

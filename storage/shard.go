@@ -53,6 +53,43 @@ type shardedIndex struct {
 	// oiNode.mu, never the reverse — see the ordered_index.go file header.
 	// nil when StorageConfig.DisableOrderedIndex is set.
 	ordered *orderedKeyIndex
+
+	// tracker, when set, is told about every key whose entry changes (put,
+	// tombstone, WAL replay, atomic ops) — AFTER the change is installed, so
+	// a reader that drains the tracker and then reads the key sees the
+	// change.  Used by raft snapshot capture (snapshot_support.go); nil
+	// otherwise, which costs one atomic load per write.
+	tracker atomic.Pointer[WriteTracker]
+
+	// replayInOrder (raft mode, set before replay starts): WAL replay
+	// installs every record in WAL order instead of keeping whichever has the
+	// larger WriteTimestampUs.  The timestamp test exists so live writes that
+	// race the asynchronous replay win; in raft mode nothing writes before
+	// ReplayDone (Apply and snapshot restore wait for it), the WAL order is
+	// the apply order, and raft-clock stamps need not grow with it across a
+	// legacy (local-clock) record — raft_clock.go, invariant 66.
+	replayInOrder bool
+	// replayExpiryCapUs (raft mode): replay judges TTL expiry at
+	// min(local now, this) — the raft clock recorded with the replay's cut.
+	replayExpiryCapUs int64
+}
+
+// replayNowUs is the time WAL replay judges TTL expiry at: the local clock,
+// capped at the raft clock in raft mode (raft_clock.go).
+func (si *shardedIndex) replayNowUs() int64 {
+	now := time.Now().UnixMicro()
+	if c := si.replayExpiryCapUs; c > 0 && c < now {
+		return c
+	}
+	return now
+}
+
+// noteWrite reports key to the active WriteTracker, if any.  Callers invoke
+// it after the new entry is installed in the shard (see tracker).
+func (si *shardedIndex) noteWrite(key string) {
+	if t := si.tracker.Load(); t != nil {
+		t.note(key)
+	}
 }
 
 func newShardedIndex() *shardedIndex {
@@ -171,6 +208,7 @@ func (si *shardedIndex) put(key string, entry *IndexEntry, value []byte) {
 		shard.dirtyValues[key] = value
 	}
 	shard.mu.Unlock()
+	si.noteWrite(key)
 }
 
 // replayPut writes entry only when no newer live entry already exists.
@@ -184,7 +222,7 @@ func (si *shardedIndex) replayPut(key string, entry *IndexEntry, value []byte) {
 	}
 	shard.mu.Lock()
 	existing, hadExisting := shard.entries.get(key, h)
-	if hadExisting && existing.WriteTimestampUs > entry.WriteTimestampUs {
+	if !si.replayInOrder && hadExisting && existing.WriteTimestampUs > entry.WriteTimestampUs {
 		shard.mu.Unlock()
 		return // live write during replay takes precedence — don't clobber it
 	}
@@ -203,6 +241,7 @@ func (si *shardedIndex) replayPut(key string, entry *IndexEntry, value []byte) {
 		shard.dirtyValues[key] = value
 	}
 	shard.mu.Unlock()
+	si.noteWrite(key)
 }
 
 // replayMarkTombstone is the version-aware tombstone setter used by background
@@ -215,7 +254,7 @@ func (si *shardedIndex) replayMarkTombstone(key string, nowUs int64) {
 	superseded := false
 	wasLive := false
 	ok := shard.entries.update(key, h, func(entry *IndexEntry) bool {
-		if entry.WriteTimestampUs > nowUs {
+		if !si.replayInOrder && entry.WriteTimestampUs > nowUs {
 			superseded = true // live write supersedes this tombstone
 			return false
 		}
@@ -226,6 +265,7 @@ func (si *shardedIndex) replayMarkTombstone(key string, nowUs int64) {
 	if !ok || superseded {
 		return
 	}
+	si.noteWrite(key) // under the shard lock: a reader of key waits for it
 	if wasLive {
 		si.keyCount.Add(-1)
 	}
@@ -255,6 +295,7 @@ func (si *shardedIndex) markTombstone(key string, nowUs int64) bool {
 	}) {
 		return false
 	}
+	si.noteWrite(key) // under the shard lock: a reader of key waits for it
 	if wasLive {
 		si.keyCount.Add(-1)
 	}
@@ -263,6 +304,40 @@ func (si *shardedIndex) markTombstone(key string, nowUs int64) bool {
 	}
 	_, hadDirty := shard.dirtyValues[key]
 	if hadDirty {
+		si.dirtyCount.Add(-1)
+	}
+	delete(shard.dirtyValues, key)
+	return true
+}
+
+// markExpired tombstones key (written at tombUs) only if, under the shard
+// write lock, its entry is still live and expired at cutoffUs.  The TTL
+// scanner, Get and RangeScan find an expired key under a read lock (or none)
+// and tombstone it later: a write that replaced the entry in between must
+// not be tombstoned with it.  Returns whether it tombstoned.
+func (si *shardedIndex) markExpired(key string, cutoffUs, tombUs int64) bool {
+	h := fnv64a(key)
+	shard := &si.shards[uint16(h&(numShards-1))]
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
+	done := false
+	shard.entries.update(key, h, func(entry *IndexEntry) bool {
+		if entry.IsTombstone() || !entry.IsExpired(cutoffUs) {
+			return false
+		}
+		entry.MarkTombstone(tombUs)
+		done = true
+		return true
+	})
+	if !done {
+		return false
+	}
+	si.noteWrite(key)
+	si.keyCount.Add(-1)
+	if si.ordered != nil {
+		si.ordered.Remove(key)
+	}
+	if _, hadDirty := shard.dirtyValues[key]; hadDirty {
 		si.dirtyCount.Add(-1)
 	}
 	delete(shard.dirtyValues, key)
@@ -295,6 +370,12 @@ func (si *shardedIndex) markTiered(key string) bool {
 func (si *shardedIndex) removeTombstone(key string) {
 	shard, _ := si.shardFor(key)
 	shard.mu.Lock()
+	// Re-check under the write lock: the reaper checked without it, and a
+	// write that revived the key in between must not be deleted.
+	if e, ok := shard.entries.get(key, fnv64a(key)); ok && !e.IsTombstone() {
+		shard.mu.Unlock()
+		return
+	}
 	if si.ordered != nil {
 		si.ordered.Remove(key) // no-op normally: markTombstone already removed it
 	}
@@ -343,8 +424,7 @@ func (si *shardedIndex) expiredTombstones(gracePeriodUs int64) []string {
 
 // expiredTTL returns all keys whose TTL has elapsed and that are not already
 // tombstoned.  Called by the background TTL scanner.
-func (si *shardedIndex) expiredTTL() []string {
-	nowUs := time.Now().UnixMicro()
+func (si *shardedIndex) expiredTTL(nowUs int64) []string {
 
 	var expired []string
 	for i := range si.shards {

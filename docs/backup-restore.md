@@ -17,7 +17,7 @@ VeltrixDB stores data across two files per disk:
 
 The in-memory index is **not** backed up — it is fully rebuilt from the WAL on startup (see Crash Recovery in `storage.md`). Backing up the WAL + VLog is sufficient.
 
-**WAL encoding.** The backed-up `wal.log` and PITR archive segments are written in the engine's `--wal-format` — binary by default; the `veltrixdb-backup` CLI, which opens the engine itself, always writes binary, and `restore-pitr` always appends binary records. Any build that reads binary WAL also reads legacy text, so restoring into the same or a newer build always works. An older build cannot read binary records (pre-binary builds) or records of keys with a TTL (builds before TTL-in-WAL): to restore into one, restore with the current build, start the server once with `--wal-format=text-legacy` and stop it cleanly (the shutdown checkpoint rewrites `wal.log` as text without TTLs — TTL'd keys become immortal there), then start the older build. Keys containing `|` or a newline are not crash-safe in the text format. Backups, checkpoints and PITR archive records carry each key's absolute TTL expiry, so a restored key expires when the original would have, and one that expired before the restore stays gone.
+**WAL encoding.** The backed-up `wal.log` and PITR archive segments are written in the engine's `--wal-format` — binary by default; the `veltrixdb-backup` CLI, which opens the engine itself, always writes binary, and `restore-pitr` always appends binary records. Any build that reads binary WAL also reads legacy text, so restoring into the same or a newer build always works. Builds from v1.14 on (v1.16 included) read every record this build writes, TTLs included, so a backup restores into them as it is — no extra step. Only builds older than that cannot: v1.6–v1.13 cannot read the record of a key with a TTL, v1.5 and older no binary record at all. To restore into one of those, restore with the current build, start the server once with `--wal-format=text-legacy` and stop it cleanly (the shutdown checkpoint rewrites `wal.log` as text without TTLs — TTL'd keys become immortal there), then start the older build. Never do that for a v1.14+ target: it only drops the TTLs. Keys containing `|` or a newline are not crash-safe in the text format. Backups, checkpoints and PITR archive records carry each key's absolute TTL expiry, so a restored key expires when the original would have, and one that expired before the restore stays gone.
 
 ---
 
@@ -30,22 +30,24 @@ A full backup captures a consistent snapshot of the entire dataset **as of the m
 ```
 BackupEngine.FullBackup(destDir)
     │
-    ├─ 1. Checkpoint()
-    │      ├─ Flush all pending WAL writes
+    ├─ 1. Runtime checkpoint (writes keep flowing)
     │      └─ Write a compacted WAL: one entry per live key
-    │         (dead entries from overwrites/deletes are excluded)
+    │         (dead entries from overwrites/deletes are excluded),
+    │         then carry the WAL written meanwhile and swap wal.log
     │
     ├─ 2. For each disk i:
-    │      ├─ snapshot vlogEnd = vlogs[i].end.Load()   (atomic)
+    │      ├─ snapshot vlogEnd = vlogs[i].end.Load()   (atomic, after step 1)
     │      ├─ copyFileRange(vlog_active.dat, disk<i>/vlog.dat, 0, vlogEnd)
     │      │    own read-only fd, Seek + io.CopyN of exactly vlogEnd bytes
     │      │    (skipped when vlogEnd == 0)
-    │      └─ copyFileFull(wal.log, disk<i>/wal.log)
+    │      └─ copy the checkpoint's compacted records → disk<i>/wal.log
+    │           (through a handle on the file step 1 created — never the
+    │            live wal.log, whose tail may point at values still in flight)
     │
     └─ 3. Write manifest.json
 ```
 
-**The engine continues serving traffic during backup.** The VLog copy opens its own read-only descriptor, seeks to the start offset and copies exactly `vlogEnd − start` bytes, so it never reads the region concurrent appends are writing. Appends after `vlogEnd` is snapshotted are simply not included in this backup. Only `vlog_active.dat` is copied: with `--raw-vlogs` (VLog on a raw block device) there is no such file and the backup silently contains no VLog data.
+**The engine continues serving traffic during backup, and keeps every write.** Before the fix in `[Unreleased]`, the backup's checkpoint renamed the new file over `wal.log` while the WAL flusher kept appending to the old, unlinked one, so on standalone and replicated nodes every write made after an online backup (or `POST /admin/checkpoint`) was lost on a crash until the next clean restart — all releases up to v1.16. The checkpoint is now safe under writes (CLAUDE.md invariant 21). `engine_version` in the manifest is the checkpoint's fence version: every write with a version at or below it is in the backup (writes concurrent with the checkpoint may be in it too); PITR restore applies archived records above it.  The VLog copy opens its own read-only descriptor, seeks to the start offset and copies exactly `vlogEnd − start` bytes, so it never reads the region concurrent appends are writing. Appends after `vlogEnd` is snapshotted are simply not included in this backup. Only `vlog_active.dat` is copied: with `--raw-vlogs` (VLog on a raw block device) there is no such file and the backup silently contains no VLog data.
 
 ### Backup Directory Structure
 
@@ -136,7 +138,7 @@ An incremental backup captures only the **delta** — VLog bytes written since t
 ```
 BackupEngine.IncrementalBackup(destDir, baseManifest)
     │
-    ├─ 1. Checkpoint()    ← same as full backup
+    ├─ 1. Runtime checkpoint    ← same as full backup
     │
     ├─ 2. For each disk i:
     │      ├─ baseEnd = baseManifest.Disks[i].VLogEndOff
@@ -144,7 +146,7 @@ BackupEngine.IncrementalBackup(destDir, baseManifest)
     │      ├─ copyFileRange(vlog_active.dat, disk<i>/vlog_delta.dat,
     │      │               baseEnd, curEnd - baseEnd)
     │      │   ← copies ONLY the new bytes since last backup
-    │      └─ copyFileFull(wal.log, disk<i>/wal.log)
+    │      └─ copy the checkpoint's compacted records → disk<i>/wal.log
     │         ← latest compacted WAL (includes all live keys)
     │
     └─ 3. Write manifest.json with BaseBackupDir = base backup ID
@@ -448,7 +450,8 @@ s3://my-bucket/veltrixdb-backups/
 | Concern | How It's Handled |
 |---------|-----------------|
 | Concurrent writes during backup | VLog copy reads through its own descriptor only up to the snapshotted end; new appends beyond `vlogEnd` are ignored |
-| Partial VLog write mid-copy | WAL checkpoint happens before VLog snapshot; WAL and VLog are consistent with each other at the snapshot point |
+| Partial VLog write mid-copy | WAL checkpoint happens before VLog snapshot, and the backup's `wal.log` holds only the checkpoint's compacted records, built from index entries whose values were already durable; `vlogEnd` is read after the checkpoint, so it covers every value they point at (`TestLiveBackup_ConsistentUnderWrites`) |
+| Writes after the backup | Durable: the checkpoint swaps the WAL flusher onto the new `wal.log` (before the fix they went to an unlinked file and were lost on a crash) |
 | GC compaction moving values during backup | GC appends relocated copies at the VLog tail and swaps the in-memory index entry via CAS; the WAL checkpoint records the offsets the index held at that moment. Backup does not pause GC, so a GC pass between the checkpoint and the VLog copy can relocate a value and punch a hole over its old offset, which the checkpoint still references |
 | Crash during backup | Backup directory is partially written — `manifest.json` is written last, so a directory without it is incomplete; re-run the backup |
 | Manifest write failure | Manifest is written via temp-file rename (`manifest.json.tmp` → `manifest.json`) — atomic on POSIX |
@@ -495,7 +498,7 @@ Check these after every backup run:
 
 | Item | Why Excluded | Recovery |
 |------|-------------|----------|
-| Raft state (`raft_log.dat`, `raft_meta.dat`, `raft_snapshot.gob`; `raft_state.gob` before 2026-10) | Cluster state; not needed for single-node restore | Recreated on startup |
+| Raft state (`raft_log.dat`, `raft_meta.dat`, `raft_snapshot.dat`; `raft_snapshot.gob` and `raft_state.gob` before 2026-10) | Cluster state; not needed for single-node restore | Recreated on startup |
 | In-memory LIRS cache | Volatile by design | Cache warms up after restart |
 | Bloom filters | Rebuilt from index on startup | Automatic |
 | Segment file (`seg_active.dat`) | Superseded by WAL+VLog | Not needed |
